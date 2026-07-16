@@ -674,7 +674,7 @@ jobs:
         id: load-credential
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/credential-load-action@69d76d75b1f52779dfdfe4ec788b5dbb3face234  # v2.0.0
+        uses: lfreleng-actions/credential-load-action@ce4a30074c03595ce0799fa09a00887ed1bffdd5  # v2.0.1
         with:
           # yamllint disable-line rule:line-length
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -934,7 +934,7 @@ jobs:
         id: load-credential
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/credential-load-action@69d76d75b1f52779dfdfe4ec788b5dbb3face234  # v2.0.0
+        uses: lfreleng-actions/credential-load-action@ce4a30074c03595ce0799fa09a00887ed1bffdd5  # v2.0.1
         with:
           # yamllint disable-line rule:line-length
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
