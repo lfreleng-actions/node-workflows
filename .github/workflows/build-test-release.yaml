@@ -1592,7 +1592,7 @@ jobs:
       - name: 'Load Nexus credential'
         id: load-credential
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/credential-load-action@ded60463a3cc5d56b3b39adb3e1e35c054c948dc  # v2.0.2
+        uses: lfreleng-actions/credential-load-action@560620cbe18a05ace2104a8997176c094cd0a940  # v2.0.3
         with:
           # yamllint disable-line rule:line-length
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
