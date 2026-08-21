@@ -34,8 +34,14 @@ permissions: {}
 jobs:
   merge:
     name: 'Merge/Publish'
+    # The caller's permissions cap what the reusable workflow's jobs
+    # can request, so id-token/attestations must be granted here or
+    # the attest and sign-artefacts jobs cannot run. Drop them if you
+    # set attestations and sigstore_sign to false.
     permissions:
       contents: read
+      id-token: write       # OIDC for provenance and Sigstore signing
+      attestations: write   # Build provenance attestations
     # Pin to a specific node-workflows release SHA in production
     # instead of the mutable @main reference.
     # yamllint disable-line rule:line-length
@@ -51,6 +57,8 @@ jobs:
       # node_version: ''              # override Node.js auto-detection
       # build_tool: ''                # 'npm' or 'yarn'; empty auto-detects
       # harden_runner_egress: 'block' # 'block' (default) or 'audit'
+      # attestations: true            # SLSA provenance for releases
+      # sigstore_sign: true           # Sigstore bundle for releases
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
       VAULT_MAPPING_JSON: ${{ secrets.VAULT_MAPPING_JSON }}
