@@ -68,7 +68,7 @@ tag (semver shape, signature, GitHub presence), builds the project,
 stamps `package.json` with the tag version, packs the npm tarball,
 then attests and signs it:
 
-- SLSA build provenance via `actions/attest-build-provenance`
+- SLSA build provenance via `actions/attest`
   (toggle with the `attestations` input)
 - Sigstore keyless signature bundle via `cosign sign-blob`
   (toggle with the `sigstore_sign` input)
