@@ -91,6 +91,42 @@ matches `version.properties`, the workflow also publishes the plain
 `X.Y.Z` release to `release_registry_url`. A version mismatch between
 the release file and `version.properties` fails the release publish.
 
+Release publishes also gain attestation and a signature. The build job
+uploads the built tree rather than a tarball, and the publish step
+stamps the version, so a `pack-release` job re-stamps that tree to the
+resolved release version and packs it, then:
+
+- SLSA build provenance via `actions/attest`
+  (toggle with the `attestations` input)
+- Sigstore keyless signature bundle via `cosign sign-blob`
+  (toggle with the `sigstore_sign` input)
+
+The release publish waits for both. An enabled record that fails blocks
+the publish rather than trailing it, because hosted npm repositories are
+typically write-once: nothing can add provenance to a version that
+already published without it, whereas a blocked publish is retryable.
+Disabling either toggle skips that job and lets the publish proceed.
+
+Snapshot publishes stay unattested and unsigned by design, since every
+merge replaces them.
+
+The calling job must grant `id-token: write` and `attestations: write`.
+A caller's `permissions` block caps what the reusable workflow's jobs
+can request, so a caller that grants `contents: read` alone leaves the
+`attest` and `sign-artefacts` jobs unable to run. Set `attestations`
+and `sigstore_sign` to `false` if you would rather not grant them.
+
+Note the scope of what these cover. The tarball comes from a separate
+`npm pack`, not the one `npm publish` performs internally, so the
+provenance and signature attest to the artefact this workflow built
+rather than the exact bytes the registry received. The `pack-release`
+job mirrors the publish path's stamping, including running `version`
+lifecycle hooks, so the content set still matches where a project's
+hooks change files. Nexus npm repositories offer no registry-native
+provenance, which is why the artefact-level records exist at all;
+publishing to a registry that does support it (such as npmjs.org under
+trusted publishing) yields registry-native provenance too.
+
 ## Inputs and Secrets
 
 ### build-test.yaml
@@ -169,24 +205,26 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 
 <!-- markdownlint-disable MD013 -->
 
-| Input                     | Type    | Default   | Description                                                        |
-| ------------------------- | ------- | --------- | ------------------------------------------------------------------ |
-| `repository`              | string  | `''`      | Repository to check out (owner/name); empty uses the caller        |
-| `ref`                     | string  | `''`      | Checkout ref (empty = event ref; other repos: default branch)      |
-| `path_prefix`             | string  | `'.'`     | Path to the project root directory                                 |
-| `node_version`            | string  | `''`      | Node.js version; empty auto-detects `engines.node`, then 22        |
-| `build_tool`              | string  | `''`      | `npm` or `yarn`; empty auto-detects from project metadata          |
-| `build_scripts`           | string  | `'build'` | package.json script(s) the build job runs                          |
-| `snapshot_registry_url`   | string  | (none)    | REQUIRED: npm registry URL that receives snapshot publishes        |
-| `release_registry_url`    | string  | (none)    | REQUIRED: npm registry URL that receives release publishes         |
-| `nexus_user`              | string  | `''`      | Nexus username override; empty derives it from the repository name |
-| `dry_run`                 | boolean | `false`   | Run the publish steps without uploading                            |
-| `harden_runner_egress`    | string  | `'block'` | Harden-runner egress policy: `block` or `audit`                    |
-| `harden_runner_allowlist` | string  | (pinned)  | Out-of-band harden-runner allow-list configuration                 |
-| `gerrit_refspec`          | string  | `''`      | Gerrit refspec of the merged change                                |
-| `gerrit_project`          | string  | `''`      | Gerrit project name                                                |
-| `gerrit_branch`           | string  | `''`      | Gerrit target branch                                               |
-| `gerrit_url`              | string  | `''`      | Gerrit server URL; empty falls back to the `GERRIT_URL` variable   |
+| Input                     | Type    | Default   | Description                                                              |
+| ------------------------- | ------- | --------- | ------------------------------------------------------------------------ |
+| `repository`              | string  | `''`      | Repository to check out (owner/name); empty uses the caller              |
+| `ref`                     | string  | `''`      | Checkout ref (empty = event ref; other repos: default branch)            |
+| `path_prefix`             | string  | `'.'`     | Path to the project root directory                                       |
+| `node_version`            | string  | `''`      | Node.js version; empty auto-detects `engines.node`, then 22              |
+| `build_tool`              | string  | `''`      | `npm` or `yarn`; empty auto-detects from project metadata                |
+| `build_scripts`           | string  | `'build'` | package.json script(s) the build job runs                                |
+| `attestations`            | boolean | `true`    | SLSA build provenance for the packed release tarball (release publishes) |
+| `sigstore_sign`           | boolean | `true`    | Sign the packed release tarball with Sigstore (release publishes)        |
+| `snapshot_registry_url`   | string  | (none)    | REQUIRED: npm registry URL that receives snapshot publishes              |
+| `release_registry_url`    | string  | (none)    | REQUIRED: npm registry URL that receives release publishes               |
+| `nexus_user`              | string  | `''`      | Nexus username override; empty derives it from the repository name       |
+| `dry_run`                 | boolean | `false`   | Run the publish steps without uploading                                  |
+| `harden_runner_egress`    | string  | `'block'` | Harden-runner egress policy: `block` or `audit`                          |
+| `harden_runner_allowlist` | string  | (pinned)  | Out-of-band harden-runner allow-list configuration                       |
+| `gerrit_refspec`          | string  | `''`      | Gerrit refspec of the merged change                                      |
+| `gerrit_project`          | string  | `''`      | Gerrit project name                                                      |
+| `gerrit_branch`           | string  | `''`      | Gerrit target branch                                                     |
+| `gerrit_url`              | string  | `''`      | Gerrit server URL; empty falls back to the `GERRIT_URL` variable         |
 
 <!-- markdownlint-enable MD013 -->
 
