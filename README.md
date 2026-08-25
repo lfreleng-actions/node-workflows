@@ -298,6 +298,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      issues: read  # Grype scan reads approved CVE bypass issues
     uses: lfreleng-actions/node-workflows/.github/workflows/build-test.yaml@main
 ```
 
