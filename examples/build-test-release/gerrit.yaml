@@ -49,6 +49,7 @@ jobs:
       contents: write       # Create the GitHub release / attach assets
       id-token: write       # OIDC for build provenance attestations
       attestations: write   # Build provenance attestations
+      issues: read          # Grype scan reads approved CVE bypass issues
     # Pin to a specific node-workflows release SHA in production
     # instead of the mutable @main reference.
     # yamllint disable-line rule:line-length

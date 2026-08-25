@@ -126,6 +126,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read  # repository-metadata-action queries PR data
+      issues: read  # Grype scan reads approved CVE bypass issues
     # Pin to a specific node-workflows release SHA in production
     # instead of the mutable @main reference.
     # yamllint disable-line rule:line-length
