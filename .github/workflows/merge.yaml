@@ -268,7 +268,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
@@ -328,7 +328,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
@@ -450,7 +450,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
@@ -537,7 +537,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ (inputs.build_permit_egress_traffic || inputs.harden_runner_egress == 'audit') && 'audit' || 'block' }}
@@ -616,7 +616,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
@@ -734,7 +734,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
@@ -870,7 +870,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
@@ -1029,7 +1029,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
@@ -1129,7 +1129,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
@@ -1181,7 +1181,7 @@ jobs:
           config: ${{ inputs.harden_runner_allowlist }}
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           # yamllint disable-line rule:line-length
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
