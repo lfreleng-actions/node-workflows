@@ -343,7 +343,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f87b90a3370e62dad310797fedc7fd3700c75832  # v1.0.2
+        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -403,7 +403,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f87b90a3370e62dad310797fedc7fd3700c75832  # v1.0.2
+        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -531,7 +531,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f87b90a3370e62dad310797fedc7fd3700c75832  # v1.0.2
+        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -599,7 +599,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f87b90a3370e62dad310797fedc7fd3700c75832  # v1.0.2
+        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -687,7 +687,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f87b90a3370e62dad310797fedc7fd3700c75832  # v1.0.2
+        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -750,7 +750,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f87b90a3370e62dad310797fedc7fd3700c75832  # v1.0.2
+        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
