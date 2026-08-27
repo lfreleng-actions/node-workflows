@@ -42,10 +42,10 @@ jobs:
       contents: read
       id-token: write       # OIDC for provenance and Sigstore signing
       attestations: write   # Build provenance attestations
-    # Pin to a specific node-workflows release SHA in production
-    # instead of the mutable @main reference.
+    # REPLACE the pinned SHA below with a node-workflows release SHA.
+    # The all-zero SHA is a non-functional placeholder, NOT a real commit.
     # yamllint disable-line rule:line-length
-    uses: lfreleng-actions/node-workflows/.github/workflows/merge.yaml@main
+    uses: lfreleng-actions/node-workflows/.github/workflows/merge.yaml@0000000000000000000000000000000000000000  # REPLACE: vX.Y.Z
     with:
       # REQUIRED: the Nexus npm registries receiving publishes
       # yamllint disable-line rule:line-length
