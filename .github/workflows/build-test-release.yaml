@@ -1527,7 +1527,7 @@ jobs:
 
       - name: 'Publish package to Nexus'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@edbfa68ff0f9a87924ce4382053398188d1fc335  # v0.0.1
+        uses: lfreleng-actions/node-publish-action@4fa043fc3b2026ae76810959a5c9a74fc9679194  # v0.0.2
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ steps.publish-params.outputs.publish_version }}
