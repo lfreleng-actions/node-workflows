@@ -703,7 +703,7 @@ jobs:
       - name: 'Publish snapshot to Nexus'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@edbfa68ff0f9a87924ce4382053398188d1fc335  # v0.0.1
+        uses: lfreleng-actions/node-publish-action@4fa043fc3b2026ae76810959a5c9a74fc9679194  # v0.0.2
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ needs.resolve-version.outputs.snapshot_version }}
@@ -975,7 +975,7 @@ jobs:
       - name: 'Publish release to Nexus'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@edbfa68ff0f9a87924ce4382053398188d1fc335  # v0.0.1
+        uses: lfreleng-actions/node-publish-action@4fa043fc3b2026ae76810959a5c9a74fc9679194  # v0.0.2
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
           registry_url: ${{ inputs.release_registry_url }}
