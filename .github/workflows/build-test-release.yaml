@@ -764,7 +764,7 @@ jobs:
 
       - name: 'Build project'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@240bf4111c4ae035762a4ededde2a3c2d17237be  # v0.2.2
+        uses: lfreleng-actions/node-build-action@ec5cc8f3b49bd239667119aef97e4f03f55f921a  # v0.2.3
         with:
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
@@ -1060,7 +1060,7 @@ jobs:
       - name: 'Run tests'
         id: run-tests
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@240bf4111c4ae035762a4ededde2a3c2d17237be  # v0.2.2
+        uses: lfreleng-actions/node-build-action@ec5cc8f3b49bd239667119aef97e4f03f55f921a  # v0.2.3
         # The NO_BLOCK/soft-fail pattern: setting the
         # test_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
         # repository variable (an org/repo-wide override that
