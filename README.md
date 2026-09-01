@@ -119,13 +119,20 @@ and `sigstore_sign` to `false` if you would rather not grant them.
 Note the scope of what these cover. The tarball comes from a separate
 `npm pack`, not the one `npm publish` performs internally, so the
 provenance and signature attest to the artefact this workflow built
-rather than the exact bytes the registry received. The `pack-release`
-job mirrors the publish path's stamping, including running `version`
-lifecycle hooks, so the content set still matches where a project's
-hooks change files. Nexus npm repositories offer no registry-native
-provenance, which is why the artefact-level records exist at all;
-publishing to a registry that does support it (such as npmjs.org under
-trusted publishing) yields registry-native provenance too.
+rather than the exact bytes the registry received.
+
+The `pack-release` job stamps with the same flags
+`node-publish-action` uses, so version handling and workspace handling
+agree, and `prepack` and `prepare` run on both paths. One hook does
+not: npm runs `prepublishOnly` for `npm publish` and never for
+`npm pack`. A project generating content in that hook ships files the
+attestation does not cover. Issue #85 tracks removing the difference
+by publishing the same artefact the attestation describes.
+
+Nexus npm repositories offer no registry-native provenance, which is
+why the artefact-level records exist at all; publishing to a registry
+that does support it (such as npmjs.org under trusted publishing)
+yields registry-native provenance too.
 
 ## Inputs and Secrets
 
