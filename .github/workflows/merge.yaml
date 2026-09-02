@@ -567,7 +567,7 @@ jobs:
 
       - name: 'Build project'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@ec5cc8f3b49bd239667119aef97e4f03f55f921a  # v0.2.3
+        uses: lfreleng-actions/node-build-action@02ffec745cddf67291d0b28f64bd81990cae327f  # v0.2.4
         with:
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
@@ -703,7 +703,7 @@ jobs:
       - name: 'Publish snapshot to Nexus'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@4fa043fc3b2026ae76810959a5c9a74fc9679194  # v0.0.2
+        uses: lfreleng-actions/node-publish-action@70ac36607392be242d79cb194c62156b5c694a58  # v0.1.1
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ needs.resolve-version.outputs.snapshot_version }}
@@ -975,7 +975,7 @@ jobs:
       - name: 'Publish release to Nexus'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@4fa043fc3b2026ae76810959a5c9a74fc9679194  # v0.0.2
+        uses: lfreleng-actions/node-publish-action@70ac36607392be242d79cb194c62156b5c694a58  # v0.1.1
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
           registry_url: ${{ inputs.release_registry_url }}
@@ -1079,18 +1079,38 @@ jobs:
           # Stamp the resolved release version so the packed tarball
           # carries the version the publish job publishes.
           #
-          # Deliberately no --ignore-scripts here, unlike the stamp in
-          # build-test-release.yaml: this job exists to reproduce what
-          # release-publish packs, and node-publish-action stamps
-          # without it. Suppressing preversion/version/postversion
-          # hooks would let the attested tree diverge in content from
-          # the published one for any project defining them. Matching
-          # includes matching failure modes: a hook needing
-          # node_modules fails here exactly as it would there.
+          # These flags must match the stamp inside
+          # node-publish-action, because this job exists to reproduce
+          # what release-publish packs. Any difference lets the
+          # attested tree diverge in content from the published one,
+          # which is invisible until somebody tries to verify a
+          # package against its attestation.
+          #
+          # --ignore-scripts: neither this job nor the action installs
+          # dependencies, so preversion/version/postversion hooks
+          # cannot reliably run in either. Suppressing them in both is
+          # the only way the two produce the same tree.
+          #
+          # --no-workspaces: with workspaces enabled in configuration,
+          # 'npm version' stamps the workspace children and leaves the
+          # target at its committed version, and 'npm pack' packs the
+          # children instead of the target -- so the attestation would
+          # cover tarballs that were never published.
+          #
+          # The same pair appears in build-test-release.yaml, and the
+          # three sites are cross-referenced; see #58.
+          #
+          # These flags align the stamp, not the whole content set.
+          # npm runs prepublishOnly for 'npm publish' and never for
+          # 'npm pack', so a project generating content in that hook
+          # still ships files this tarball lacks. Removing that
+          # difference means publishing the artefact attested here
+          # rather than packing twice; see #85.
           npm version --no-git-tag-version --allow-same-version \
-            "${RELEASE_VERSION}"
+            --ignore-scripts --no-workspaces "${RELEASE_VERSION}"
           mkdir -p pack-dist
-          tarball=$(npm pack --pack-destination pack-dist | tail -n1)
+          tarball=$(npm pack --no-workspaces \
+            --pack-destination pack-dist | tail -n1)
           if [ ! -f "pack-dist/${tarball}" ]; then
             echo "::error::npm pack produced no tarball"
             exit 1

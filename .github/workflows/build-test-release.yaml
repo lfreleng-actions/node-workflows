@@ -763,18 +763,28 @@ jobs:
             echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
             exit 1
           fi
-          # Stamp package.json with the validated tag version;
-          # --ignore-scripts keeps project lifecycle scripts
-          # (preversion/version/postversion) from running before
-          # dependencies install
+          # Stamp package.json with the validated tag version.
+          #
+          # These flags must match the stamp inside
+          # node-publish-action, which publishes this project, and the
+          # pack-release job in merge.yaml, which attests it. All
+          # three produce a tree that has to be identical; see #58.
+          #
+          # --ignore-scripts: dependencies are not installed at this
+          # point, so preversion/version/postversion hooks cannot
+          # reliably run here or in the action.
+          #
+          # --no-workspaces: with workspaces enabled in configuration,
+          # 'npm version' stamps the workspace children and leaves the
+          # target at its committed version.
           cd "${PATH_PREFIX}"
           version="${TAG#v}"
           npm version --no-git-tag-version --allow-same-version \
-            --ignore-scripts "${version}"
+            --ignore-scripts --no-workspaces "${version}"
 
       - name: 'Build project'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@ec5cc8f3b49bd239667119aef97e4f03f55f921a  # v0.2.3
+        uses: lfreleng-actions/node-build-action@02ffec745cddf67291d0b28f64bd81990cae327f  # v0.2.4
         with:
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
@@ -796,10 +806,20 @@ jobs:
             exit 1
           fi
           # Produce the release tarball via npm pack (package.json
-          # already carries the stamped release version)
+          # already carries the stamped release version).
+          #
+          # --no-workspaces for the same reason as the stamp above:
+          # with workspaces enabled in configuration, npm pack packs
+          # the workspace children rather than the target, so the
+          # release would carry tarballs nobody asked for.
+          #
+          # npm runs prepublishOnly for 'npm publish' and never for
+          # 'npm pack', so this tarball can lack content the published
+          # one carries; see #85.
           cd "${PATH_PREFIX}"
           mkdir -p pack-dist
-          tarball=$(npm pack --pack-destination pack-dist | tail -n1)
+          tarball=$(npm pack --no-workspaces \
+            --pack-destination pack-dist | tail -n1)
           if [ ! -f "pack-dist/${tarball}" ]; then
             echo "::error::npm pack produced no tarball"
             exit 1
@@ -1070,7 +1090,7 @@ jobs:
       - name: 'Run tests'
         id: run-tests
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@ec5cc8f3b49bd239667119aef97e4f03f55f921a  # v0.2.3
+        uses: lfreleng-actions/node-build-action@02ffec745cddf67291d0b28f64bd81990cae327f  # v0.2.4
         # The NO_BLOCK/soft-fail pattern: setting the
         # test_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
         # repository variable (an org/repo-wide override that
@@ -1537,7 +1557,7 @@ jobs:
 
       - name: 'Publish package to Nexus'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@4fa043fc3b2026ae76810959a5c9a74fc9679194  # v0.0.2
+        uses: lfreleng-actions/node-publish-action@70ac36607392be242d79cb194c62156b5c694a58  # v0.1.1
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ steps.publish-params.outputs.publish_version }}
