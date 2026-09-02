@@ -92,3 +92,389 @@ jobs:
       test_permit_fail: ${{ matrix.test_permit_fail }}
       audit_permit_fail: ${{ matrix.audit_permit_fail }}
       grype_permit_fail: ${{ matrix.grype_permit_fail }}
+
+  # The publish-targets resolver is the one part of the merge and
+  # build-test-release publish paths that CI can exercise: it reads
+  # its inputs and touches nothing else, so it runs here directly.
+  # That matters because those two workflows are not self-tested (see
+  # the header), which would otherwise leave the target validation
+  # rules with no coverage at all.
+  publish-targets-valid:
+    name: 'Test: publish targets (valid)'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-targets.yaml
+    with:
+      label: 'self-test'
+      # yamllint disable-line rule:line-length
+      targets_json: '[{"name":"nexus","registry_url":"https://nexus3.example.org/repository/npm.release/","auth":"nexus"},{"name":"npmjs","registry_url":"https://registry.npmjs.org/","auth":"token","credential_name":"example-npmjs-token"}]'
+
+  publish-targets-scalar:
+    name: 'Test: publish targets (deprecated scalar)'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-targets.yaml
+    with:
+      label: 'self-test'
+      registry_url: 'https://nexus3.example.org/repository/npm.release/'
+
+  # Confirms the resolver produces what the publish jobs consume: a
+  # matrix of the expected length, and the scalar path flagged as
+  # deprecated so the notice cannot silently stop firing.
+  publish-targets-assert:
+    name: 'Test: publish targets (assertions)'
+    runs-on: ubuntu-latest
+    needs:
+      - 'publish-targets-valid'
+      - 'publish-targets-scalar'
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Assert resolved targets'
+        shell: bash
+        env:
+          LIST_MATRIX: ${{ needs.publish-targets-valid.outputs.matrix }}
+          LIST_COUNT: ${{ needs.publish-targets-valid.outputs.count }}
+          # yamllint disable-line rule:line-length
+          LIST_DEPRECATED: ${{ needs.publish-targets-valid.outputs.deprecated_scalar }}
+          SCALAR_COUNT: ${{ needs.publish-targets-scalar.outputs.count }}
+          # yamllint disable-line rule:line-length
+          SCALAR_MATRIX: ${{ needs.publish-targets-scalar.outputs.matrix }}
+          # yamllint disable-line rule:line-length
+          SCALAR_DEPRECATED: ${{ needs.publish-targets-scalar.outputs.deprecated_scalar }}
+        run: |
+          # Assert resolved targets
+          errors=0
+          if [ "${LIST_COUNT}" != "2" ]; then
+            echo "List form resolved ${LIST_COUNT} targets, expected 2 ❌"
+            errors=1
+          fi
+          if [ "${LIST_DEPRECATED}" != "false" ]; then
+            echo "List form reported as deprecated scalar ❌"
+            errors=1
+          fi
+          if [ "${SCALAR_COUNT}" != "1" ]; then
+            echo "Scalar form resolved ${SCALAR_COUNT} targets, expected 1 ❌"
+            errors=1
+          fi
+          # The deprecation notice is the only signal telling callers
+          # to migrate, so assert it fires rather than trusting it.
+          if [ "${SCALAR_DEPRECATED}" != "true" ]; then
+            echo "Scalar form was not flagged as deprecated ❌"
+            errors=1
+          fi
+          # The matrix has to carry the exact targets the publish jobs
+          # consume. Checking only that the keys exist would let a
+          # regression swap registry URLs or auth modes -- routing a
+          # credential to the wrong registry -- while staying green.
+          expected='[{"name":"nexus","registry_url":"https://nexus3.example.org/repository/npm.release/","auth":"nexus","credential_name":""},{"name":"npmjs","registry_url":"https://registry.npmjs.org/","auth":"token","credential_name":"example-npmjs-token"}]'
+          if ! printf '%s' "${LIST_MATRIX}" \
+            | jq -e --argjson want "${expected}" '. == $want' > /dev/null; then
+            echo "Resolved matrix does not match the expected targets ❌"
+            printf 'got:  %s\n' "${LIST_MATRIX}"
+            printf 'want: %s\n' "${expected}"
+            errors=1
+          fi
+          # The count output drives nothing on its own, but a count
+          # disagreeing with the matrix means one of them is wrong.
+          actual_len="$(printf '%s' "${LIST_MATRIX}" | jq -r 'length')"
+          if [ "${actual_len}" != "${LIST_COUNT}" ]; then
+            echo "count=${LIST_COUNT} but matrix holds ${actual_len} ❌"
+            errors=1
+          fi
+          # The scalar path is the backward-compatibility contract, so
+          # assert its whole matrix as the list path does. Checking the
+          # count alone would miss a regression in the legacy mapping --
+          # a changed URL, a renamed leg, or a different auth mode, any
+          # of which would route a credential somewhere unintended.
+          scalar_want='[{"name":"nexus","registry_url":"https://nexus3.example.org/repository/npm.release/","auth":"nexus","credential_name":""}]'
+          if ! printf '%s' "${SCALAR_MATRIX}" \
+            | jq -e --argjson want "${scalar_want}" '. == $want' \
+              > /dev/null; then
+            echo "Scalar matrix does not match the expected target ❌"
+            printf 'got:  %s\n' "${SCALAR_MATRIX}"
+            printf 'want: %s\n' "${scalar_want}"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Publish target resolution failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Publish target resolution correct ✅"
+          echo "Publish target resolution correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  # The success cases above prove the resolver accepts good input.
+  # They cannot prove it rejects bad input: a called reusable workflow
+  # that fails marks the run red, so the rejection rules cannot be
+  # exercised by calling the workflow. Without this job every
+  # validation rule could regress while CI stayed green.
+  #
+  # The validator body is extracted from publish-targets.yaml rather
+  # than restated, so this exercises the shipped rules. It cannot live
+  # in a script file the workflow imports: a reusable workflow called
+  # from another repository has no way to check out its own source.
+  publish-targets-rejections:
+    name: 'Test: publish targets (rejections)'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise every rejection rule'
+        shell: bash
+        run: |
+          # Exercise every rejection rule
+          validator="${RUNNER_TEMP}/resolve.py"
+          python3 - <<'EXTRACT' > "${validator}"
+          import textwrap
+          import yaml
+
+          with open('.github/workflows/publish-targets.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          run = doc['jobs']['resolve']['steps'][0]['run']
+          lines = run.split('\n')
+          start = next(
+              i for i, line in enumerate(lines)
+              if line.strip().startswith("python3 - <<'PY'")
+          )
+          end = next(
+              i for i, line in enumerate(lines)
+              if line.strip() == 'PY' and i > start
+          )
+          print(textwrap.dedent('\n'.join(lines[start + 1:end])))
+          EXTRACT
+          # Fail loudly rather than silently testing nothing if the
+          # step or the heredoc marker is renamed
+          if ! grep -q 'resolves to the same registry' "${validator}"; then
+            echo "Could not extract the validator ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          errors=0
+          # $1 case name, $2 want (accept|reject), $3 targets JSON
+          check() {
+            set +e
+            out="$(LABEL='self-test' TARGETS_JSON="$3" REGISTRY_URL='' \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/out.txt" \
+              python3 "${validator}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${rc}" != "0" ]; then
+              got='reject'
+            else
+              got='accept'
+            fi
+            if [ "${got}" != "$2" ]; then
+              echo "$1: validator ${got}ed, expected $2 ❌"
+              printf '%s\n' "${out}" | tail -2
+              errors=1
+              return
+            fi
+            # A non-zero exit alone would let a traceback count as a
+            # correct rejection. Every rejection has to arrive as a
+            # labelled error naming the target, which is the whole
+            # reason this job runs before the publish legs.
+            if [ "$2" = 'reject' ] \
+              && ! printf '%s' "${out}" | grep -q '^::error::'; then
+              echo "$1: rejected with a traceback, not an error ❌"
+              printf '%s\n' "${out}" | tail -3
+              errors=1
+            fi
+          }
+
+          npmjs='https://registry.npmjs.org/'
+          nexus='https://nexus3.example.org/repository/npm.release/'
+
+          check 'valid list' accept \
+            "[{\"name\":\"a\",\"registry_url\":\"${nexus}\",\"auth\":\"nexus\"}]"
+          # Neither input set: both resolver jobs always run, so this
+          # is a real caller mistake rather than a way to opt out
+          check 'nothing configured' reject ''
+          check 'invalid JSON' reject 'not json at all'
+          check 'not an array' reject '{"name":"a"}'
+          check 'empty array' reject '[]'
+          check 'entry not an object' reject '["nexus"]'
+          check 'missing name' reject \
+            "[{\"registry_url\":\"${nexus}\",\"auth\":\"nexus\"}]"
+          check 'missing registry_url' reject \
+            '[{"name":"a","auth":"nexus"}]'
+          check 'missing auth' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${nexus}\"}]"
+          check 'http scheme' reject \
+            '[{"name":"a","registry_url":"http://a.example.org/","auth":"nexus"}]'
+          # 'https://' as a prefix test alone accepts this
+          check 'no host' reject \
+            '[{"name":"a","registry_url":"https:///repository/","auth":"nexus"}]'
+          check 'no trailing slash' reject \
+            '[{"name":"a","registry_url":"https://a.example.org","auth":"nexus"}]'
+          check 'userinfo in url' reject \
+            '[{"name":"a","registry_url":"https://u:p@a.example.org/","auth":"nexus"}]'
+          check 'unsupported auth' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${nexus}\",\"auth\":\"basic\"}]"
+          # A non-string auth is unhashable, so a set-membership test
+          # would raise rather than name the target
+          check 'auth is an array' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${nexus}\",\"auth\":[]}]"
+          check 'auth is an object' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${nexus}\",\"auth\":{}}]"
+          check 'auth is a number' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${nexus}\",\"auth\":7}]"
+          # urlsplit defers port parsing to attribute access, so these
+          # surface late, as a ValueError, rather than at parse time
+          check 'non-numeric port' reject \
+            '[{"name":"a","registry_url":"https://a.example.org:abc/","auth":"nexus"}]'
+          check 'port out of range' reject \
+            '[{"name":"a","registry_url":"https://a.example.org:99999/","auth":"nexus"}]'
+          # OIDC is not wired up yet and must say so rather than pass
+          check 'oidc auth' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${nexus}\",\"auth\":\"oidc\"}]"
+          check 'name with newline' reject \
+            "[{\"name\":\"a\nb\",\"registry_url\":\"${nexus}\",\"auth\":\"nexus\"}]"
+          check 'duplicate name' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${nexus}\",\"auth\":\"nexus\"},{\"name\":\"a\",\"registry_url\":\"${npmjs}\",\"auth\":\"token\"}]"
+          check 'duplicate registry' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${npmjs}\",\"auth\":\"nexus\"},{\"name\":\"b\",\"registry_url\":\"${npmjs}\",\"auth\":\"token\"}]"
+          # Host case and the implicit :443 name one destination
+          check 'duplicate by host case' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${npmjs}\",\"auth\":\"nexus\"},{\"name\":\"b\",\"registry_url\":\"https://REGISTRY.NPMJS.ORG/\",\"auth\":\"token\"}]"
+          check 'duplicate by explicit 443' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${npmjs}\",\"auth\":\"nexus\"},{\"name\":\"b\",\"registry_url\":\"https://registry.npmjs.org:443/\",\"auth\":\"token\"}]"
+          # A different port is a different destination, and paths are
+          # case-sensitive: neither may be folded into a duplicate.
+          check 'different port accepted' accept \
+            '[{"name":"a","registry_url":"https://a.example.org/x/","auth":"nexus"},{"name":"b","registry_url":"https://a.example.org:8443/x/","auth":"nexus"}]'
+          check 'path case accepted' accept \
+            '[{"name":"a","registry_url":"https://a.example.org/Repo/","auth":"nexus"},{"name":"b","registry_url":"https://a.example.org/repo/","auth":"nexus"}]'
+          # Dot segments resolve to the same endpoint but compare as
+          # different strings, so two such targets would race
+          check 'dot-dot path segment' reject \
+            '[{"name":"a","registry_url":"https://a.example.org/x/../y/","auth":"nexus"}]'
+          check 'single-dot path segment' reject \
+            '[{"name":"a","registry_url":"https://a.example.org/x/./y/","auth":"nexus"}]'
+          # A terminal dot is the DNS root: 'host.' and 'host' are one
+          # destination, and would otherwise produce two matrix legs
+          check 'trailing dot in host' reject \
+            '[{"name":"a","registry_url":"https://a.example.org./","auth":"nexus"}]'
+          check 'trailing dot aliasing a sibling' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${npmjs}\",\"auth\":\"nexus\"},{\"name\":\"b\",\"registry_url\":\"https://registry.npmjs.org./\",\"auth\":\"token\"}]"
+          # urlsplit lowercases .scheme, so an uppercase prefix passes a
+          # scheme test and is then emitted unchanged
+          check 'uppercase scheme' reject \
+            '[{"name":"a","registry_url":"HTTPS://a.example.org/","auth":"nexus"}]'
+          # credential_name reaches credential-load-action and must be a
+          # safe single token
+          cred_base="[{\"name\":\"a\",\"registry_url\":\"${nexus}\","
+          cred_base="${cred_base}"'"auth":"nexus","credential_name":'
+          check 'credential_name not a string' reject \
+            "${cred_base}[]}]"
+          check 'credential_name unsafe chars' reject \
+            "${cred_base}\"a b;c\"}]"
+          # GitHub expands at most 256 matrix jobs; a longer list would
+          # otherwise fail during expansion, after the build.
+          #
+          # Generated via a heredoc so the body sits at the block
+          # scalar's base indentation: YAML strips that indentation, so
+          # python sees column 0. Lines written at column 0 here would
+          # instead break the block scalar itself.
+          python3 - <<'GEN' > "${RUNNER_TEMP}/targets.json"
+          import json
+
+          def targets(count):
+              return [
+                  {
+                      'name': f't{i}',
+                      'registry_url': f'https://a{i}.example.org/',
+                      'auth': 'nexus',
+                  }
+                  for i in range(count)
+              ]
+
+          print(json.dumps(targets(257)))
+          print(json.dumps(targets(256)))
+          GEN
+          oversized="$(sed -n '1p' "${RUNNER_TEMP}/targets.json")"
+          at_limit="$(sed -n '2p' "${RUNNER_TEMP}/targets.json")"
+          check 'more targets than the matrix limit' reject "${oversized}"
+          check 'exactly the matrix limit accepted' accept "${at_limit}"
+
+          # label prefixes every annotation this job emits and is a
+          # workflow input, so a newline in it would close the
+          # ::error:: command and let the remainder be read as another.
+          # This workflow is callable from other repositories, so the
+          # value is not necessarily one of this repository's own.
+          set +e
+          forged_label="$(printf 'release\n::warning::forged')"
+          forged="$(LABEL="${forged_label}" TARGETS_JSON='[]' \
+            REGISTRY_URL='' GITHUB_OUTPUT="${RUNNER_TEMP}/out.txt" \
+            python3 "${validator}" 2>&1)"
+          set -e
+          if printf '%s' "${forged}" | grep -q '^::warning::'; then
+            echo "A label forged a second workflow command ❌"
+            printf '%s\n' "${forged}"
+            errors=1
+          fi
+          if ! printf '%s' "${forged}" | grep -q 'label input'; then
+            echo "A multiline label was not rejected ❌"
+            errors=1
+          fi
+
+          # The deprecation notice is the only signal telling callers to
+          # migrate off the scalar input. Asserting the deprecated_scalar
+          # output does not cover it: deleting the notice would leave
+          # that output, and the assertion, unchanged.
+          set +e
+          scalar_out="$(LABEL='self-test' TARGETS_JSON='' \
+            REGISTRY_URL="${nexus}" \
+            GITHUB_OUTPUT="${RUNNER_TEMP}/out.txt" \
+            python3 "${validator}" 2>&1)"
+          set -e
+          if ! printf '%s' "${scalar_out}" \
+            | grep -q '::notice::.*deprecated'; then
+            echo "Scalar input emitted no deprecation notice ❌"
+            errors=1
+          fi
+
+          # The deprecation notice is the only signal telling callers to
+          # migrate off the scalar input. Asserting the deprecated_scalar
+          # output does not cover it: deleting the notice would leave
+          # that output, and the assertion, unchanged.
+          if [ "${errors}" != "0" ]; then
+            echo "Publish target rejection tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Every rejection rule behaved correctly ✅"
+          echo "Every rejection rule behaved correctly ✅" \
+            >> "$GITHUB_STEP_SUMMARY"

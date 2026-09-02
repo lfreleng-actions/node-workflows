@@ -99,18 +99,43 @@ on:
         default: true
 
       # --- Nexus/registry publishing ---
+      #
+      # Two forms. The *_targets inputs take a JSON array and can
+      # reach several registries; the *_registry_url inputs take one
+      # URL and are kept working for existing callers. Supplying a
+      # targets list makes the matching URL input inert.
+      snapshot_targets:
+        description: >-
+          JSON array of snapshot publish targets. Each entry needs
+          'name', 'registry_url' and 'auth' ('nexus' or 'token'), and
+          may carry 'credential_name' to name the 1Password item.
+          Empty falls back to snapshot_registry_url.
+        required: false
+        type: string
+        default: ''
+      release_targets:
+        description: >-
+          JSON array of release publish targets, in the same shape as
+          snapshot_targets. Empty falls back to release_registry_url.
+        required: false
+        type: string
+        default: ''
       snapshot_registry_url:
         description: >-
-          npm registry URL that receives snapshot publishes, e.g.
-          https://nexus3.example.org/repository/npm.snapshot/
-        required: true
+          Single npm registry URL that receives snapshot publishes,
+          e.g. https://nexus3.example.org/repository/npm.snapshot/
+          Deprecated: prefer snapshot_targets.
+        required: false
         type: string
+        default: ''
       release_registry_url:
         description: >-
-          npm registry URL that receives release publishes, e.g.
-          https://nexus3.example.org/repository/npm.release/
-        required: true
+          Single npm registry URL that receives release publishes,
+          e.g. https://nexus3.example.org/repository/npm.release/
+          Deprecated: prefer release_targets.
+        required: false
         type: string
+        default: ''
       nexus_user:
         description: >-
           Nexus username override; empty derives the username from the
@@ -596,15 +621,52 @@ jobs:
           # or empty build tree must fail here, not mid-publish
           if-no-files-found: error
 
+  # Resolve the publish target lists before either publish job, so a
+  # malformed targets input fails once, early, and names the offending
+  # entry -- rather than failing identically in every matrix leg after
+  # the build has already run.
+  resolve-snapshot-targets:
+    name: 'Resolve Snapshot Targets'
+    needs: gerrit-validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-targets.yaml
+    with:
+      label: 'snapshot'
+      targets_json: ${{ inputs.snapshot_targets }}
+      registry_url: ${{ inputs.snapshot_registry_url }}
+
+  resolve-release-targets:
+    name: 'Resolve Release Targets'
+    needs: gerrit-validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-targets.yaml
+    with:
+      label: 'release'
+      targets_json: ${{ inputs.release_targets }}
+      registry_url: ${{ inputs.release_registry_url }}
+
   snapshot-publish:
-    name: 'Publish Snapshot'
+    # The leg name comes from the target, so a failed check names the
+    # registry that failed rather than leaving the reader to open it.
+    name: 'Publish Snapshot (${{ matrix.target.name }})'
     runs-on: ubuntu-latest
     needs:
       - 'resolve-version'
       - 'node-metadata'
       - 'build'
+      - 'resolve-snapshot-targets'
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && needs.resolve-version.result == 'success' && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.resolve-version.result == 'success' && needs.build.result == 'success' && needs.resolve-snapshot-targets.result == 'success' }}
+    strategy:
+      # One registry rejecting a publish must not abandon the others:
+      # the legs are independent destinations for the same artefact,
+      # and a partial publish is easier to complete than to redo.
+      fail-fast: false
+      matrix:
+        # yamllint disable-line rule:line-length
+        target: ${{ fromJSON(needs.resolve-snapshot-targets.outputs.matrix) }}
     permissions:
       contents: read
     timeout-minutes: 10
@@ -683,8 +745,15 @@ jobs:
       # the workflow layer: composite actions cannot read vars, and the
       # grants list must never become a caller-facing input.
       # credential-load-action v2+ performs no checkout by default,
-      # so the downloaded artefact tree survives this step intact
-      - name: 'Load Nexus credential'
+      # so the downloaded artefact tree survives this step intact.
+      #
+      # credential_name lets each target name its own 1Password item,
+      # which is what makes several registries workable: a Nexus leg
+      # keeps the derived repository name, while a token leg names the
+      # item holding that registry's token. Empty keeps the derived
+      # name. The grants list still gates which items this repository
+      # may load, so naming one here cannot widen access.
+      - name: 'Load publish credential'
         id: load-credential
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
@@ -693,6 +762,7 @@ jobs:
           # yamllint disable-line rule:line-length
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          credential_name: ${{ matrix.target.credential_name }}
           credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
           export_env: 'false'
 
@@ -700,21 +770,28 @@ jobs:
       # design: they are replaced on every merge, and Nexus npm
       # repositories carry no registry-native provenance anyway. The
       # pack-release/attest/sign-artefacts jobs cover releases only.
-      - name: 'Publish snapshot to Nexus'
+      - name: 'Publish snapshot'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/node-publish-action@70ac36607392be242d79cb194c62156b5c694a58  # v0.1.1
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ needs.resolve-version.outputs.snapshot_version }}
-          registry_url: ${{ inputs.snapshot_registry_url }}
+          registry_url: ${{ matrix.target.registry_url }}
           path_prefix: ${{ inputs.path_prefix }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           dry_run: ${{ inputs.dry_run }}
           provenance: 'false'
           load_credential: 'false'
           nexus_user: ${{ steps.publish-params.outputs.nexus_user }}
-          nexus_password: ${{ steps.load-credential.outputs.credential }}
+          # One credential is loaded per leg; the target's auth mode
+          # decides which input it reaches. node-publish-action treats
+          # the modes as mutually exclusive and rejects two at once,
+          # so exactly one of these has to be non-empty.
+          # yamllint disable-line rule:line-length
+          nexus_password: ${{ matrix.target.auth == 'nexus' && steps.load-credential.outputs.credential || '' }}
+          # yamllint disable-line rule:line-length
+          auth_token: ${{ matrix.target.auth == 'token' && steps.load-credential.outputs.credential || '' }}
 
   check-release:
     name: 'Check for Release File'
@@ -827,7 +904,9 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
   release-publish:
-    name: 'Publish Release'
+    # The leg name comes from the target, so a failed check names the
+    # registry that failed rather than leaving the reader to open it.
+    name: 'Publish Release (${{ matrix.target.name }})'
     runs-on: ubuntu-latest
     needs:
       - 'check-release'
@@ -837,6 +916,15 @@ jobs:
       - 'pack-release'
       - 'attest'
       - 'sign-artefacts'
+      - 'resolve-release-targets'
+    strategy:
+      # One registry rejecting a publish must not abandon the others:
+      # the legs are independent destinations for the same artefact,
+      # and a partial publish is easier to complete than to redo.
+      fail-fast: false
+      matrix:
+        # yamllint disable-line rule:line-length
+        target: ${{ fromJSON(needs.resolve-release-targets.outputs.matrix) }}
     # Publishing waits on attestation and signing so that an enabled
     # record which fails blocks the publish rather than trailing it.
     # Hosted npm repositories are typically write-once, so a version
@@ -853,6 +941,7 @@ jobs:
       && needs.check-release.outputs.has_release == 'true'
       && needs.resolve-version.result == 'success'
       && needs.build.result == 'success'
+      && needs.resolve-release-targets.result == 'success'
       && (needs.pack-release.result == 'success'
       || needs.pack-release.result == 'skipped')
       && (needs.attest.result == 'success'
@@ -955,8 +1044,15 @@ jobs:
       # the workflow layer: composite actions cannot read vars, and the
       # grants list must never become a caller-facing input.
       # credential-load-action v2+ performs no checkout by default,
-      # so the downloaded artefact tree survives this step intact
-      - name: 'Load Nexus credential'
+      # so the downloaded artefact tree survives this step intact.
+      #
+      # credential_name lets each target name its own 1Password item,
+      # which is what makes several registries workable: a Nexus leg
+      # keeps the derived repository name, while a token leg names the
+      # item holding that registry's token. Empty keeps the derived
+      # name. The grants list still gates which items this repository
+      # may load, so naming one here cannot widen access.
+      - name: 'Load publish credential'
         id: load-credential
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
@@ -965,6 +1061,7 @@ jobs:
           # yamllint disable-line rule:line-length
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          credential_name: ${{ matrix.target.credential_name }}
           credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
           export_env: 'false'
 
@@ -972,20 +1069,27 @@ jobs:
       # registry-native provenance support. Release-grade provenance
       # comes from the attest and sign-artefacts jobs instead, which
       # cover the packed tarball rather than the registry record.
-      - name: 'Publish release to Nexus'
+      - name: 'Publish release'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/node-publish-action@70ac36607392be242d79cb194c62156b5c694a58  # v0.1.1
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
-          registry_url: ${{ inputs.release_registry_url }}
+          registry_url: ${{ matrix.target.registry_url }}
           path_prefix: ${{ inputs.path_prefix }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           dry_run: ${{ inputs.dry_run }}
           provenance: 'false'
           load_credential: 'false'
           nexus_user: ${{ steps.publish-params.outputs.nexus_user }}
-          nexus_password: ${{ steps.load-credential.outputs.credential }}
+          # One credential is loaded per leg; the target's auth mode
+          # decides which input it reaches. node-publish-action treats
+          # the modes as mutually exclusive and rejects two at once,
+          # so exactly one of these has to be non-empty.
+          # yamllint disable-line rule:line-length
+          nexus_password: ${{ matrix.target.auth == 'nexus' && steps.load-credential.outputs.credential || '' }}
+          # yamllint disable-line rule:line-length
+          auth_token: ${{ matrix.target.auth == 'token' && steps.load-credential.outputs.credential || '' }}
 
   # Pack a release tarball for attestation and signing.
   #

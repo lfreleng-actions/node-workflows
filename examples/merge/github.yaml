@@ -47,11 +47,48 @@ jobs:
     # yamllint disable-line rule:line-length
     uses: lfreleng-actions/node-workflows/.github/workflows/merge.yaml@0000000000000000000000000000000000000000  # REPLACE: vX.Y.Z
     with:
-      # REQUIRED: the Nexus npm registries receiving publishes
-      # yamllint disable-line rule:line-length
-      snapshot_registry_url: 'https://nexus3.example.org/repository/npm.snapshot/'
-      # yamllint disable-line rule:line-length
-      release_registry_url: 'https://nexus3.example.org/repository/npm.release/'
+      # REQUIRED: the npm registries receiving publishes.
+      #
+      # Each target publishes in its own matrix leg, so one registry
+      # failing does not abandon the others. 'auth' selects the
+      # credential form: 'nexus' for Basic auth, 'token' for a bearer
+      # token. registry.npmjs.org rejects Basic auth for publishing.
+      #
+      # 'credential_name' names the 1Password item holding that
+      # registry's credential; omit it to derive the name from the
+      # repository. The administrator-managed grants list still
+      # controls which items this repository may load.
+      snapshot_targets: |
+        [
+          {"name": "nexus",
+           "registry_url":
+             "https://nexus3.example.org/repository/npm.snapshot/",
+           "auth": "nexus"}
+        ]
+      #
+      # To publish to the public registry as well, replace the whole
+      # release_targets value with the two-entry form below. JSON has
+      # no comment syntax, so the extra entry cannot be shown inline
+      # inside the list:
+      #
+      #   release_targets: |
+      #     [
+      #       {"name": "nexus",
+      #        "registry_url":
+      #          "https://nexus3.example.org/repository/npm.release/",
+      #        "auth": "nexus"},
+      #       {"name": "npmjs",
+      #        "registry_url": "https://registry.npmjs.org/",
+      #        "auth": "token",
+      #        "credential_name": "example-npmjs-publish-token"}
+      #     ]
+      release_targets: |
+        [
+          {"name": "nexus",
+           "registry_url":
+             "https://nexus3.example.org/repository/npm.release/",
+           "auth": "nexus"}
+        ]
       # Optional tuning:
       # path_prefix: '.'              # project root (monorepo subdir, etc.)
       # node_version: ''              # override Node.js auto-detection
