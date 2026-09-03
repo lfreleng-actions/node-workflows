@@ -1,0 +1,361 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Resolve a list of npm publish targets into a job matrix.
+#
+# The publish workflows accept a JSON array of targets so one artefact
+# can reach several registries. workflow_call inputs cannot be arrays,
+# so the list arrives as a JSON string and this workflow validates it
+# and emits a matrix the caller expands with fromJSON().
+#
+# It exists as a reusable workflow rather than a job inside merge.yaml
+# for two reasons: merge.yaml is Gerrit-driven and cannot be exercised
+# from CI, whereas this can be called directly by testing.yaml; and
+# build-test-release.yaml needs the same resolution, which would
+# otherwise be a second copy of the rules.
+name: '[R] Resolve Publish Targets'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_call:
+    inputs:
+      targets_json:
+        description: >-
+          JSON array of publish targets. Each entry needs 'name',
+          'registry_url' and 'auth' ('nexus' or 'token'), and may
+          carry 'credential_name' to select a specific 1Password item.
+          Empty falls back to registry_url below.
+        required: false
+        type: string
+        default: ''
+      registry_url:
+        description: >-
+          Single registry URL, used when targets_json is empty. Kept
+          so existing callers keep working; resolves to a
+          one-element matrix using Nexus authentication.
+        required: false
+        type: string
+        default: ''
+      label:
+        description: >-
+          Names the lane in error messages, such as 'snapshot' or
+          'release'.
+        required: false
+        type: string
+        default: 'publish'
+    outputs:
+      matrix:
+        description: 'JSON array of validated targets, for fromJSON()'
+        value: ${{ jobs.resolve.outputs.matrix }}
+      count:
+        description: 'Number of resolved targets'
+        value: ${{ jobs.resolve.outputs.count }}
+      deprecated_scalar:
+        description: >-
+          'true' when the result came from registry_url rather than
+          targets_json.
+        value: ${{ jobs.resolve.outputs.deprecated_scalar }}
+
+permissions: {}
+
+jobs:
+  resolve:
+    name: 'Resolve Targets'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      count: ${{ steps.resolve.outputs.count }}
+      deprecated_scalar: ${{ steps.resolve.outputs.deprecated_scalar }}
+    steps:
+      # No checkout: this job reads its inputs and nothing from the
+      # repository, so it needs no source and no egress.
+      - name: 'Resolve publish targets'
+        id: resolve
+        shell: bash
+        env:
+          TARGETS_JSON: ${{ inputs.targets_json }}
+          REGISTRY_URL: ${{ inputs.registry_url }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          # Resolve publish targets
+          #
+          # Validation happens in python3 rather than jq: the rules are
+          # per-entry with cross-entry uniqueness checks, and the
+          # errors have to name which entry is wrong. Expressing that
+          # as a jq filter would be write-only.
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from urllib.parse import urlsplit
+
+          label = os.environ.get('LABEL') or 'publish'
+          raw = (os.environ.get('TARGETS_JSON') or '').strip()
+          scalar = (os.environ.get('REGISTRY_URL') or '').strip()
+
+          AUTH_MODES = {'nexus', 'token'}
+          # GitHub expands at most 256 jobs from a matrix. A longer list
+          # passes every rule below and then fails during expansion,
+          # with a platform error rather than this job's actionable one
+          # -- after the build has already run.
+          MAX_TARGETS = 256
+          # A registry URL reaches npm and the job summary, so hold it
+          # to the same character set node-publish-action accepts.
+          URL_ALLOWED = set(
+              'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+              'abcdefghijklmnopqrstuvwxyz'
+              '0123456789.:/_-'
+          )
+          # Names appear in job titles and must stay a single safe
+          # token so they cannot forge workflow commands.
+          NAME_ALLOWED = set(
+              'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+              'abcdefghijklmnopqrstuvwxyz'
+              '0123456789._-'
+          )
+
+
+          def fail(message: str) -> None:
+              print(f'::error::{label}: {message}')
+              sys.exit(1)
+
+
+          # label prefixes every annotation this job emits, so a newline
+          # in it would close the ::error:: command and let the rest be
+          # read as a second one -- forging warnings or notices from an
+          # input. This workflow is callable from other repositories, so
+          # the value is not necessarily one of this repository's own.
+          #
+          # Checked before anything else can emit an annotation, and the
+          # offending value is repr()'d rather than interpolated raw:
+          # printing the suspect value unescaped is how this class of
+          # bug gets reintroduced.
+          if set(label) - NAME_ALLOWED:
+              print(
+                  f'::error::label input {label!r} contains characters '
+                  'outside A-Z a-z 0-9 . _ -'
+              )
+              sys.exit(1)
+
+          deprecated = False
+
+          if raw:
+              try:
+                  targets = json.loads(raw)
+              except json.JSONDecodeError as exc:
+                  fail(
+                      f'targets input is not valid JSON ({exc}). Supply a '
+                      'JSON array of objects.'
+                  )
+          elif scalar:
+              # Backward compatibility: one registry, Nexus auth, which
+              # is what the scalar input has always meant.
+              deprecated = True
+              targets = [
+                  {'name': 'nexus', 'registry_url': scalar, 'auth': 'nexus'}
+              ]
+          else:
+              fail(
+                  'no publish targets configured. Set the targets input '
+                  'to a JSON array, or the registry URL input.'
+              )
+
+          if not isinstance(targets, list):
+              fail('targets input must be a JSON array of objects.')
+          if not targets:
+              fail(
+                  'targets input is an empty array. List at least one '
+                  'target: both publish lanes always resolve, so an empty '
+                  'list cannot be used to skip publishing.'
+              )
+          if len(targets) > MAX_TARGETS:
+              fail(
+                  f'targets input lists {len(targets)} targets; GitHub '
+                  f'expands at most {MAX_TARGETS} matrix jobs. Split the '
+                  'publish across more than one caller.'
+              )
+
+          seen_names: dict[str, int] = {}
+          seen_urls: dict[str, int] = {}
+          resolved = []
+
+          for index, entry in enumerate(targets):
+              where = f'target {index}'
+              if not isinstance(entry, dict):
+                  fail(f'{where} is not an object.')
+
+              name = entry.get('name')
+              if not isinstance(name, str) or not name:
+                  fail(f"{where} has no 'name'.")
+              if set(name) - NAME_ALLOWED:
+                  fail(
+                      f"{where} name {name!r} contains characters outside "
+                      'A-Z a-z 0-9 . _ -'
+                  )
+
+              url = entry.get('registry_url')
+              if not isinstance(url, str) or not url:
+                  fail(f"{where} ({name}) has no 'registry_url'.")
+              if set(url) - URL_ALLOWED:
+                  fail(
+                      f'{where} ({name}) registry_url contains characters '
+                      'this workflow refuses. Allowed: A-Z a-z 0-9 . : / _ -'
+                  )
+              # Parse rather than test the prefix. 'https://' alone is
+              # satisfied by 'https:///path/', which has no host: the
+              # resolver would pass it on and npm would reject it later,
+              # after the build, defeating the point of failing here.
+              parsed = urlsplit(url)
+              # urlsplit lowercases .scheme, so testing it alone accepts
+              # 'HTTPS://host/' -- which is then emitted unchanged, and
+              # node-publish-action only accepts the lowercase prefix.
+              # Reject it here rather than in every publish leg.
+              if parsed.scheme != 'https' or not url.startswith('https://'):
+                  fail(
+                      f'{where} ({name}) registry_url must begin with a '
+                      'lowercase "https://"; npm credentials must never '
+                      'cross a cleartext connection, and the publish '
+                      'action matches the prefix exactly.'
+                  )
+              if not parsed.hostname:
+                  fail(
+                      f'{where} ({name}) registry_url has no host. Expected '
+                      'https://host/path/'
+                  )
+              # A terminal dot is the DNS root, so 'host.' and 'host'
+              # resolve identically and would otherwise produce two
+              # keys for one destination. Rejected rather than trimmed,
+              # for the same reason as the uppercase scheme below: npm
+              # uses the URL as written when deriving its credential
+              # key, so rewriting it here would publish to one host
+              # while looking the credential up under another. A
+              # trailing dot also breaks certificate matching in some
+              # TLS stacks, so it is worth refusing on its own terms.
+              if parsed.hostname.endswith('.'):
+                  fail(
+                      f'{where} ({name}) registry_url host ends with a ".". '
+                      'Drop it: it names the same host and would let one '
+                      'registry appear twice under different spellings.'
+                  )
+              if not url.endswith('/'):
+                  fail(
+                      f'{where} ({name}) registry_url must end with "/". '
+                      'npm derives its credential key from the URL path, '
+                      'and a missing slash silently changes that key.'
+                  )
+              # '/repository/tmp/../npm.release/' and
+              # '/repository/npm.release/' name one endpoint once dot
+              # segments resolve, but compare as different strings --
+              # so both legs would run and race. Rejecting is preferred
+              # to normalising: npm stores credentials under the path as
+              # written, so a rewritten URL would resolve differently
+              # there than the one the caller configured.
+              segments = parsed.path.split('/')
+              if '.' in segments or '..' in segments:
+                  fail(
+                      f'{where} ({name}) registry_url path contains a "." '
+                      'or ".." segment. Give the resolved path, so the '
+                      'same registry cannot appear twice under different '
+                      'spellings.'
+                  )
+
+              auth = entry.get('auth')
+              # Check the type before the membership test. A JSON value
+              # such as [] or {} is unhashable, and `auth in AUTH_MODES`
+              # would raise TypeError -- replacing this job's whole
+              # purpose, an error naming the offending target, with a
+              # traceback.
+              if not isinstance(auth, str) or auth not in AUTH_MODES:
+                  supported = ', '.join(sorted(AUTH_MODES))
+                  extra = ''
+                  if auth == 'oidc':
+                      extra = (
+                          " OIDC trusted publishing is not wired up yet; "
+                          'see issue #54.'
+                      )
+                  fail(
+                      f"{where} ({name}) has auth {auth!r}; expected one of "
+                      f'{supported}.{extra}'
+                  )
+
+              credential_name = entry.get('credential_name', '')
+              if not isinstance(credential_name, str):
+                  fail(f"{where} ({name}) credential_name must be a string.")
+              if set(credential_name) - NAME_ALLOWED:
+                  fail(
+                      f'{where} ({name}) credential_name contains characters '
+                      'outside A-Z a-z 0-9 . _ -'
+                  )
+
+              # Duplicates are always a mistake and the failure they
+              # cause is confusing: two legs race to publish the same
+              # version to the same place, and one loses with EPUBLISH-
+              # CONFLICT on a version that did publish.
+              if name in seen_names:
+                  fail(
+                      f'{where} reuses the name {name!r} from target '
+                      f'{seen_names[name]}. Names label the matrix legs '
+                      'and must be unique.'
+                  )
+              seen_names[name] = index
+
+              # Compare destinations, not spellings. Scheme and host
+              # are case-insensitive and the default port is implicit,
+              # so 'https://REGISTRY.NPMJS.ORG:443/' and
+              # 'https://registry.npmjs.org/' name one destination.
+              # Raw string comparison lets both through, and the two
+              # legs then race to publish one version to one registry.
+              # The path stays case-sensitive, because it is.
+              # urlsplit defers port parsing to attribute access, so
+              # this is where a non-numeric or out-of-range port such
+              # as 'https://host:abc/' or ':99999' surfaces -- as a
+              # ValueError, which would escape as a traceback rather
+              # than naming the target.
+              try:
+                  port = parsed.port
+              except ValueError as exc:
+                  fail(f'{where} ({name}) registry_url has a bad port ({exc}).')
+              host = parsed.hostname.lower()
+              if port is not None and port != 443:
+                  host = f'{host}:{port}'
+              destination = f'https://{host}{parsed.path}'
+
+              if destination in seen_urls:
+                  other = seen_urls[destination]
+                  fail(
+                      f'{where} ({name}) resolves to the same registry as '
+                      f'target {other}. Publishing the same version twice '
+                      'to one registry cannot succeed.'
+                  )
+              seen_urls[destination] = index
+
+              resolved.append(
+                  {
+                      'name': name,
+                      'registry_url': url,
+                      'auth': auth,
+                      'credential_name': credential_name,
+                  }
+              )
+
+          matrix = json.dumps(resolved, separators=(',', ':'))
+          output = os.environ['GITHUB_OUTPUT']
+          with open(output, 'a', encoding='utf-8') as handle:
+              handle.write(f'matrix={matrix}\n')
+              handle.write(f'count={len(resolved)}\n')
+              handle.write(f'deprecated_scalar={str(deprecated).lower()}\n')
+
+          names = ', '.join(t['name'] for t in resolved)
+          print(f'Resolved {len(resolved)} {label} target(s): {names}')
+
+          if deprecated:
+              print(
+                  '::notice::The single registry URL input is deprecated. '
+                  'Move to the targets input, which takes a JSON array and '
+                  'supports publishing to more than one registry.'
+              )
+          PY
