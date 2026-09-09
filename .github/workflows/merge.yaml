@@ -812,7 +812,7 @@ jobs:
       - name: 'Publish snapshot'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@70ac36607392be242d79cb194c62156b5c694a58  # v0.1.1
+        uses: lfreleng-actions/node-publish-action@dc6e147d968b3f94f3a178d9c42f61f8aaabf6d7  # v0.1.2
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ needs.resolve-version.outputs.snapshot_version }}
@@ -1113,7 +1113,7 @@ jobs:
       - name: 'Publish release'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@70ac36607392be242d79cb194c62156b5c694a58  # v0.1.1
+        uses: lfreleng-actions/node-publish-action@dc6e147d968b3f94f3a178d9c42f61f8aaabf6d7  # v0.1.2
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
           registry_url: ${{ matrix.target.registry_url }}

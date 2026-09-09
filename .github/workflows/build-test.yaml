@@ -782,7 +782,7 @@ jobs:
       # lacks one, so legacy projects still get audit coverage
       - name: 'Audit dependencies'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-audit-action@32003597c05c79445e7abc1fdc3228cbf1cbafda  # v0.0.2
+        uses: lfreleng-actions/node-audit-action@e2fb529140ff803c457451f16c2bc12107e1a5d3  # v0.0.3
         with:
           path_prefix: ${{ inputs.path_prefix }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
