@@ -13,6 +13,38 @@
 # does -- is the only way to audit them.
 
 rules:
+  self-repository:
+    ignore:
+      # zizmor recommends GitHub's '$/...' self-repository syntax over
+      # the workspace-relative './...' form, and it is right to: the
+      # '$/' form cannot resolve to something a previous step cloned
+      # onto the runner, and it counts as pinning for policy purposes.
+      #
+      # actionlint does not know that syntax yet and rejects it as a
+      # malformed reusable-workflow call, failing a mandatory gate:
+      #   rhysd/actionlint#711, rhysd/actionlint#732
+      #
+      # Both are open, so no version bump resolves this. Silencing
+      # actionlint would be the worse trade -- it validates whether a
+      # workflow call is well formed at all, where this is advisory --
+      # so the './' form stays until actionlint supports '$/'.
+      #
+      # Scoped per LINE, naming the five reusable-workflow calls that
+      # exist today. A file-scoped entry would also cover step-level
+      # 'uses: ./...' clauses, and those are the case this rule most
+      # needs to catch: a step-local action resolved after an
+      # attacker-controlled checkout is exactly the runtime
+      # substitution '$/' exists to prevent. Line drift then fails
+      # safe, reporting the finding again rather than hiding a new one.
+      #
+      # When actionlint lands support: drop this block and rewrite
+      # every 'uses: ./.github/workflows/...' to 'uses: $/...'.
+      - merge.yaml:633
+      - merge.yaml:644
+      - testing.yaml:87
+      - testing.yaml:106
+      - testing.yaml:116
+
   impostor-commit:
     ignore:
       # The example callers pin an all-zero placeholder SHA. It cannot

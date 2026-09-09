@@ -85,10 +85,10 @@ projects. Every merge publishes a snapshot: the `build-metadata-action`
 parses `version.properties` (`major=`/`minor=`/`patch=` keys, a
 combined `release_version=X.Y.Z` key, or a `version=X.Y.Z` key,
 skipping Jenkins-era `${...}` interpolated values) and the
-workflow publishes `X.Y.Z-SNAPSHOT` to `snapshot_registry_url`. When
+workflow publishes `X.Y.Z-SNAPSHOT` to the snapshot targets. When
 the merged commit adds a file under `releases/` whose `version:`
 matches `version.properties`, the workflow also publishes the plain
-`X.Y.Z` release to `release_registry_url`. A version mismatch between
+`X.Y.Z` release to the release targets. A version mismatch between
 the release file and `version.properties` fails the release publish.
 
 Release publishes also gain attestation and a signature. The build job
@@ -213,26 +213,28 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 
 <!-- markdownlint-disable MD013 -->
 
-| Input                     | Type    | Default   | Description                                                              |
-| ------------------------- | ------- | --------- | ------------------------------------------------------------------------ |
-| `repository`              | string  | `''`      | Repository to check out (owner/name); empty uses the caller              |
-| `ref`                     | string  | `''`      | Checkout ref (empty = event ref; other repos: default branch)            |
-| `path_prefix`             | string  | `'.'`     | Path to the project root directory                                       |
-| `node_version`            | string  | `''`      | Node.js version; empty auto-detects `engines.node`, then 22              |
-| `build_tool`              | string  | `''`      | `npm` or `yarn`; empty auto-detects from project metadata                |
-| `build_scripts`           | string  | `'build'` | package.json script(s) the build job runs                                |
-| `attestations`            | boolean | `true`    | SLSA build provenance for the packed release tarball (release publishes) |
-| `sigstore_sign`           | boolean | `true`    | Sign the packed release tarball with Sigstore (release publishes)        |
-| `snapshot_registry_url`   | string  | (none)    | REQUIRED: npm registry URL that receives snapshot publishes              |
-| `release_registry_url`    | string  | (none)    | REQUIRED: npm registry URL that receives release publishes               |
-| `nexus_user`              | string  | `''`      | Nexus username override; empty derives it from the repository name       |
-| `dry_run`                 | boolean | `false`   | Run the publish steps without uploading                                  |
-| `harden_runner_egress`    | string  | `'block'` | Harden-runner egress policy: `block` or `audit`                          |
-| `harden_runner_allowlist` | string  | (pinned)  | Out-of-band harden-runner allow-list configuration                       |
-| `gerrit_refspec`          | string  | `''`      | Gerrit refspec of the merged change                                      |
-| `gerrit_project`          | string  | `''`      | Gerrit project name                                                      |
-| `gerrit_branch`           | string  | `''`      | Gerrit target branch                                                     |
-| `gerrit_url`              | string  | `''`      | Gerrit server URL; empty falls back to the `GERRIT_URL` variable         |
+| Input                     | Type    | Default   | Description                                                                                                                      |
+| ------------------------- | ------- | --------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `repository`              | string  | `''`      | Repository to check out (owner/name); empty uses the caller                                                                      |
+| `ref`                     | string  | `''`      | Checkout ref (empty = event ref; other repos: default branch)                                                                    |
+| `path_prefix`             | string  | `'.'`     | Path to the project root directory                                                                                               |
+| `node_version`            | string  | `''`      | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
+| `build_tool`              | string  | `''`      | `npm` or `yarn`; empty auto-detects from project metadata                                                                        |
+| `build_scripts`           | string  | `'build'` | package.json script(s) the build job runs                                                                                        |
+| `attestations`            | boolean | `true`    | SLSA build provenance for the packed release tarball (release publishes)                                                         |
+| `sigstore_sign`           | boolean | `true`    | Sign the packed release tarball with Sigstore (release publishes)                                                                |
+| `snapshot_targets`        | string  | `''`      | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
+| `release_targets`         | string  | `''`      | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
+| `snapshot_registry_url`   | string  | `''`      | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
+| `release_registry_url`    | string  | `''`      | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
+| `nexus_user`              | string  | `''`      | Nexus username override; empty derives it from the repository name                                                               |
+| `dry_run`                 | boolean | `false`   | Run the publish steps without uploading                                                                                          |
+| `harden_runner_egress`    | string  | `'block'` | Harden-runner egress policy: `block` or `audit`                                                                                  |
+| `harden_runner_allowlist` | string  | (pinned)  | Out-of-band harden-runner allow-list configuration                                                                               |
+| `gerrit_refspec`          | string  | `''`      | Gerrit refspec of the merged change                                                                                              |
+| `gerrit_project`          | string  | `''`      | Gerrit project name                                                                                                              |
+| `gerrit_branch`           | string  | `''`      | Gerrit target branch                                                                                                             |
+| `gerrit_url`              | string  | `''`      | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                                                                 |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -248,6 +250,73 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 The secrets stay optional so PR and self-test contexts work; the
 publish steps check credential availability and skip with a warning
 when the secrets stay unset.
+
+## Publish Targets
+
+Each lane needs **one** of its two forms. Leaving both
+`snapshot_targets` and `snapshot_registry_url` empty fails the
+workflow, and likewise for the release lane: both lanes always
+resolve, so an empty configuration is a mistake rather than a way to
+opt out of publishing. Use `dry_run` to run the publish steps without
+uploading.
+
+`merge.yaml` can publish one artefact to more than one registry. Both
+lanes take a JSON array, fanned out as a matrix so each registry
+publishes in parallel and fails on its own:
+
+```yaml
+    release_targets: |
+      [
+        {"name": "nexus",
+         "registry_url": "https://nexus3.example.org/repository/npm.release/",
+         "auth": "nexus"},
+        {"name": "npmjs",
+         "registry_url": "https://registry.npmjs.org/",
+         "auth": "token",
+         "credential_name": "example-npmjs-publish-token"}
+      ]
+```
+
+<!-- markdownlint-disable MD013 -->
+
+| Field             | Required | Meaning                                                                          |
+| ----------------- | -------- | -------------------------------------------------------------------------------- |
+| `name`            | Yes      | Labels the matrix leg, so a failed check names the registry. Unique per list     |
+| `registry_url`    | Yes      | Absolute `https` URL ending in `/`. Unique per list                              |
+| `auth`            | Yes      | `nexus` for Basic auth, `token` for a bearer token                               |
+| `credential_name` | No       | 1Password item holding the credential; empty derives it from the repository name |
+
+<!-- markdownlint-enable MD013 -->
+
+`registry.npmjs.org` rejects Basic auth for publishing, so a target
+aiming there needs `auth: token`.
+
+Each leg loads its own credential, which is what lets one lane reach
+registries with unrelated credentials. `credential_name` still passes
+through the admin-managed `CREDENTIAL_LOAD_GRANTS` allow-list, so
+naming an item here cannot widen what a repository may read.
+
+`fail-fast` stays off. The legs are independent destinations for the
+same artefact, and completing a partial publish is easier than
+redoing a whole one.
+
+A malformed list fails once in a `Resolve Targets` job before the
+publish legs start, naming the offending entry. The resolver also
+refuses duplicate names and duplicate registry URLs: two legs
+publishing the same version to one registry cannot both succeed, and
+the loser fails with `EPUBLISHCONFLICT` on a version that did publish.
+
+> [!NOTE]
+> OIDC trusted publishing is not available as an `auth` mode yet. It
+> needs `id-token: write`, which GitHub cannot grant per matrix leg,
+> so issue #54 tracks it separately.
+
+### Migrating from the single-URL inputs
+
+`snapshot_registry_url` and `release_registry_url` still work and
+resolve to a one-element list using `nexus` auth, which is what they
+have always meant. A run using them emits a deprecation notice.
+Supplying a targets list makes the matching URL input inert.
 
 ## Credential Contract (Nexus publishing)
 
