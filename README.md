@@ -140,35 +140,37 @@ yields registry-native provenance too.
 
 <!-- markdownlint-disable MD013 -->
 
-| Input                     | Type    | Default    | Description                                                          |
-| ------------------------- | ------- | ---------- | -------------------------------------------------------------------- |
-| `repository`              | string  | `''`       | Repository to check out (owner/name); empty uses the caller          |
-| `ref`                     | string  | `''`       | Checkout ref (empty = event ref; other repos: default branch)        |
-| `path_prefix`             | string  | `'.'`      | Path to the project root directory                                   |
-| `node_version`            | string  | `''`       | Node.js version; empty auto-detects `engines.node`, then 22          |
-| `build_tool`              | string  | `''`       | `npm` or `yarn`; empty auto-detects from project metadata            |
-| `build_scripts`           | string  | `'build'`  | package.json script(s) the build job runs                            |
-| `tests_enabled`           | boolean | `true`     | Run the tests job (set false to skip tests)                          |
-| `test_script`             | string  | `'test'`   | package.json test script(s); comma/space/newline separated list      |
-| `test_permit_fail`        | boolean | `false`    | Permit test failures without failing the workflow                    |
-| `test_artifact_path`      | string  | `''`       | Test output/report path uploaded as an artefact; empty disables      |
-| `audit_enabled`           | boolean | `true`     | Run the dependency audit job (set false to skip)                     |
-| `audit_level`             | string  | `'high'`   | npm audit severity threshold that fails the audit                    |
-| `production_only`         | boolean | `false`    | Restrict the audit to production dependencies                        |
-| `audit_permit_fail`       | boolean | `false`    | Permit dependency audit failures (the NO_BLOCK pattern)              |
-| `sbom_enabled`            | boolean | `true`     | Generate an SBOM (set false to skip; Grype then has nothing to scan) |
-| `grype_enabled`           | boolean | `true`     | Run the Grype scan (set false to keep the SBOM but skip the scan)    |
-| `grype_fail_on`           | string  | `'medium'` | Severity threshold that fails the Grype scan                         |
-| `grype_permit_fail`       | boolean | `false`    | Permit Grype findings without failing the job                        |
-| `build_timeout_minutes`   | number  | `15`       | Timeout (minutes) for the build job                                  |
-| `test_timeout_minutes`    | number  | `10`       | Timeout (minutes) for the tests job                                  |
-| `audit_timeout_minutes`   | number  | `10`       | Timeout (minutes) for the audit, SBOM and Grype jobs                 |
-| `harden_runner_egress`    | string  | `'block'`  | Harden-runner egress policy: `block` or `audit`                      |
-| `harden_runner_allowlist` | string  | (pinned)   | Out-of-band harden-runner allow-list configuration                   |
-| `gerrit_refspec`          | string  | `''`       | Gerrit refspec of the change under test                              |
-| `gerrit_project`          | string  | `''`       | Gerrit project name                                                  |
-| `gerrit_branch`           | string  | `''`       | Gerrit target branch                                                 |
-| `gerrit_url`              | string  | `''`       | Gerrit server URL; empty falls back to the `GERRIT_URL` variable     |
+| Input                     | Type    | Default    | Description                                                                    |
+| ------------------------- | ------- | ---------- | ------------------------------------------------------------------------------ |
+| `repository`              | string  | `''`       | Repository to check out (owner/name); empty uses the caller                    |
+| `ref`                     | string  | `''`       | Checkout ref (empty = event ref; other repos: default branch)                  |
+| `path_prefix`             | string  | `'.'`      | Path to the project root directory                                             |
+| `node_version`            | string  | `''`       | Node.js version; empty auto-detects `engines.node`, then 22                    |
+| `build_node_version`      | string  | `''`       | Node.js for jobs running the project's toolchain; empty follows `node_version` |
+| `test_node_version`       | string  | `''`       | Node.js for the tests job; empty follows `node_version`                        |
+| `build_tool`              | string  | `''`       | `npm` or `yarn`; empty auto-detects from project metadata                      |
+| `build_scripts`           | string  | `'build'`  | package.json script(s) the build job runs                                      |
+| `tests_enabled`           | boolean | `true`     | Run the tests job (set false to skip tests)                                    |
+| `test_script`             | string  | `'test'`   | package.json test script(s); comma/space/newline separated list                |
+| `test_permit_fail`        | boolean | `false`    | Permit test failures without failing the workflow                              |
+| `test_artifact_path`      | string  | `''`       | Test output/report path uploaded as an artefact; empty disables                |
+| `audit_enabled`           | boolean | `true`     | Run the dependency audit job (set false to skip)                               |
+| `audit_level`             | string  | `'high'`   | npm audit severity threshold that fails the audit                              |
+| `production_only`         | boolean | `false`    | Restrict the audit to production dependencies                                  |
+| `audit_permit_fail`       | boolean | `false`    | Permit dependency audit failures (the NO_BLOCK pattern)                        |
+| `sbom_enabled`            | boolean | `true`     | Generate an SBOM (set false to skip; Grype then has nothing to scan)           |
+| `grype_enabled`           | boolean | `true`     | Run the Grype scan (set false to keep the SBOM but skip the scan)              |
+| `grype_fail_on`           | string  | `'medium'` | Severity threshold that fails the Grype scan                                   |
+| `grype_permit_fail`       | boolean | `false`    | Permit Grype findings without failing the job                                  |
+| `build_timeout_minutes`   | number  | `15`       | Timeout (minutes) for the build job                                            |
+| `test_timeout_minutes`    | number  | `10`       | Timeout (minutes) for the tests job                                            |
+| `audit_timeout_minutes`   | number  | `10`       | Timeout (minutes) for the audit, SBOM and Grype jobs                           |
+| `harden_runner_egress`    | string  | `'block'`  | Harden-runner egress policy: `block` or `audit`                                |
+| `harden_runner_allowlist` | string  | (pinned)   | Out-of-band harden-runner allow-list configuration                             |
+| `gerrit_refspec`          | string  | `''`       | Gerrit refspec of the change under test                                        |
+| `gerrit_project`          | string  | `''`       | Gerrit project name                                                            |
+| `gerrit_branch`           | string  | `''`       | Gerrit target branch                                                           |
+| `gerrit_url`              | string  | `''`       | Gerrit server URL; empty falls back to the `GERRIT_URL` variable               |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -219,6 +221,7 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 | `ref`                     | string  | `''`      | Checkout ref (empty = event ref; other repos: default branch)                                                                    |
 | `path_prefix`             | string  | `'.'`     | Path to the project root directory                                                                                               |
 | `node_version`            | string  | `''`      | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
+| `build_node_version`      | string  | `''`      | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
 | `build_tool`              | string  | `''`      | `npm` or `yarn`; empty auto-detects from project metadata                                                                        |
 | `build_scripts`           | string  | `'build'` | package.json script(s) the build job runs                                                                                        |
 | `attestations`            | boolean | `true`    | SLSA build provenance for the packed release tarball (release publishes)                                                         |
@@ -250,6 +253,69 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 The secrets stay optional so PR and self-test contexts work; the
 publish steps check credential availability and skip with a warning
 when the secrets stay unset.
+
+## Node.js Version Selection
+
+`node_version` sets the Node.js used across the pipeline. Empty (the
+default) takes a plain `engines.node` from `package.json`, and falls
+back to 22.
+
+Two optional inputs narrow that for the jobs that run the **project's
+own toolchain**, leaving everything else on `node_version`:
+
+<!-- markdownlint-disable MD013 -->
+
+| Input                | Applies to                              | Empty means            |
+| -------------------- | --------------------------------------- | ---------------------- |
+| `build_node_version` | the `build` job                         | follow `node_version`  |
+| `test_node_version`  | the `tests` job (not in `merge.yaml`)   | follow `node_version`  |
+
+<!-- markdownlint-enable MD013 -->
+
+Everything else stays on `node_version`, for two different reasons.
+Packing and publishing consume the built artefact rather than
+rebuilding it. The dependency audit never builds at all — it takes a
+fresh checkout and reads the dependency tree. Neither needs a project
+toolchain of its own.
+
+> [!IMPORTANT]
+> That is not the same as running no project code. `npm pack` and
+> `npm publish` execute `prepack` and `prepare`, and `npm publish`
+> also runs `prepublishOnly` (see
+> [the note on attestation scope](#release-models)). Those hooks run
+> under `node_version`, **not** `build_node_version`, so a project
+> splitting the two must keep its packing hooks compatible with the
+> newer toolchain. Hooks that need the legacy toolchain belong in the
+> build script instead, where `build_node_version` applies.
+
+### When you need this
+
+A legacy dependency tree can cap the build below what the release
+lane requires, leaving no single version that satisfies both.
+
+For example, `node-sass 4.9.2` stops shipping prebuilt bindings after
+Node 10, and falls back to a source compile that fails on newer
+runners. Meanwhile `pack-release` uses `npm pack --pack-destination`,
+which arrived in npm 7 (Node 15+); under npm 6 npm ignores the flag,
+the tarball lands in the working directory and the job fails with
+`npm pack produced no tarball`.
+
+Splitting the two lets such a project adopt these workflows:
+
+```yaml
+    with:
+      # The pack/publish jobs stay on a modern toolchain
+      node_version: '22'
+      # ...while the project itself compiles on the version its
+      # dependency tree supports
+      build_node_version: '10'
+      # Tests often run somewhere newer again
+      test_node_version: '18'
+```
+
+The overrides accept the same forms as `node_version`, including
+aliases such as `lts/*`, and share its character set — these values
+reach `actions/setup-node` and the job summary.
 
 ## Publish Targets
 

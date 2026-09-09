@@ -51,6 +51,23 @@ on:
         required: false
         type: string
         default: ''
+      build_node_version:
+        description: >-
+          Node.js version for jobs that run the project's own
+          toolchain. Empty (the default) follows node_version. Set
+          this when a legacy dependency tree caps the build below the
+          version the pack/publish jobs need.
+        required: false
+        type: string
+        default: ''
+      test_node_version:
+        description: >-
+          Node.js version for the test job. Empty (the default)
+          follows node_version. Projects needing build_node_version
+          often test on a newer toolchain than they build on.
+        required: false
+        type: string
+        default: ''
       build_tool:
         description: >-
           Build tool: 'npm' or 'yarn'. Empty (the default) auto-detects
@@ -391,6 +408,10 @@ jobs:
       node_version: ${{ steps.resolve.outputs.node_version }}
       build_tool: ${{ steps.resolve.outputs.build_tool }}
       # yamllint disable-line rule:line-length
+      build_node_version: ${{ steps.resolve.outputs.build_node_version }}
+      # yamllint disable-line rule:line-length
+      test_node_version: ${{ steps.resolve.outputs.test_node_version }}
+      # yamllint disable-line rule:line-length
       has_lock_file: ${{ steps.build-metadata.outputs.javascript_has_lock_file }}
     permissions:
       contents: read
@@ -445,6 +466,8 @@ jobs:
         shell: bash
         env:
           NODE_VERSION_INPUT: ${{ inputs.node_version }}
+          BUILD_NODE_VERSION_INPUT: ${{ inputs.build_node_version }}
+          TEST_NODE_VERSION_INPUT: ${{ inputs.test_node_version }}
           BUILD_TOOL_INPUT: ${{ inputs.build_tool }}
           # yamllint disable-line rule:line-length
           DETECTED_PACKAGE_MANAGER: ${{ steps.build-metadata.outputs.javascript_package_manager }}
@@ -459,7 +482,8 @@ jobs:
           # to write to $GITHUB_OUTPUT
           if [ -n "${node_version}" ] &&
             [[ ! "${node_version}" =~ ^[A-Za-z0-9./*_-]+$ ]]; then
-            echo "::error::Invalid node_version input: ${node_version}"
+            echo "::error::Invalid node_version input:" \
+              "$(printf '%s' "${node_version}" | tr -d '\r\n')"
             exit 1
           fi
           if [ -z "${node_version}" ]; then
@@ -502,10 +526,45 @@ jobs:
               exit 1
               ;;
           esac
+          # Jobs that run the project's own toolchain can need a
+          # different Node.js from the pack/publish jobs, which only
+          # need a modern npm and never rebuild. A legacy dependency
+          # tree can cap the first well below what the second
+          # requires, leaving no single version that satisfies both.
+          # Empty follows node_version, so this costs nothing unless
+          # a caller needs the split.
+          build_node_version="${BUILD_NODE_VERSION_INPUT}"
+          if [ -n "${build_node_version}" ] &&
+            [[ ! "${build_node_version}" =~ ^[A-Za-z0-9./*_-]+$ ]]; then
+            echo "::error::Invalid build_node_version input:" \
+              "$(printf '%s' "${build_node_version}" \
+                | tr -d '\r\n')"
+            exit 1
+          fi
+          if [ -z "${build_node_version}" ]; then
+            build_node_version="${node_version}"
+          fi
+          test_node_version="${TEST_NODE_VERSION_INPUT}"
+          if [ -n "${test_node_version}" ] &&
+            [[ ! "${test_node_version}" =~ ^[A-Za-z0-9./*_-]+$ ]]; then
+            echo "::error::Invalid test_node_version input:" \
+              "$(printf '%s' "${test_node_version}" \
+                | tr -d '\r\n')"
+            exit 1
+          fi
+          if [ -z "${test_node_version}" ]; then
+            test_node_version="${node_version}"
+          fi
           echo "Resolved Node.js version: ${node_version}"
           echo "Resolved build tool: ${build_tool}"
-          echo "node_version=${node_version}" >> "$GITHUB_OUTPUT"
-          echo "build_tool=${build_tool}" >> "$GITHUB_OUTPUT"
+          echo "Build toolchain Node.js version: ${build_node_version}"
+          echo "Test Node.js version: ${test_node_version}"
+          {
+            echo "node_version=${node_version}"
+            echo "build_tool=${build_tool}"
+            echo "build_node_version=${build_node_version}"
+            echo "test_node_version=${test_node_version}"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     name: 'Node.js Build'
@@ -567,7 +626,7 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/node-build-action@02ffec745cddf67291d0b28f64bd81990cae327f  # v0.2.4
         with:
-          node_version: ${{ needs.node-metadata.outputs.node_version }}
+          node_version: ${{ needs.node-metadata.outputs.build_node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
           path_prefix: ${{ inputs.path_prefix }}
           scripts: ${{ inputs.build_scripts }}
@@ -642,7 +701,7 @@ jobs:
         # yamllint disable-line rule:line-length
         continue-on-error: ${{ inputs.test_permit_fail || vars.NO_BLOCK_AUDIT_FAIL == 'true' }}
         with:
-          node_version: ${{ needs.node-metadata.outputs.node_version }}
+          node_version: ${{ needs.node-metadata.outputs.test_node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
           path_prefix: ${{ inputs.path_prefix }}
           scripts: ${{ inputs.test_script }}

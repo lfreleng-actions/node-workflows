@@ -478,3 +478,384 @@ jobs:
           echo "Every rejection rule behaved correctly ✅"
           echo "Every rejection rule behaved correctly ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  # The node-metadata resolver decides which Node.js version each job
+  # runs on, including the build/test split that lets a legacy
+  # toolchain coexist with a modern pack/publish lane. Calling
+  # build-test.yaml cannot assert that: the resolved versions are job
+  # outputs, not workflow outputs, and merge.yaml cannot run in CI at
+  # all. So the shipped step is extracted and driven directly.
+  #
+  # The guarantee is narrow, and worth stating precisely: this compares
+  # the build_node_version and test_node_version blocks across the
+  # workflows that define them, not the resolvers as a whole. The
+  # bodies are not identical -- merge.yaml has no tests job and so
+  # resolves no test version -- and drift elsewhere in the resolver
+  # would go unreported.
+  node-version-resolution:
+    name: 'Test: Node.js version resolution'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise the version resolver'
+        shell: bash
+        run: |
+          # Exercise the version resolver
+          resolver="${RUNNER_TEMP}/resolve.sh"
+          python3 - <<'EXTRACT' > "${resolver}"
+          import sys
+          import yaml
+
+          paths = [
+              '.github/workflows/build-test.yaml',
+              '.github/workflows/merge.yaml',
+              '.github/workflows/build-test-release.yaml',
+          ]
+          bodies = {}
+          for path in paths:
+              with open(path) as handle:
+                  doc = yaml.safe_load(handle)
+              steps = doc['jobs']['node-metadata']['steps']
+              step = [s for s in steps if s.get('id') == 'resolve'][0]
+              bodies[path] = step['run']
+
+          # The three resolvers must agree on the shared logic. Compare
+          # the build_node_version block itself rather than the whole
+          # body: merge.yaml has no tests job and so resolves no test
+          # version, which makes a whole-body comparison meaningless.
+          def block(body, marker):
+              lines = body.split('\n')
+              start = next(
+                  i for i, line in enumerate(lines)
+                  if line.startswith(f'{marker}=')
+              )
+              # A block ends at the reporting echoes, or at the start
+              # of the sibling block -- in build-test.yaml the test
+              # block sits between the build block and the echoes, so
+              # stopping only at the echo would swallow it and make
+              # every comparison with merge.yaml fail.
+              terminators = ('echo "Resolved Node.js version',)
+              if marker != 'test_node_version':
+                  terminators += ('test_node_version=',)
+              end = next(
+                  i for i, line in enumerate(lines[start + 1:], start + 1)
+                  if line.startswith(terminators)
+              )
+              return lines[start:end]
+
+          reference = bodies['.github/workflows/build-test.yaml']
+          ref_block = block(reference, 'build_node_version')
+          for path, body in bodies.items():
+              if block(body, 'build_node_version') != ref_block:
+                  sys.exit(f'build_node_version block in {path} diverged')
+
+          # The two workflows that do have a tests job must agree on
+          # the test block too.
+          with_tests = [
+              '.github/workflows/build-test.yaml',
+              '.github/workflows/build-test-release.yaml',
+          ]
+          test_ref = block(reference, 'test_node_version')
+          for path in with_tests:
+              if block(bodies[path], 'test_node_version') != test_ref:
+                  sys.exit(f'test_node_version block in {path} diverged')
+
+          sys.stdout.write(reference)
+          EXTRACT
+          # Fail loudly rather than silently testing nothing if the
+          # step is renamed or the resolvers diverge
+          if ! grep -q 'build_node_version' "${resolver}"; then
+            echo "Could not extract the version resolver ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          errors=0
+          # $1 case, $2 expected "node|build|test", then the inputs
+          check() {
+            local name="$1" want="$2"
+            shift 2
+            : > "${RUNNER_TEMP}/vout.txt"
+            set +e
+            out="$(env "$@" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/vout.txt" \
+              bash "${resolver}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${rc}" != "0" ]; then
+              if [ "${want}" = 'reject' ]; then
+                if ! printf '%s' "${out}" | grep -q '^::error::'; then
+                  echo "${name}: failed without a labelled error ❌"
+                  errors=1
+                fi
+                return
+              fi
+              echo "${name}: resolver failed unexpectedly ❌"
+              printf '%s\n' "${out}" | tail -2
+              errors=1
+              return
+            fi
+            if [ "${want}" = 'reject' ]; then
+              echo "${name}: expected rejection, resolver succeeded ❌"
+              errors=1
+              return
+            fi
+            got="$(grep '^node_version=' "${RUNNER_TEMP}/vout.txt" \
+              | cut -d= -f2-)"
+            got_build="$(grep '^build_node_version=' \
+              "${RUNNER_TEMP}/vout.txt" | cut -d= -f2-)"
+            got_test="$(grep '^test_node_version=' \
+              "${RUNNER_TEMP}/vout.txt" | cut -d= -f2-)"
+            if [ "${got}|${got_build}|${got_test}" != "${want}" ]; then
+              echo "${name}: got '${got}|${got_build}|${got_test}'," \
+                "expected '${want}' ❌"
+              errors=1
+            fi
+          }
+
+          # Nothing set: everything follows the default
+          check 'defaults' '22|22|22' \
+            NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+            TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
+            DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE=''
+          # node_version alone still drives every job, so existing
+          # callers see no change
+          check 'node_version alone' '20|20|20' \
+            NODE_VERSION_INPUT='20' BUILD_NODE_VERSION_INPUT='' \
+            TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
+            DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE=''
+          # The motivating case: build on a legacy toolchain while the
+          # pack/publish jobs stay modern
+          check 'build split' '22|10|22' \
+            NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='10' \
+            TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
+            DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE=''
+          check 'build and test split' '22|10|18' \
+            NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='10' \
+            TEST_NODE_VERSION_INPUT='18' BUILD_TOOL_INPUT='' \
+            DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE=''
+          # The overrides follow an explicit node_version, not the
+          # hardcoded default
+          check 'overrides beside node_version' '20|10|20' \
+            NODE_VERSION_INPUT='20' BUILD_NODE_VERSION_INPUT='10' \
+            TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
+            DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE=''
+          # engines.node detection still feeds node_version, and the
+          # overrides still follow it
+          check 'detected engines.node' '18|18|18' \
+            NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+            TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
+            DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE='18'
+          # The overrides carry the same character allowlist as
+          # node_version: these values reach setup-node and the job
+          # summary
+          check 'unsafe build_node_version' reject \
+            NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='10; rm -rf /' \
+            TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
+            DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE=''
+          check 'unsafe test_node_version' reject \
+            NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+            TEST_NODE_VERSION_INPUT='18 && whoami' BUILD_TOOL_INPUT='' \
+            DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE=''
+
+          # Rejection is not enough on its own: the rejected value
+          # reaches the log, so a newline in it could close the
+          # ::error:: command and let the rest be read as another.
+          # Single-line metacharacters above cannot catch that.
+          forged_version="$(printf '10\n::warning::forged')"
+          for var in NODE_VERSION_INPUT BUILD_NODE_VERSION_INPUT \
+            TEST_NODE_VERSION_INPUT; do
+            set +e
+            out="$(env \
+              NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+              TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
+              DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE='' \
+              "${var}=${forged_version}" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/vout.txt" \
+              bash "${resolver}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${rc}" = "0" ]; then
+              echo "${var}: multiline value was accepted ❌"
+              errors=1
+            fi
+            if printf '%s' "${out}" | grep -q '^::warning::forged'; then
+              echo "${var}: rejected value forged a workflow command ❌"
+              printf '%s\n' "${out}"
+              errors=1
+            fi
+          done
+          # Forms setup-node accepts must survive the allowlist
+          check 'lts alias accepted' '22|lts/*|22' \
+            NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='lts/*' \
+            TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
+            DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE=''
+
+          if [ "${errors}" != "0" ]; then
+            echo "Node.js version resolution tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Node.js version resolution correct ✅"
+          echo "Node.js version resolution correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Resolving the versions correctly is worthless if a job then
+      # reads the wrong output, and the step above cannot see that: it
+      # runs the resolver in isolation. This asserts the wiring itself,
+      # against a table that has to be edited deliberately.
+      - name: 'Assert the jobs consume the right version'
+        shell: bash
+        run: |
+          # Assert the jobs consume the right version
+          if ! python3 - <<'PY'
+          import re
+          import sys
+
+          import yaml
+
+          # Every place a job selects one of the resolved versions.
+          # Compared as a whole set, so adding a consumer without
+          # naming it here fails just as loudly as changing one.
+          EXPECTED = {
+              ('build-test.yaml', 'build', 'Build project'):
+                  'build_node_version',
+              ('build-test.yaml', 'tests', 'Run tests'):
+                  'test_node_version',
+              ('build-test.yaml', 'audit', 'Audit dependencies'):
+                  'node_version',
+              ('merge.yaml', 'build', 'Build project'):
+                  'build_node_version',
+              ('merge.yaml', 'pack-release', 'Set up Node.js'):
+                  'node_version',
+              ('merge.yaml', 'snapshot-publish', 'Publish snapshot'):
+                  'node_version',
+              ('merge.yaml', 'release-publish', 'Publish release'):
+                  'node_version',
+              ('build-test-release.yaml', 'build', 'Set up Node.js'):
+                  'node_version',
+              ('build-test-release.yaml', 'build', 'Build project'):
+                  'build_node_version',
+              ('build-test-release.yaml', 'build',
+               'Restore the publish Node.js'): 'node_version',
+              ('build-test-release.yaml', 'tests', 'Run tests'):
+                  'test_node_version',
+              ('build-test-release.yaml', 'audit', 'Audit dependencies'):
+                  'node_version',
+              ('build-test-release.yaml', 'nexus-publish',
+               'Publish package to Nexus'): 'node_version',
+          }
+
+          PATTERN = re.compile(
+              r'needs\.node-metadata\.outputs\.'
+              r'((?:build_|test_)?node_version)'
+          )
+
+          found = {}
+          jobs = {}
+          for name in (
+              'build-test.yaml',
+              'merge.yaml',
+              'build-test-release.yaml',
+          ):
+              with open(f'.github/workflows/{name}') as handle:
+                  doc = yaml.safe_load(handle)
+              jobs[name] = doc['jobs']
+              for job_id, job in doc['jobs'].items():
+                  for step in job.get('steps') or []:
+                      blob = yaml.safe_dump(step)
+                      used = sorted(set(PATTERN.findall(blob)))
+                      if not used:
+                          continue
+                      key = (name, job_id, step.get('name'))
+                      # One step reading two versions is always a
+                      # mistake, and joining them keeps it visible
+                      # rather than letting sorted() pick a winner.
+                      found[key] = ' + '.join(used)
+
+          errors = []
+          for key in sorted(EXPECTED.keys() | found.keys()):
+              want = EXPECTED.get(key)
+              got = found.get(key)
+              if want == got:
+                  continue
+              where = '/'.join(str(part) for part in key)
+              if want is None:
+                  errors.append(
+                      f'{where} reads {got} but is absent from the '
+                      'table in this job. Add it, choosing the version '
+                      'deliberately.'
+                  )
+              elif got is None:
+                  errors.append(
+                      f'{where} should read {want} but reads no '
+                      'resolved version. Renamed, removed or rewired?'
+                  )
+              else:
+                  errors.append(f'{where} reads {got}, expected {want}')
+
+          # The build job in build-test-release.yaml packs the tarball
+          # itself, and node-build-action runs setup-node internally --
+          # so the build leaves its own toolchain on PATH. Without the
+          # restore between them, `npm pack --pack-destination` runs
+          # under the build's npm, and on npm 6 the flag is ignored,
+          # the tarball lands elsewhere and the job fails. That is the
+          # regression this PR fixed; this keeps it fixed.
+          order = [
+              step.get('name')
+              for step in jobs['build-test-release.yaml']['build']['steps']
+          ]
+          sequence = [
+              'Build project',
+              'Restore the publish Node.js',
+              'Pack release tarball',
+          ]
+          missing = [name for name in sequence if name not in order]
+          if missing:
+              errors.append(
+                  'build-test-release.yaml build job is missing steps: '
+                  + ', '.join(missing)
+              )
+          else:
+              positions = [order.index(name) for name in sequence]
+              if positions != sorted(positions):
+                  errors.append(
+                      'build-test-release.yaml build job runs '
+                      + ' -> '.join(sequence)
+                      + ' out of order; the pack step must run after '
+                      'the publish Node.js is restored.'
+                  )
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('Node.js version wiring incorrect ❌')
+
+          print(f'Node.js version wiring correct ✅ ({len(found)} sites)')
+          PY
+          then
+            echo "Node.js version wiring incorrect ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Node.js version wiring correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"

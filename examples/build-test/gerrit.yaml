@@ -143,6 +143,8 @@ jobs:
       # Optional Node.js tuning; empty values auto-detect from the
       # project metadata:
       # node_version: ''              # override Node.js auto-detection
+      # build_node_version: ''        # Node.js for the build job
+      # test_node_version: ''         # Node.js for the tests job
       # build_tool: ''                # 'npm' or 'yarn'; empty auto-detects
       # build_scripts: 'build'        # package.json build script(s)
       # test_script: 'test'           # package.json test script
