@@ -50,21 +50,21 @@ jobs:
         include:
           - name: 'test-node-project'
             repository: 'lfreleng-actions/test-node-project'
-            ref: '822b5f442388e4f2fd16b756bd8bf4f576b9cfaf'  # v0.0.2
+            ref: '2a48ade3e41599700b8e987eaf2cfdcb2c824c5f'  # v0.0.5
             node_version: ''
             test_permit_fail: false
-            # The fixture's tree carries a brace-expansion advisory
-            # (DoS via unbounded expansion) whose vulnerable range is
-            # <=5.0.7, i.e. every published version. npm reports the
-            # only remediation as downgrading jest to 25.0.0, a
-            # semver-major change, so the fixture cannot pass an
-            # audit gate at all while it depends on jest.
+            # v0.0.5 clears the brace-expansion advisories that first
+            # forced this flag, but npm audit rates js-yaml 4.3.1
+            # high, the top of its 4.0.0 - 4.3.1 range, so the flag
+            # stays. The fixture's ^4.3.1 override admits the patched
+            # 4.3.2, so refreshing its lockfile clears this -- in
+            # test-node-project, not here.
             #
             # The fixture exists to prove this workflow runs, not to
             # model a clean dependency tree, and its advisory status
             # says nothing about node-workflows. The audit job still
-            # runs and reports; it just does not gate. Revisit when
-            # brace-expansion ships a fixed release.
+            # runs and reports; it does not gate. Restore the gate
+            # once the fixture resolves js-yaml 4.3.2 or later.
             audit_permit_fail: true
             grype_permit_fail: false
           - name: 'sdc-onap-ui-common'
