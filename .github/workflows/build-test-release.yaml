@@ -969,7 +969,7 @@ jobs:
       # lacks one, so legacy projects still get audit coverage
       - name: 'Audit dependencies'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-audit-action@32003597c05c79445e7abc1fdc3228cbf1cbafda  # v0.0.2
+        uses: lfreleng-actions/node-audit-action@e2fb529140ff803c457451f16c2bc12107e1a5d3  # v0.0.3
         with:
           path_prefix: ${{ inputs.path_prefix }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
@@ -1644,7 +1644,7 @@ jobs:
 
       - name: 'Publish package to Nexus'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@70ac36607392be242d79cb194c62156b5c694a58  # v0.1.1
+        uses: lfreleng-actions/node-publish-action@dc6e147d968b3f94f3a178d9c42f61f8aaabf6d7  # v0.1.2
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ steps.publish-params.outputs.publish_version }}
