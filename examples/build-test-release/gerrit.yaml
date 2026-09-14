@@ -62,8 +62,14 @@ jobs:
     #   build_tool: ''                # 'npm' or 'yarn'; empty auto-detects
     #   attestations: true
     #   sigstore_sign: true
-    #   nexus_publish: true           # publish to a Nexus npm registry
-    #   registry_url: 'https://nexus3.example.org/repository/npm.release/'
+    #   nexus_publish: true           # publish to npm registries
+    #   publish_targets: |            # one entry per registry
+    #     [
+    #       {"name": "nexus",
+    #        "registry_url":
+    #          "https://nexus3.example.org/repository/npm.release/",
+    #        "auth": "nexus"}
+    #     ]
     # Uncomment the secrets block when nexus_publish is true:
     # secrets:
     #   OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}

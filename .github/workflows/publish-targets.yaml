@@ -169,8 +169,10 @@ jobs:
           if not targets:
               fail(
                   'targets input is an empty array. List at least one '
-                  'target: both publish lanes always resolve, so an empty '
-                  'list cannot be used to skip publishing.'
+                  'target: an empty list cannot be used to switch '
+                  'publishing off. In merge.yaml both lanes always '
+                  'resolve; in build-test-release.yaml set '
+                  'nexus_publish to false instead.'
               )
           if len(targets) > MAX_TARGETS:
               fail(
