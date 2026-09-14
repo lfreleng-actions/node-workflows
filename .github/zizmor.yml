@@ -41,9 +41,9 @@ rules:
       # every 'uses: ./.github/workflows/...' to 'uses: $/...'.
       - merge.yaml:671
       - merge.yaml:682
-      - testing.yaml:87
-      - testing.yaml:106
-      - testing.yaml:116
+      - testing.yaml:78
+      - testing.yaml:97
+      - testing.yaml:107
 
   impostor-commit:
     ignore:
