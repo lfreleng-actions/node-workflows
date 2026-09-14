@@ -50,22 +50,13 @@ jobs:
         include:
           - name: 'test-node-project'
             repository: 'lfreleng-actions/test-node-project'
-            ref: '2a48ade3e41599700b8e987eaf2cfdcb2c824c5f'  # v0.0.5
+            ref: 'd4ac174e51af3b8ee1b667aa1b99f404065e706e'  # v0.0.6
             node_version: ''
             test_permit_fail: false
-            # v0.0.5 clears the brace-expansion advisories that first
-            # forced this flag, but npm audit rates js-yaml 4.3.1
-            # high, the top of its 4.0.0 - 4.3.1 range, so the flag
-            # stays. The fixture's ^4.3.1 override admits the patched
-            # 4.3.2, so refreshing its lockfile clears this -- in
-            # test-node-project, not here.
-            #
-            # The fixture exists to prove this workflow runs, not to
-            # model a clean dependency tree, and its advisory status
-            # says nothing about node-workflows. The audit job still
-            # runs and reports; it does not gate. Restore the gate
-            # once the fixture resolves js-yaml 4.3.2 or later.
-            audit_permit_fail: true
+            # This lane gates on both scanners. The fixture is meant
+            # to stay clean, so a finding here is a real signal: fix
+            # the fixture rather than reaching for a permit flag.
+            audit_permit_fail: false
             grype_permit_fail: false
           - name: 'sdc-onap-ui-common'
             repository: 'onap/sdc-onap-ui-common'
