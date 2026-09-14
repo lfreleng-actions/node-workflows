@@ -75,8 +75,8 @@ then attests and signs it:
 
 The tarball, Sigstore bundle and SBOM files attach to a draft GitHub
 release, which the workflow then promotes. With `nexus_publish: true`
-the workflow also publishes the package to the Nexus npm registry
-named in `registry_url`, using the credential contract below.
+the workflow also publishes the package to every configured registry,
+in parallel, using the credential contract below.
 
 ### Model B: merge-driven (`merge.yaml`)
 
@@ -183,16 +183,17 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 
 <!-- markdownlint-disable MD013 -->
 
-| Input           | Type    | Default    | Description                                                           |
-| --------------- | ------- | ---------- | --------------------------------------------------------------------- |
-| `attestations`  | boolean | `true`     | Generate SLSA build provenance attestations for the packed tarball    |
-| `sigstore_sign` | boolean | `true`     | Sign the packed tarball with Sigstore (keyless/OIDC)                  |
-| `nexus_publish` | boolean | `false`    | Publish the package to a Nexus npm registry after release promotion   |
-| `registry_url`  | string  | `''`       | npm registry URL that receives the publish (required for Nexus)       |
-| `nexus_user`    | string  | `''`       | Nexus username override; empty derives it from the repository name    |
-| `npm_tag`       | string  | `'latest'` | npm dist-tag applied to the published version                         |
-| `npm_access`    | string  | `''`       | npm publish access: `public` or `restricted`; empty keeps the default |
-| `dry_run`       | boolean | `false`    | Run the Nexus publish steps without uploading                         |
+| Input             | Type    | Default    | Description                                                            |
+| ----------------- | ------- | ---------- | ---------------------------------------------------------------------- |
+| `attestations`    | boolean | `true`     | Generate SLSA build provenance attestations for the packed tarball     |
+| `sigstore_sign`   | boolean | `true`     | Sign the packed tarball with Sigstore (keyless/OIDC)                   |
+| `nexus_publish`   | boolean | `false`    | Publish the package to one or more npm registries after promotion      |
+| `publish_targets` | string  | `''`       | JSON array of publish targets; see [Publish Targets](#publish-targets) |
+| `registry_url`    | string  | `''`       | Single registry URL; deprecated, prefer `publish_targets`              |
+| `nexus_user`      | string  | `''`       | Nexus username override; empty derives it from the repository name     |
+| `npm_tag`         | string  | `'latest'` | npm dist-tag applied to the published version                          |
+| `npm_access`      | string  | `''`       | npm publish access: `public` or `restricted`; empty keeps the default  |
+| `dry_run`         | boolean | `false`    | Run the publish steps for every target without uploading               |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -319,16 +320,22 @@ reach `actions/setup-node` and the job summary.
 
 ## Publish Targets
 
-Each lane needs **one** of its two forms. Leaving both
+Both publish workflows take the same target list.
+
+In `merge.yaml` each lane needs **one** of its two forms. Leaving both
 `snapshot_targets` and `snapshot_registry_url` empty fails the
 workflow, and likewise for the release lane: both lanes always
 resolve, so an empty configuration is a mistake rather than a way to
 opt out of publishing. Use `dry_run` to run the publish steps without
 uploading.
 
-`merge.yaml` can publish one artefact to more than one registry. Both
-lanes take a JSON array, fanned out as a matrix so each registry
-publishes in parallel and fails on its own:
+`build-test-release.yaml` differs, because publishing there is
+opt-in. The targets resolve when `nexus_publish` is `true`, and
+`publish_targets` or `registry_url` becomes required at that point.
+Leave `nexus_publish` at `false` to skip publishing entirely.
+
+One artefact can reach more than one registry. A matrix fans the list
+out, so each registry publishes in parallel and fails on its own:
 
 ```yaml
     release_targets: |
@@ -342,6 +349,10 @@ publishes in parallel and fails on its own:
          "credential_name": "example-npmjs-publish-token"}
       ]
 ```
+
+The input is `publish_targets` in `build-test-release.yaml`, which has
+a single publish lane, and `snapshot_targets` / `release_targets` in
+`merge.yaml`, which has two. The entry format below is identical.
 
 <!-- markdownlint-disable MD013 -->
 
@@ -379,10 +390,11 @@ the loser fails with `EPUBLISHCONFLICT` on a version that did publish.
 
 ### Migrating from the single-URL inputs
 
-`snapshot_registry_url` and `release_registry_url` still work and
-resolve to a one-element list using `nexus` auth, which is what they
-have always meant. A run using them emits a deprecation notice.
-Supplying a targets list makes the matching URL input inert.
+`snapshot_registry_url`, `release_registry_url` and
+`build-test-release.yaml`'s `registry_url` still work and resolve to a
+one-element list using `nexus` auth, which is what they have always
+meant. A run using them emits a deprecation notice. Supplying a
+targets list makes the matching URL input inert.
 
 ## Credential Contract (Nexus publishing)
 
