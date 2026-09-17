@@ -29,7 +29,7 @@ rules:
       # workflow call is well formed at all, where this is advisory --
       # so the './' form stays until actionlint supports '$/'.
       #
-      # Scoped per LINE, naming the five reusable-workflow calls that
+      # Scoped per LINE, naming the six reusable-workflow calls that
       # exist today. A file-scoped entry would also cover step-level
       # 'uses: ./...' clauses, and those are the case this rule most
       # needs to catch: a step-local action resolved after an
@@ -39,6 +39,7 @@ rules:
       #
       # When actionlint lands support: drop this block and rewrite
       # every 'uses: ./.github/workflows/...' to 'uses: $/...'.
+      - build-test-release.yaml:1532
       - merge.yaml:671
       - merge.yaml:682
       - testing.yaml:78
