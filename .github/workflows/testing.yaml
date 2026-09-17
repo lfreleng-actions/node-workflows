@@ -259,6 +259,31 @@ jobs:
                   '${' + '{ inputs.nexus_publish }' + '}',
           }
 
+          # Assembled rather than written out: a literal one here is a
+          # workflow expression as far as actionlint is concerned, and
+          # it fails parsing this file.
+          OPEN = '${' + '{ '
+          CLOSE = ' }' + '}'
+
+          # Only the release lanes attest what they publish, so only
+          # they must hand npm the packed archive. The snapshot lane
+          # has no attestation to match, and requiring it there would
+          # assert a property nothing depends on.
+          #
+          # The exact expression, not merely a non-empty one: any
+          # other .tgz of the same version would publish bytes this
+          # lane never attested, which is the defect being fixed
+          # rather than a variation on it.
+          ATTESTED = {
+              ('merge.yaml', 'release-publish'):
+                  'pack-dist/' + OPEN
+                  + 'needs.pack-release.outputs.tarball_name' + CLOSE,
+              ('build-test-release.yaml', 'nexus-publish'):
+                  OPEN + 'needs.build.outputs.artefact_path' + CLOSE
+                  + '/' + OPEN + 'needs.build.outputs.tarball_name'
+                  + CLOSE,
+          }
+
           errors = []
           for name, pairs in EXPECTED.items():
               with open(f'.github/workflows/{name}') as handle:
@@ -279,17 +304,10 @@ jobs:
                   # 'needs.X.outputs.matrix' alone is a JSON string,
                   # not a list: it satisfies a substring test while
                   # expanding to no legs at all.
-                  #
-                  # The delimiters are assembled rather than written
-                  # out, because a literal one here is a workflow
-                  # expression as far as actionlint is concerned, and
-                  # it fails parsing this file.
-                  opener = '${' + '{ '
-                  closer = ' }' + '}'
                   wanted = (
-                      opener
+                      OPEN
                       + f'fromJSON(needs.{resolver}.outputs.matrix)'
-                      + closer
+                      + CLOSE
                   )
                   if target != wanted:
                       errors.append(
@@ -308,7 +326,7 @@ jobs:
                   # different field, or the name inside a comment,
                   # would satisfy a substring test and name nothing.
                   leg_name = str(job.get('name', ''))
-                  leg_expr = opener + 'matrix.target.name' + closer
+                  leg_expr = OPEN + 'matrix.target.name' + CLOSE
                   if leg_expr not in leg_name:
                       errors.append(
                           f'{where} name is {leg_name!r}; it must include '
@@ -325,6 +343,40 @@ jobs:
                               f'expected {gate!r}'
                           )
                   blob = yaml.safe_dump(job)
+                  # Publishing the attested archive rather than packing
+                  # a second one is the whole of issue #85. Nothing
+                  # else here would notice its loss: the publish still
+                  # succeeds, and only the bytes the attestation covers
+                  # quietly stop matching.
+                  #
+                  # Located on the publish action's own inputs rather
+                  # than searched for in the job body. The string
+                  # appears in comments and could be moved to an
+                  # environment variable, either of which would keep a
+                  # substring test green while npm went back to
+                  # packing its own archive.
+                  if (name, job_id) in ATTESTED:
+                      publish_steps = [
+                          s for s in (job.get('steps') or [])
+                          if 'node-publish-action' in str(s.get('uses', ''))
+                      ]
+                      if len(publish_steps) != 1:
+                          errors.append(
+                              f'{where} has {len(publish_steps)} '
+                              'node-publish-action steps, expected one'
+                          )
+                      else:
+                          supplied = str((
+                              publish_steps[0].get('with') or {}
+                          ).get('tarball_path', '')).strip()
+                          expected = ATTESTED[(name, job_id)]
+                          if supplied != expected:
+                              errors.append(
+                                  f'{where} passes tarball_path '
+                                  f'{supplied!r} to node-publish-action, '
+                                  f'expected {expected!r} -- the archive '
+                                  'this lane attests'
+                              )
                   if 'inputs.registry_url' in blob:
                       errors.append(
                           f'{where} still reads inputs.registry_url; the '
@@ -344,15 +396,15 @@ jobs:
                   # somewhere in the body.
                   wired = {
                       'credential_name':
-                          opener + 'matrix.target.credential_name' + closer,
+                          OPEN + 'matrix.target.credential_name' + CLOSE,
                       'nexus_password':
-                          opener + "matrix.target.auth == 'nexus' && "
+                          OPEN + "matrix.target.auth == 'nexus' && "
                           + 'steps.load-credential.outputs.credential'
-                          + " || ''" + closer,
+                          + " || ''" + CLOSE,
                       'auth_token':
-                          opener + "matrix.target.auth == 'token' && "
+                          OPEN + "matrix.target.auth == 'token' && "
                           + 'steps.load-credential.outputs.credential'
-                          + " || ''" + closer,
+                          + " || ''" + CLOSE,
                   }
                   by_uses = {}
                   for step in job.get('steps') or []:
@@ -379,6 +431,31 @@ jobs:
                               f'{where} passes {field} as {got!r}, '
                               f'expected {expected!r}'
                           )
+
+          # The archive release-publish publishes is the one
+          # pack-release produces, so that job can no longer be gated
+          # on the attestation toggles: a caller with both switched
+          # off would publish nothing. Nor can release-publish accept
+          # a skipped pack, which would surface as a failed download
+          # deep in the job rather than a clear skip. Neither shows up
+          # in any assertion above, and neither breaks the common
+          # configuration, so both are checked explicitly.
+          with open('.github/workflows/merge.yaml') as handle:
+              merge_jobs = yaml.safe_load(handle)['jobs']
+          pack_if = str(merge_jobs['pack-release'].get('if', ''))
+          for toggle in ('inputs.attestations', 'inputs.sigstore_sign'):
+              if toggle in pack_if:
+                  errors.append(
+                      f'merge.yaml/pack-release is gated on {toggle}; '
+                      'release-publish needs its tarball whether or '
+                      'not attestation and signing are enabled'
+                  )
+          publish_if = str(merge_jobs['release-publish'].get('if', ''))
+          if "pack-release.result == 'skipped'" in publish_if:
+              errors.append(
+                  'merge.yaml/release-publish accepts a skipped '
+                  "pack-release, but publishes that job's tarball"
+              )
 
           if errors:
               for message in errors:
