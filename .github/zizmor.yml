@@ -39,7 +39,7 @@ rules:
       #
       # When actionlint lands support: drop this block and rewrite
       # every 'uses: ./.github/workflows/...' to 'uses: $/...'.
-      - build-test-release.yaml:1532
+      - build-test-release.yaml:1534
       - merge.yaml:671
       - merge.yaml:682
       - testing.yaml:87

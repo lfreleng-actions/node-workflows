@@ -812,7 +812,7 @@ jobs:
       - name: 'Publish snapshot'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@dc6e147d968b3f94f3a178d9c42f61f8aaabf6d7  # v0.1.2
+        uses: lfreleng-actions/node-publish-action@d9098d8589fc72737c504d4b6acbc9a440e0e477  # v0.2.0
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ needs.resolve-version.outputs.snapshot_version }}
@@ -971,19 +971,22 @@ jobs:
     # published without its provenance can never be republished to
     # gain it, whereas a blocked publish is simply retryable.
     #
-    # Skipped results pass, because the attestations/sigstore_sign
-    # toggles legitimately disable these jobs. pack-release is named
-    # explicitly: a failure there leaves attest and sign-artefacts
-    # skipped rather than failed, which would otherwise read as
-    # consent to publish unattested.
+    # Skipped results pass for attest and sign-artefacts, because the
+    # attestations/sigstore_sign toggles legitimately disable them.
+    #
+    # pack-release must now succeed outright. It produces the archive
+    # this job publishes through tarball_path, so a skipped or failed
+    # pack leaves nothing to publish -- where previously this job
+    # packed its own and could carry on. Accepting 'skipped' here
+    # would turn that into a download failure deep in the job rather
+    # than a clear skip.
     if: >-
       ${{ !cancelled()
       && needs.check-release.outputs.has_release == 'true'
       && needs.resolve-version.result == 'success'
       && needs.build.result == 'success'
       && needs.resolve-release-targets.result == 'success'
-      && (needs.pack-release.result == 'success'
-      || needs.pack-release.result == 'skipped')
+      && needs.pack-release.result == 'success'
       && (needs.attest.result == 'success'
       || needs.attest.result == 'skipped')
       && (needs.sign-artefacts.result == 'success'
@@ -1017,6 +1020,22 @@ jobs:
         with:
           name: node-build-content
           path: ${{ inputs.path_prefix }}
+
+      # The artefact the attest and sign-artefacts jobs consumed. This
+      # job publishes that archive rather than packing a second one,
+      # so the bytes the attestation describes are the bytes the
+      # registry receives.
+      #
+      # Where it lands does not matter: npm is given the file by path
+      # and packs nothing, so the archive sitting inside the project
+      # tree (which it does whenever path_prefix is '.') cannot end up
+      # inside a tarball.
+      - name: 'Download release tarball'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: node-release-package
+          path: pack-dist
 
       # The release file's version must match version.properties; a
       # mismatch means the release descriptor and committed version
@@ -1110,14 +1129,24 @@ jobs:
       # registry-native provenance support. Release-grade provenance
       # comes from the attest and sign-artefacts jobs instead, which
       # cover the packed tarball rather than the registry record.
+      #
+      # tarball_path is what makes that cover meaningful. Without it
+      # the action packs a second archive at publish time, and npm
+      # builds the two differently: prepublishOnly runs for publish
+      # and not for pack, so a project generating content in that hook
+      # ships files the attestation never saw. Handing npm the archive
+      # the attest and sign-artefacts jobs consumed makes the attested
+      # bytes and the published bytes one object.
       - name: 'Publish release'
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@dc6e147d968b3f94f3a178d9c42f61f8aaabf6d7  # v0.1.2
+        uses: lfreleng-actions/node-publish-action@d9098d8589fc72737c504d4b6acbc9a440e0e477  # v0.2.0
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
           registry_url: ${{ matrix.target.registry_url }}
           path_prefix: ${{ inputs.path_prefix }}
+          # yamllint disable-line rule:line-length
+          tarball_path: pack-dist/${{ needs.pack-release.outputs.tarball_name }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           dry_run: ${{ inputs.dry_run }}
           provenance: 'false'
@@ -1132,18 +1161,18 @@ jobs:
           # yamllint disable-line rule:line-length
           auth_token: ${{ matrix.target.auth == 'token' && steps.load-credential.outputs.credential || '' }}
 
-  # Pack a release tarball for attestation and signing.
+  # Pack the release tarball.
   #
   # This job exists because the build job uploads the built *tree*
-  # rather than a tarball, and the release version is stamped inside
-  # node-publish-action rather than at build time. So neither a tarball
-  # nor the release version exists in 'node-build-content'. Pack here
-  # from that same tree, stamped to the same version the release
-  # publish uses, so the attested artefact matches what publishes.
+  # rather than a tarball, and the release version is not stamped at
+  # build time. So neither a tarball nor the release version exists in
+  # 'node-build-content'. Pack here from that same tree, stamped to
+  # the release version.
   #
-  # The tarball is packed separately from the one npm publish creates
-  # internally, so the attestation covers the artefact this workflow
-  # built rather than the exact bytes the registry received.
+  # This archive is now the release artefact itself: attest and
+  # sign-artefacts cover it, and release-publish hands it to npm
+  # through tarball_path rather than packing a second one. One object
+  # rather than two that have to be kept identical.
   pack-release:
     name: 'Pack Release Tarball'
     runs-on: ubuntu-latest
@@ -1152,15 +1181,22 @@ jobs:
       - 'resolve-version'
       - 'build'
       - 'check-release'
-    # Release publishes only, and only when something consumes the
-    # tarball; snapshots are replaced on every merge.
+    # Release publishes only; snapshots are replaced on every merge.
+    #
+    # This job runs for every release publish, not merely when
+    # attestations or signing are on. release-publish now publishes
+    # this archive through tarball_path rather than packing its own,
+    # so the tarball is the release artefact itself and no longer an
+    # optional input to attest and sign-artefacts. Gating it on those
+    # toggles would leave a caller with both switched off publishing
+    # nothing at all.
     #
     # The version equality mirrors the cross-check release-publish
     # performs against version.properties. On a mismatch that job
     # fails, and skipping here stops the run leaving behind signed
     # provenance for a version that never passed release validation.
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && needs.check-release.outputs.has_release == 'true' && needs.check-release.outputs.version == needs.resolve-version.outputs.version && needs.resolve-version.result == 'success' && needs.build.result == 'success' && (inputs.attestations || inputs.sigstore_sign) }}
+    if: ${{ !cancelled() && needs.check-release.outputs.has_release == 'true' && needs.check-release.outputs.version == needs.resolve-version.outputs.version && needs.resolve-version.result == 'success' && needs.build.result == 'success' }}
     outputs:
       tarball_name: ${{ steps.pack.outputs.tarball_name }}
     permissions:
@@ -1225,33 +1261,23 @@ jobs:
           # Stamp the resolved release version so the packed tarball
           # carries the version the publish job publishes.
           #
-          # These flags must match the stamp inside
-          # node-publish-action, because this job exists to reproduce
-          # what release-publish packs. Any difference lets the
-          # attested tree diverge in content from the published one,
-          # which is invisible until somebody tries to verify a
-          # package against its attestation.
+          # This is now the only stamp in the release path. The action
+          # skips its own when given tarball_path, and verifies that
+          # this archive already declares publish_version -- so the
+          # two can no longer disagree, where previously they had to
+          # be kept in step by hand.
           #
-          # --ignore-scripts: neither this job nor the action installs
-          # dependencies, so preversion/version/postversion hooks
-          # cannot reliably run in either. Suppressing them in both is
-          # the only way the two produce the same tree.
+          # --ignore-scripts: this job does not install dependencies,
+          # so preversion/version/postversion hooks cannot reliably
+          # run here.
           #
           # --no-workspaces: with workspaces enabled in configuration,
           # 'npm version' stamps the workspace children and leaves the
           # target at its committed version, and 'npm pack' packs the
-          # children instead of the target -- so the attestation would
-          # cover tarballs that were never published.
+          # children instead of the target -- so the release would
+          # carry tarballs nobody asked for.
           #
-          # The same pair appears in build-test-release.yaml, and the
-          # three sites are cross-referenced; see #58.
-          #
-          # These flags align the stamp, not the whole content set.
-          # npm runs prepublishOnly for 'npm publish' and never for
-          # 'npm pack', so a project generating content in that hook
-          # still ships files this tarball lacks. Removing that
-          # difference means publishing the artefact attested here
-          # rather than packing twice; see #85.
+          # The same pair appears in build-test-release.yaml; see #58.
           npm version --no-git-tag-version --allow-same-version \
             --ignore-scripts --no-workspaces "${RELEASE_VERSION}"
           mkdir -p pack-dist

@@ -116,18 +116,24 @@ can request, so a caller that grants `contents: read` alone leaves the
 `attest` and `sign-artefacts` jobs unable to run. Set `attestations`
 and `sigstore_sign` to `false` if you would rather not grant them.
 
-Note the scope of what these cover. The tarball comes from a separate
-`npm pack`, not the one `npm publish` performs internally, so the
-provenance and signature attest to the artefact this workflow built
-rather than the exact bytes the registry received.
+Both release lanes publish the **same archive** they attest. The
+`pack-release` job, and the matching step inside `build-test-release`'s
+`build` job, pack once, and the publish job hands that file to npm
+through `node-publish-action`'s `tarball_path`, so npm packs nothing
+at publish time. The provenance and the Sigstore signature cover the
+exact bytes the registry received.
 
-The `pack-release` job stamps with the same flags
-`node-publish-action` uses, so version handling and workspace handling
-agree, and `prepack` and `prepare` run on both paths. One hook does
-not: npm runs `prepublishOnly` for `npm publish` and never for
-`npm pack`. A project generating content in that hook ships files the
-attestation does not cover. Issue #85 tracks removing the difference
-by publishing the same artefact the attestation describes.
+That also settles a difference the two paths used to carry. `npm pack`
+and `npm publish` do not build identical archives: npm runs
+`prepublishOnly` for `publish` and never for `pack`, so a project
+generating content in that hook once shipped files the attestation did
+not cover. With one archive there is no second pack to diverge.
+
+One consequence is worth knowing. npm gates `prepack`, `prepare`,
+`prepublishOnly`, `publish` and `postpublish` on packing a directory,
+and publishing a tarball runs none of them. The packing hooks still
+run in the pack step, where they belong; a project relying on
+`postpublish` needs another home for that work.
 
 Nexus npm repositories offer no registry-native provenance, which is
 why the artefact-level records exist at all; publishing to a registry
@@ -280,9 +286,8 @@ fresh checkout and reads the dependency tree. Neither needs a project
 toolchain of its own.
 
 > [!IMPORTANT]
-> That is not the same as running no project code. `npm pack` and
-> `npm publish` execute `prepack` and `prepare`, and `npm publish`
-> also runs `prepublishOnly` (see
+> That is not the same as running no project code. `npm pack` executes
+> `prepack` and `prepare` (see
 > [the note on attestation scope](#release-models)). Those hooks run
 > under `node_version`, **not** `build_node_version`, so a project
 > splitting the two must keep its packing hooks compatible with the
