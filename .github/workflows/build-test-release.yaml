@@ -259,16 +259,26 @@ on:
       # --- Nexus/registry publishing ---
       nexus_publish:
         description: >-
-          Publish the package to a Nexus npm registry after the GitHub
-          release promotes; requires the OP_SERVICE_ACCOUNT_TOKEN and
-          VAULT_MAPPING_JSON secrets
+          Publish the package to one or more npm registries after the
+          GitHub release promotes; requires the OP_SERVICE_ACCOUNT_TOKEN
+          and VAULT_MAPPING_JSON secrets
         required: false
         type: boolean
         default: false
+      publish_targets:
+        description: >-
+          JSON array of publish targets, each with 'name',
+          'registry_url' and 'auth' ('nexus' or 'token'), optionally
+          'credential_name'. Targets publish in parallel and fail
+          independently. Empty falls back to registry_url.
+        required: false
+        type: string
+        default: ''
       registry_url:
         description: >-
-          npm registry URL that receives the publish, e.g.
+          Single npm registry URL that receives the publish, e.g.
           https://nexus3.example.org/repository/npm.release/
+          Deprecated: prefer publish_targets.
         required: false
         type: string
         default: ''
@@ -831,10 +841,11 @@ jobs:
           fi
           # Stamp package.json with the validated tag version.
           #
-          # These flags must match the stamp inside
-          # node-publish-action, which publishes this project, and the
-          # pack-release job in merge.yaml, which attests it. All
-          # three produce a tree that has to be identical; see #58.
+          # This is the only stamp in the release path. The publish
+          # job hands npm this archive through tarball_path, so the
+          # action skips its own stamp and verifies that the tarball
+          # already declares publish_version. The pack-release job in
+          # merge.yaml does the same for that lane; see #58.
           #
           # --ignore-scripts: dependencies are not installed at this
           # point, so preversion/version/postversion hooks cannot
@@ -891,9 +902,10 @@ jobs:
           # the workspace children rather than the target, so the
           # release would carry tarballs nobody asked for.
           #
-          # npm runs prepublishOnly for 'npm publish' and never for
-          # 'npm pack', so this tarball can lack content the published
-          # one carries; see #85.
+          # This archive is the release artefact: attest and
+          # sign-artefacts cover it, and nexus-publish publishes it
+          # rather than packing a second one, so there is no
+          # prepublishOnly divergence left to document; see #85.
           cd "${PATH_PREFIX}"
           mkdir -p pack-dist
           tarball=$(npm pack --no-workspaces \
@@ -1504,19 +1516,50 @@ jobs:
           RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
           echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
 
+  # Resolve the publish target list before the publish job, so a
+  # malformed targets input fails once, early, and names the offending
+  # entry -- rather than failing identically in every matrix leg after
+  # the release has already promoted.
+  #
+  # Gated on nexus_publish, unlike merge.yaml's two resolvers: there
+  # publishing always happens, whereas here it is opt-in, and the
+  # resolver treats "no targets at all" as an error rather than as a
+  # way to skip.
+  resolve-publish-targets:
+    name: 'Resolve Publish Targets'
+    needs: 'tag-validate'
+    if: ${{ inputs.nexus_publish }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-targets.yaml
+    with:
+      label: 'release'
+      targets_json: ${{ inputs.publish_targets }}
+      registry_url: ${{ inputs.registry_url }}
+
   nexus-publish:
-    name: 'Publish to Nexus'
+    # The leg name comes from the target, so a failed check names the
+    # registry that failed rather than leaving the reader to open it.
+    name: 'Publish Release (${{ matrix.target.name }})'
     runs-on: ubuntu-latest
     needs:
       - 'tag-validate'
       - 'node-metadata'
       - 'build'
       - 'promote-release'
+      - 'resolve-publish-targets'
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && inputs.nexus_publish && needs.promote-release.result == 'success' }}
+    if: ${{ !cancelled() && inputs.nexus_publish && needs.promote-release.result == 'success' && needs.resolve-publish-targets.result == 'success' }}
     permissions:
       contents: read
     timeout-minutes: 10
+    strategy:
+      # One registry rejecting the publish must not abandon the others:
+      # the release has already promoted, so the remaining targets are
+      # still worth attempting and the failure is per-registry.
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.resolve-publish-targets.outputs.matrix) }}
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
@@ -1567,7 +1610,6 @@ jobs:
         env:
           TAG: ${{ needs.tag-validate.outputs.tag }}
           NEXUS_USER_INPUT: ${{ inputs.nexus_user }}
-          REGISTRY_URL: ${{ inputs.registry_url }}
           # The repository actually checked out/published, which can
           # differ from GITHUB_REPOSITORY for cross-repository calls
           TARGET_REPOSITORY: ${{ inputs.repository || github.repository }}
@@ -1578,11 +1620,10 @@ jobs:
           HAS_VAULT_MAPPING: ${{ secrets.VAULT_MAPPING_JSON != '' }}
         run: |
           # Derive the publish version and Nexus username
-          if [ -z "${REGISTRY_URL}" ]; then
-            echo "::error::nexus_publish requires the registry_url" \
-              "input"
-            exit 1
-          fi
+          # The registry URL is validated by resolve-publish-targets,
+          # which also rejects an empty target list, so there is
+          # nothing left to check for it here.
+          #
           # Fail fast with an actionable message when the credential
           # secrets are missing, rather than deep inside
           # credential-load-action
@@ -1631,7 +1672,7 @@ jobs:
       # grants list must never become a caller-facing input.
       # credential-load-action v2+ performs no checkout by default,
       # so the downloaded artefact tree survives this step intact
-      - name: 'Load Nexus credential'
+      - name: 'Load publish credential'
         id: load-credential
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/credential-load-action@025002b47f4302fb7252175c470da69435060176  # v2.0.4
@@ -1639,17 +1680,26 @@ jobs:
           # yamllint disable-line rule:line-length
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          credential_name: ${{ matrix.target.credential_name }}
           credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
           export_env: 'false'
 
-      - name: 'Publish package to Nexus'
+      - name: 'Publish release'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@dc6e147d968b3f94f3a178d9c42f61f8aaabf6d7  # v0.1.2
+        uses: lfreleng-actions/node-publish-action@d9098d8589fc72737c504d4b6acbc9a440e0e477  # v0.2.0
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ steps.publish-params.outputs.publish_version }}
-          registry_url: ${{ inputs.registry_url }}
+          registry_url: ${{ matrix.target.registry_url }}
           path_prefix: ${{ inputs.path_prefix }}
+          # The build job packs the tarball and uploads it as the build
+          # artefact, which the attest and sign-artefacts jobs consume.
+          # Publishing that same archive keeps the attested bytes and
+          # the published bytes one object; packing again here would
+          # reintroduce the prepublishOnly divergence issue #85
+          # describes. The download above already placed it.
+          # yamllint disable-line rule:line-length
+          tarball_path: ${{ needs.build.outputs.artefact_path }}/${{ needs.build.outputs.tarball_name }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           tag: ${{ inputs.npm_tag }}
           access: ${{ inputs.npm_access }}
@@ -1658,4 +1708,10 @@ jobs:
           provenance: 'false'
           load_credential: 'false'
           nexus_user: ${{ steps.publish-params.outputs.nexus_user }}
-          nexus_password: ${{ steps.load-credential.outputs.credential }}
+          # One credential is loaded per leg; which input carries it
+          # depends on the target's auth mode. The unused one stays
+          # empty so the action sees a single mode selected.
+          # yamllint disable-line rule:line-length
+          nexus_password: ${{ matrix.target.auth == 'nexus' && steps.load-credential.outputs.credential || '' }}
+          # yamllint disable-line rule:line-length
+          auth_token: ${{ matrix.target.auth == 'token' && steps.load-credential.outputs.credential || '' }}

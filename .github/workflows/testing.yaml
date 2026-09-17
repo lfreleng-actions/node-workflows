@@ -218,6 +218,212 @@ jobs:
   # than restated, so this exercises the shipped rules. It cannot live
   # in a script file the workflow imports: a reusable workflow called
   # from another repository has no way to check out its own source.
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # merge.yaml and build-test-release.yaml cannot run in CI, so the
+      # only way to keep their publish wiring honest is to read it. A
+      # leg still pointing at the deprecated scalar input, or at a
+      # resolver it does not depend on, would publish to one registry
+      # while the caller configured several.
+      - name: 'Assert both publish lanes consume the resolver'
+        shell: bash
+        run: |
+          # Assert both publish lanes consume the resolver
+          python3 - <<'PY'
+          import sys
+
+          import yaml
+
+          # workflow -> {publish job: resolver job it must expand}
+          EXPECTED = {
+              'merge.yaml': {
+                  'snapshot-publish': 'resolve-snapshot-targets',
+                  'release-publish': 'resolve-release-targets',
+              },
+              'build-test-release.yaml': {
+                  'nexus-publish': 'resolve-publish-targets',
+              },
+          }
+
+          # Publishing is opt-in in build-test-release.yaml, so its
+          # resolver carries a gate the merge lanes do not need.
+          # Without it every caller that leaves publishing off would
+          # invoke the resolver with no targets and fail, which no
+          # other assertion here would notice.
+          GATED = {
+              ('build-test-release.yaml', 'resolve-publish-targets'):
+                  '${' + '{ inputs.nexus_publish }' + '}',
+          }
+
+          # Assembled rather than written out: a literal one here is a
+          # workflow expression as far as actionlint is concerned, and
+          # it fails parsing this file.
+          OPEN = '${' + '{ '
+          CLOSE = ' }' + '}'
+
+          # Only the release lanes attest what they publish, so only
+          # they must hand npm the packed archive. The snapshot lane
+          # has no attestation to match, and requiring it there would
+          # assert a property nothing depends on.
+          #
+          # The exact expression, not merely a non-empty one: any
+          # other .tgz of the same version would publish bytes this
+          # lane never attested, which is the defect being fixed
+          # rather than a variation on it.
+          ATTESTED = {
+              ('merge.yaml', 'release-publish'):
+                  'pack-dist/' + OPEN
+                  + 'needs.pack-release.outputs.tarball_name' + CLOSE,
+              ('build-test-release.yaml', 'nexus-publish'):
+                  OPEN + 'needs.build.outputs.artefact_path' + CLOSE
+                  + '/' + OPEN + 'needs.build.outputs.tarball_name'
+                  + CLOSE,
+          }
+
+          errors = []
+          for name, pairs in EXPECTED.items():
+              with open(f'.github/workflows/{name}') as handle:
+                  jobs = yaml.safe_load(handle)['jobs']
+              for job_id, resolver in pairs.items():
+                  job = jobs.get(job_id)
+                  if job is None:
+                      errors.append(f'{name}: no job {job_id}')
+                      continue
+                  if jobs.get(resolver) is None:
+                      errors.append(f'{name}: no resolver {resolver}')
+                      continue
+                  strategy = job.get('strategy') or {}
+                  matrix = strategy.get('matrix') or {}
+                  target = str(matrix.get('target', '')).strip()
+                  where = f'{name}/{job_id}'
+                  # Compare the whole expression, not a substring.
+                  # 'needs.X.outputs.matrix' alone is a JSON string,
+                  # not a list: it satisfies a substring test while
+                  # expanding to no legs at all.
+                  wanted = (
+                      OPEN
+                      + f'fromJSON(needs.{resolver}.outputs.matrix)'
+                      + CLOSE
+                  )
+                  if target != wanted:
+                      errors.append(
+                          f'{where} matrix target is {target!r}, '
+                          f'expected {wanted!r}'
+                      )
+                  # fail-fast off keeps one registry's failure from
+                  # abandoning the others, which is the point of the
+                  # fan-out.
+                  if strategy.get('fail-fast') is not False:
+                      errors.append(f'{where} does not set fail-fast: false')
+                  if resolver not in (job.get('needs') or []):
+                      errors.append(f'{where} does not need {resolver}')
+                  gate = GATED.get((name, resolver))
+                  if gate is not None:
+                      actual = str(jobs[resolver].get('if', '')).strip()
+                      if actual != gate:
+                          errors.append(
+                              f'{name}/{resolver} if is {actual!r}, '
+                              f'expected {gate!r}'
+                          )
+                  blob = yaml.safe_dump(job)
+                  # Publishing the attested archive rather than packing
+                  # a second one is the whole of issue #85. Nothing
+                  # else here would notice its loss: the publish still
+                  # succeeds, and only the bytes the attestation covers
+                  # quietly stop matching.
+                  #
+                  # Located on the publish action's own inputs rather
+                  # than searched for in the job body. The string
+                  # appears in comments and could be moved to an
+                  # environment variable, either of which would keep a
+                  # substring test green while npm went back to
+                  # packing its own archive.
+                  if (name, job_id) in ATTESTED:
+                      publish_steps = [
+                          s for s in (job.get('steps') or [])
+                          if 'node-publish-action' in str(s.get('uses', ''))
+                      ]
+                      if len(publish_steps) != 1:
+                          errors.append(
+                              f'{where} has {len(publish_steps)} '
+                              'node-publish-action steps, expected one'
+                          )
+                      else:
+                          supplied = str((
+                              publish_steps[0].get('with') or {}
+                          ).get('tarball_path', '')).strip()
+                          expected = ATTESTED[(name, job_id)]
+                          if supplied != expected:
+                              errors.append(
+                                  f'{where} passes tarball_path '
+                                  f'{supplied!r} to node-publish-action, '
+                                  f'expected {expected!r} -- the archive '
+                                  'this lane attests'
+                              )
+                  if 'inputs.registry_url' in blob:
+                      errors.append(
+                          f'{where} still reads inputs.registry_url; the '
+                          'leg must take its URL from the matrix target'
+                      )
+                  if 'matrix.target.registry_url' not in blob:
+                      errors.append(
+                          f'{where} never reads matrix.target.registry_url'
+                      )
+                  # Per-target credential routing is the reason a
+                  # single lane can reach registries with unrelated
+                  # credentials. Dropping any of these leaves the
+                  # matrix intact and the feature broken, so assert
+                  # them rather than the URL alone.
+                  for expression in (
+                      'matrix.target.credential_name',
+                      "matrix.target.auth == 'nexus'",
+                      "matrix.target.auth == 'token'",
+                  ):
+                      if expression not in blob:
+                          errors.append(
+                              f'{where} never reads {expression}'
+                          )
+
+          # The archive release-publish publishes is the one
+          # pack-release produces, so that job can no longer be gated
+          # on the attestation toggles: a caller with both switched
+          # off would publish nothing. Nor can release-publish accept
+          # a skipped pack, which would surface as a failed download
+          # deep in the job rather than a clear skip. Neither shows up
+          # in any assertion above, and neither breaks the common
+          # configuration, so both are checked explicitly.
+          with open('.github/workflows/merge.yaml') as handle:
+              merge_jobs = yaml.safe_load(handle)['jobs']
+          pack_if = str(merge_jobs['pack-release'].get('if', ''))
+          for toggle in ('inputs.attestations', 'inputs.sigstore_sign'):
+              if toggle in pack_if:
+                  errors.append(
+                      f'merge.yaml/pack-release is gated on {toggle}; '
+                      'release-publish needs its tarball whether or '
+                      'not attestation and signing are enabled'
+                  )
+          publish_if = str(merge_jobs['release-publish'].get('if', ''))
+          if "pack-release.result == 'skipped'" in publish_if:
+              errors.append(
+                  'merge.yaml/release-publish accepts a skipped '
+                  "pack-release, but publishes that job's tarball"
+              )
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('Publish target wiring incorrect \u274c')
+
+          print('Publish target wiring correct \u2705')
+          PY
+          echo "Publish target wiring correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+
   publish-targets-rejections:
     name: 'Test: publish targets (rejections)'
     runs-on: ubuntu-latest
@@ -753,7 +959,7 @@ jobs:
               ('build-test-release.yaml', 'audit', 'Audit dependencies'):
                   'node_version',
               ('build-test-release.yaml', 'nexus-publish',
-               'Publish package to Nexus'): 'node_version',
+               'Publish release'): 'node_version',
           }
 
           PATTERN = re.compile(

@@ -75,8 +75,8 @@ then attests and signs it:
 
 The tarball, Sigstore bundle and SBOM files attach to a draft GitHub
 release, which the workflow then promotes. With `nexus_publish: true`
-the workflow also publishes the package to the Nexus npm registry
-named in `registry_url`, using the credential contract below.
+the workflow also publishes the package to every configured registry,
+in parallel, using the credential contract below.
 
 ### Model B: merge-driven (`merge.yaml`)
 
@@ -116,18 +116,24 @@ can request, so a caller that grants `contents: read` alone leaves the
 `attest` and `sign-artefacts` jobs unable to run. Set `attestations`
 and `sigstore_sign` to `false` if you would rather not grant them.
 
-Note the scope of what these cover. The tarball comes from a separate
-`npm pack`, not the one `npm publish` performs internally, so the
-provenance and signature attest to the artefact this workflow built
-rather than the exact bytes the registry received.
+Both release lanes publish the **same archive** they attest. The
+`pack-release` job, and the matching step inside `build-test-release`'s
+`build` job, pack once, and the publish job hands that file to npm
+through `node-publish-action`'s `tarball_path`, so npm packs nothing
+at publish time. The provenance and the Sigstore signature cover the
+exact bytes the registry received.
 
-The `pack-release` job stamps with the same flags
-`node-publish-action` uses, so version handling and workspace handling
-agree, and `prepack` and `prepare` run on both paths. One hook does
-not: npm runs `prepublishOnly` for `npm publish` and never for
-`npm pack`. A project generating content in that hook ships files the
-attestation does not cover. Issue #85 tracks removing the difference
-by publishing the same artefact the attestation describes.
+That also settles a difference the two paths used to carry. `npm pack`
+and `npm publish` do not build identical archives: npm runs
+`prepublishOnly` for `publish` and never for `pack`, so a project
+generating content in that hook once shipped files the attestation did
+not cover. With one archive there is no second pack to diverge.
+
+One consequence is worth knowing. npm gates `prepack`, `prepare`,
+`prepublishOnly`, `publish` and `postpublish` on packing a directory,
+and publishing a tarball runs none of them. The packing hooks still
+run in the pack step, where they belong; a project relying on
+`postpublish` needs another home for that work.
 
 Nexus npm repositories offer no registry-native provenance, which is
 why the artefact-level records exist at all; publishing to a registry
@@ -183,16 +189,17 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 
 <!-- markdownlint-disable MD013 -->
 
-| Input           | Type    | Default    | Description                                                           |
-| --------------- | ------- | ---------- | --------------------------------------------------------------------- |
-| `attestations`  | boolean | `true`     | Generate SLSA build provenance attestations for the packed tarball    |
-| `sigstore_sign` | boolean | `true`     | Sign the packed tarball with Sigstore (keyless/OIDC)                  |
-| `nexus_publish` | boolean | `false`    | Publish the package to a Nexus npm registry after release promotion   |
-| `registry_url`  | string  | `''`       | npm registry URL that receives the publish (required for Nexus)       |
-| `nexus_user`    | string  | `''`       | Nexus username override; empty derives it from the repository name    |
-| `npm_tag`       | string  | `'latest'` | npm dist-tag applied to the published version                         |
-| `npm_access`    | string  | `''`       | npm publish access: `public` or `restricted`; empty keeps the default |
-| `dry_run`       | boolean | `false`    | Run the Nexus publish steps without uploading                         |
+| Input             | Type    | Default    | Description                                                            |
+| ----------------- | ------- | ---------- | ---------------------------------------------------------------------- |
+| `attestations`    | boolean | `true`     | Generate SLSA build provenance attestations for the packed tarball     |
+| `sigstore_sign`   | boolean | `true`     | Sign the packed tarball with Sigstore (keyless/OIDC)                   |
+| `nexus_publish`   | boolean | `false`    | Publish the package to one or more npm registries after promotion      |
+| `publish_targets` | string  | `''`       | JSON array of publish targets; see [Publish Targets](#publish-targets) |
+| `registry_url`    | string  | `''`       | Single registry URL; deprecated, prefer `publish_targets`              |
+| `nexus_user`      | string  | `''`       | Nexus username override; empty derives it from the repository name     |
+| `npm_tag`         | string  | `'latest'` | npm dist-tag applied to the published version                          |
+| `npm_access`      | string  | `''`       | npm publish access: `public` or `restricted`; empty keeps the default  |
+| `dry_run`         | boolean | `false`    | Run the publish steps for every target without uploading               |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -279,9 +286,8 @@ fresh checkout and reads the dependency tree. Neither needs a project
 toolchain of its own.
 
 > [!IMPORTANT]
-> That is not the same as running no project code. `npm pack` and
-> `npm publish` execute `prepack` and `prepare`, and `npm publish`
-> also runs `prepublishOnly` (see
+> That is not the same as running no project code. `npm pack` executes
+> `prepack` and `prepare` (see
 > [the note on attestation scope](#release-models)). Those hooks run
 > under `node_version`, **not** `build_node_version`, so a project
 > splitting the two must keep its packing hooks compatible with the
@@ -319,16 +325,22 @@ reach `actions/setup-node` and the job summary.
 
 ## Publish Targets
 
-Each lane needs **one** of its two forms. Leaving both
+Both publish workflows take the same target list.
+
+In `merge.yaml` each lane needs **one** of its two forms. Leaving both
 `snapshot_targets` and `snapshot_registry_url` empty fails the
 workflow, and likewise for the release lane: both lanes always
 resolve, so an empty configuration is a mistake rather than a way to
 opt out of publishing. Use `dry_run` to run the publish steps without
 uploading.
 
-`merge.yaml` can publish one artefact to more than one registry. Both
-lanes take a JSON array, fanned out as a matrix so each registry
-publishes in parallel and fails on its own:
+`build-test-release.yaml` differs, because publishing there is
+opt-in. The targets resolve when `nexus_publish` is `true`, and
+`publish_targets` or `registry_url` becomes required at that point.
+Leave `nexus_publish` at `false` to skip publishing entirely.
+
+One artefact can reach more than one registry. A matrix fans the list
+out, so each registry publishes in parallel and fails on its own:
 
 ```yaml
     release_targets: |
@@ -342,6 +354,10 @@ publishes in parallel and fails on its own:
          "credential_name": "example-npmjs-publish-token"}
       ]
 ```
+
+The input is `publish_targets` in `build-test-release.yaml`, which has
+a single publish lane, and `snapshot_targets` / `release_targets` in
+`merge.yaml`, which has two. The entry format below is identical.
 
 <!-- markdownlint-disable MD013 -->
 
@@ -379,10 +395,11 @@ the loser fails with `EPUBLISHCONFLICT` on a version that did publish.
 
 ### Migrating from the single-URL inputs
 
-`snapshot_registry_url` and `release_registry_url` still work and
-resolve to a one-element list using `nexus` auth, which is what they
-have always meant. A run using them emits a deprecation notice.
-Supplying a targets list makes the matching URL input inert.
+`snapshot_registry_url`, `release_registry_url` and
+`build-test-release.yaml`'s `registry_url` still work and resolve to a
+one-element list using `nexus` auth, which is what they have always
+meant. A run using them emits a deprecation notice. Supplying a
+targets list makes the matching URL input inert.
 
 ## Credential Contract (Nexus publishing)
 
