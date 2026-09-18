@@ -75,7 +75,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read  # repository-metadata-action queries PR data
-    uses: ./.github/workflows/build-test.yaml
+    uses: $/.github/workflows/build-test.yaml
     with:
       repository: ${{ matrix.repository }}
       ref: ${{ matrix.ref }}
@@ -94,7 +94,7 @@ jobs:
     name: 'Test: publish targets (valid)'
     permissions:
       contents: read
-    uses: ./.github/workflows/publish-targets.yaml
+    uses: $/.github/workflows/publish-targets.yaml
     with:
       label: 'self-test'
       # yamllint disable-line rule:line-length
@@ -104,7 +104,7 @@ jobs:
     name: 'Test: publish targets (deprecated scalar)'
     permissions:
       contents: read
-    uses: ./.github/workflows/publish-targets.yaml
+    uses: $/.github/workflows/publish-targets.yaml
     with:
       label: 'self-test'
       registry_url: 'https://nexus3.example.org/repository/npm.release/'

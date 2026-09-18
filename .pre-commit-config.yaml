@@ -88,10 +88,13 @@ repos:
     hooks:
       - id: reuse
 
-  # Replaces: https://github.com/rhysd/actionlint
-  # Permits actionlint to run both locally and with precommit.ci/GitHub
-  - repo: https://github.com/Mateusz-Grzelinski/actionlint-py
-    rev: c04ed26e40637cab1aa9879c693832a9c120fb20  # frozen: v1.7.12.24
+  # Actively maintained fork of https://github.com/rhysd/actionlint
+  # Upstream v1.7.12 predates GitHub's self-repository 'uses: $/{path}'
+  # syntax and rejects it, which conflicts with zizmor's
+  # self-repository audit. This fork understands it, for job-level
+  # reusable workflow calls as well as steps.
+  - repo: https://github.com/kjanat/actionlint
+    rev: 08bb2c4f0d039744455b87aef1c647fb8b66d37b  # frozen: v1.17.0
     hooks:
       - id: actionlint
         # Upstream scopes this to '^.github/workflows/'. Widened to add
