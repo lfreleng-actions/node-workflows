@@ -668,7 +668,7 @@ jobs:
     needs: gerrit-validate
     permissions:
       contents: read
-    uses: ./.github/workflows/publish-targets.yaml
+    uses: $/.github/workflows/publish-targets.yaml
     with:
       label: 'snapshot'
       targets_json: ${{ inputs.snapshot_targets }}
@@ -679,7 +679,7 @@ jobs:
     needs: gerrit-validate
     permissions:
       contents: read
-    uses: ./.github/workflows/publish-targets.yaml
+    uses: $/.github/workflows/publish-targets.yaml
     with:
       label: 'release'
       targets_json: ${{ inputs.release_targets }}
