@@ -118,14 +118,17 @@ on:
           JSON array of snapshot publish targets. Each entry needs
           'name', 'registry_url' and 'auth' ('nexus' or 'token'), and
           may carry 'credential_name' to name the 1Password item.
-          Empty falls back to snapshot_registry_url.
+          Leave unset to fall back to snapshot_registry_url; an empty
+          array [] is rejected, not a fallback.
         required: false
         type: string
         default: ''
       release_targets:
         description: >-
           JSON array of release publish targets, in the same shape as
-          snapshot_targets. Empty falls back to release_registry_url.
+          snapshot_targets. Leave unset to fall back to
+          release_registry_url; an empty array [] is rejected, not a
+          fallback.
         required: false
         type: string
         default: ''
