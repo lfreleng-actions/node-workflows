@@ -842,10 +842,11 @@ jobs:
           fi
           # Stamp package.json with the validated tag version.
           #
-          # These flags must match the stamp inside
-          # node-publish-action, which publishes this project, and the
-          # pack-release job in merge.yaml, which attests it. All
-          # three produce a tree that has to be identical; see #58.
+          # This is the only stamp in the release path. The publish
+          # job hands npm this archive through tarball_path, so the
+          # action skips its own stamp and verifies that the tarball
+          # already declares publish_version. The pack-release job in
+          # merge.yaml does the same for that lane; see #58.
           #
           # --ignore-scripts: dependencies are not installed at this
           # point, so preversion/version/postversion hooks cannot
@@ -902,9 +903,10 @@ jobs:
           # the workspace children rather than the target, so the
           # release would carry tarballs nobody asked for.
           #
-          # npm runs prepublishOnly for 'npm publish' and never for
-          # 'npm pack', so this tarball can lack content the published
-          # one carries; see #85.
+          # This archive is the release artefact: attest and
+          # sign-artefacts cover it, and nexus-publish publishes it
+          # rather than packing a second one, so there is no
+          # prepublishOnly divergence left to document; see #85.
           cd "${PATH_PREFIX}"
           mkdir -p pack-dist
           tarball=$(npm pack --no-workspaces \
@@ -1685,12 +1687,20 @@ jobs:
 
       - name: 'Publish release'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@dc6e147d968b3f94f3a178d9c42f61f8aaabf6d7  # v0.1.2
+        uses: lfreleng-actions/node-publish-action@d9098d8589fc72737c504d4b6acbc9a440e0e477  # v0.2.0
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ steps.publish-params.outputs.publish_version }}
           registry_url: ${{ matrix.target.registry_url }}
           path_prefix: ${{ inputs.path_prefix }}
+          # The build job packs the tarball and uploads it as the build
+          # artefact, which the attest and sign-artefacts jobs consume.
+          # Publishing that same archive keeps the attested bytes and
+          # the published bytes one object; packing again here would
+          # reintroduce the prepublishOnly divergence issue #85
+          # describes. The download above already placed it.
+          # yamllint disable-line rule:line-length
+          tarball_path: ${{ needs.build.outputs.artefact_path }}/${{ needs.build.outputs.tarball_name }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           tag: ${{ inputs.npm_tag }}
           access: ${{ inputs.npm_access }}
