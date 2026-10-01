@@ -50,7 +50,7 @@ jobs:
         include:
           - name: 'test-node-project'
             repository: 'lfreleng-actions/test-node-project'
-            ref: 'd4ac174e51af3b8ee1b667aa1b99f404065e706e'  # v0.0.6
+            ref: '0ada465df779c97a9ac53d9139d119a9bc2cbada'  # v0.0.7
             node_version: ''
             test_permit_fail: false
             # This lane gates on both scanners. The fixture is meant
