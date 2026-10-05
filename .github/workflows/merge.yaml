@@ -207,6 +207,15 @@ on:
         required: false
         type: string
         default: ''
+      gerrit_patchset_revision:
+        description: >-
+          The triggering change's revision (GERRIT_PATCHSET_REVISION).
+          Pins the run to the commit that merged it; without it a
+          branch refspec builds whatever the branch tip is when the
+          run resolves it.
+        required: false
+        type: string
+        default: ''
       gerrit_project:
         description: 'Gerrit project name'
         required: false
@@ -231,16 +240,16 @@ on:
           1Password service-account token used by credential-load-action
           to fetch the per-repository Nexus credential from the common
           per-org CI/CD vault (op://<vault>/<repository-name>/password).
-          A live run fails when this is unset; a dry run warns and
-          skips publishing.
+          A live run fails when this is unset. A dry run never loads a
+          credential, set or not, and still rehearses each publish.
         required: false
       VAULT_MAPPING_JSON:
         description: >-
           Base64-encoded JSON mapping of organisation name to 1Password
           vault ID, keyed on github.repository_owner; consumed by
           credential-load-action to resolve the correct vault. A live
-          run fails when this is unset; a dry run warns and skips
-          publishing.
+          run fails when this is unset. A dry run never loads a
+          credential, set or not, and still rehearses each publish.
         required: false
 
 permissions: {}
@@ -309,26 +318,33 @@ jobs:
 
   # Resolve, once, the commit this run builds and publishes (#119).
   #
-  # A Gerrit refspec is usually the branch ref (refs/heads/<branch>),
-  # and checking that out in each job separately means each job gets
-  # whatever the branch tip is when it starts. A merge landing
-  # mid-run then splits one run across commits: version.properties
-  # from one, the built tree from another, release detection from a
-  # third. Every later Gerrit checkout fetches the SHA resolved here
-  # instead, so the whole run sees one commit.
+  # A merge event's refspec is usually the branch ref, and checking
+  # that out in each job separately means each job gets whatever the
+  # branch tip is when it starts -- on the GitHub mirror, which can
+  # also lag Gerrit. A merge landing mid-run then splits one run across
+  # commits, or misses the triggering change entirely. Every later
+  # Gerrit checkout fetches the SHA resolved here instead.
   #
-  # The commit must also be on the target branch. Re-dispatching a
+  # Resolution asks Gerrit, never the mirror, and starts from the
+  # triggering revision (gerrit_patchset_revision) when the caller
+  # forwards it. Under a merge-if-necessary submit type that revision
+  # need not be the commit on the branch: Gerrit may have merged it
+  # with a merge commit. So the build commit is the first-parent
+  # commit that brought the revision onto the branch -- the revision
+  # itself when it was fast-forwarded.
+  #
+  # The revision must be on the target branch. Re-dispatching a
   # merged release change by its change ref is a legitimate recovery;
-  # dispatching an unmerged patchset would publish code nobody
-  # merged, so it is refused.
+  # an unmerged patchset would publish code nobody merged, so it is
+  # refused.
   resolve-commit:
     name: 'Resolve Commit'
     needs: gerrit-validate
     runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.resolve.outputs.commit }}
-    permissions:
-      contents: read
+    # Reads Gerrit over HTTPS and checks nothing out
+    permissions: {}
     timeout-minutes: 5
     steps:
       - name: 'Load egress allow-list'
@@ -348,20 +364,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: 'Checkout Gerrit change'
-        if: inputs.gerrit_refspec != ''
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
-        with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
-          gerrit-project: ${{ inputs.gerrit_project }}
-          # yamllint disable-line rule:line-length
-          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
-          delay: '0s'
-          repository: ${{ inputs.repository || github.repository }}
-          ref: refs/heads/${{ inputs.gerrit_branch }}
-          fetch-depth: '1'
-
       # The GitHub-native path checks out inputs.ref, which the caller
       # already pins; there is nothing to resolve, and every job keeps
       # checking out that ref as before.
@@ -370,34 +372,85 @@ jobs:
         if: inputs.gerrit_refspec != ''
         shell: bash
         env:
+          GERRIT_REFSPEC: ${{ inputs.gerrit_refspec }}
           GERRIT_BRANCH: ${{ inputs.gerrit_branch }}
+          REVISION: ${{ inputs.gerrit_patchset_revision }}
           # yamllint disable-line rule:line-length
           GERRIT_URL: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
           GERRIT_PROJECT: ${{ inputs.gerrit_project }}
         run: |
-          # Resolve the commit, then prove it is on the target branch
-          commit=$(git rev-parse --verify 'HEAD^{commit}')
-          # Ask Gerrit, the source of truth, for the branch: the
-          # mirror may lag behind it. Unshallow first, because
-          # ancestry needs the history between the tip and the commit.
-          deepen=()
-          if [ "$(git rev-parse --is-shallow-repository)" = 'true' ]; then
-            deepen=(--unshallow)
-          fi
-          if ! git fetch -q "${deepen[@]}" --no-tags -- \
-            "${GERRIT_URL}/${GERRIT_PROJECT}" \
-            "refs/heads/${GERRIT_BRANCH}" 2> /dev/null; then
-            echo "::error::Cannot fetch ${GERRIT_BRANCH} from Gerrit" \
-              "to confirm the commit is on it"
+          # Resolve the triggering revision against Gerrit's branch
+          if [ -n "${REVISION}" ] \
+            && [[ ! "${REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::gerrit_patchset_revision must be a full" \
+              "40-character commit SHA"
             exit 1
           fi
-          if ! git merge-base --is-ancestor "${commit}" FETCH_HEAD; then
-            echo "::error::Commit ${commit} is not on" \
+          repo="${RUNNER_TEMP}/resolve-commit"
+          rm -rf "${repo}"
+          git init -q "${repo}"
+          cd "${repo}"
+          remote="${GERRIT_URL}/${GERRIT_PROJECT}"
+          branch_ref='refs/remotes/gerrit/branch'
+          # The whole branch history: mapping a revision to the commit
+          # that merged it, and proving ancestry, both walk it
+          if ! git fetch -q --no-tags -- "${remote}" \
+            "+refs/heads/${GERRIT_BRANCH}:${branch_ref}" 2> /dev/null; then
+            echo "::error::Cannot fetch ${GERRIT_BRANCH} from Gerrit"
+            exit 1
+          fi
+          if [ -n "${REVISION}" ]; then
+            revision="${REVISION}"
+            if ! git cat-file -e "${revision}^{commit}" 2> /dev/null \
+              && ! git fetch -q --no-tags -- "${remote}" \
+                "${revision}" 2> /dev/null; then
+              echo "::error::Gerrit does not serve revision" \
+                "${revision}"
+              exit 1
+            fi
+          elif [ "${GERRIT_REFSPEC}" = "refs/heads/${GERRIT_BRANCH}" ]; then
+            # No triggering revision to anchor on: the branch tip is
+            # the closest available, but a merge landing between the
+            # event and this job moves it. Forward
+            # GERRIT_PATCHSET_REVISION to pin the exact change.
+            echo "::notice::No gerrit_patchset_revision; building the" \
+              "current tip of ${GERRIT_BRANCH}"
+            revision=$(git rev-parse "${branch_ref}")
+          else
+            if ! git fetch -q --no-tags -- "${remote}" \
+              "${GERRIT_REFSPEC}" 2> /dev/null; then
+              echo "::error::Cannot fetch ${GERRIT_REFSPEC} from Gerrit"
+              exit 1
+            fi
+            revision=$(git rev-parse 'FETCH_HEAD^{commit}')
+          fi
+          if ! git merge-base --is-ancestor "${revision}" "${branch_ref}"
+          then
+            echo "::error::Revision ${revision} is not on" \
               "${GERRIT_BRANCH}; refusing to build or publish an" \
               "unmerged change"
             exit 1
           fi
-          echo "Building ${commit} (on ${GERRIT_BRANCH})"
+          # The commit Gerrit put on the branch for this revision: the
+          # revision itself when fast-forwarded, otherwise the oldest
+          # first-parent commit descending from it, i.e. its merge.
+          # Listed into a variable rather than piped to grep -q, which
+          # can exit early and SIGPIPE rev-list under pipefail.
+          mainline=$(git rev-list --first-parent "${branch_ref}")
+          if grep -qx "${revision}" <<< "${mainline}"; then
+            commit="${revision}"
+          else
+            commit=$(git rev-list --first-parent \
+              --ancestry-path="${revision}" \
+              "${revision}..${branch_ref}" | tail -n 1)
+          fi
+          if [[ ! "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Cannot find the commit that merged" \
+              "${revision} onto ${GERRIT_BRANCH}"
+            exit 1
+          fi
+          echo "Building ${commit} (merged ${revision} on" \
+            "${GERRIT_BRANCH})"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
   repository-metadata:
@@ -689,10 +742,14 @@ jobs:
 
       # Snapshots must never take 'latest', which npm install resolves
       # and which must keep naming the newest release (#122). Checked
-      # here so a bad value fails before anything builds. The
-      # character set matches the one node-publish-action enforces; a
-      # leading digit or 'v' is refused because npm rejects a dist-tag
-      # that parses as a semver range.
+      # here so a bad value fails before anything builds.
+      #
+      # npm refuses a dist-tag that parses as a semver range, which
+      # covers more than leading digits: 'x', 'X', 'x.x' and 'vx' are
+      # all wildcard ranges. Rather than approximate that rule, ask
+      # the semver module npm itself bundles, so this gate refuses
+      # exactly what 'npm publish --tag' would. The character set
+      # matches the one node-publish-action enforces.
       - name: 'Validate snapshot dist-tag'
         shell: bash
         env:
@@ -705,9 +762,36 @@ jobs:
                 "that tag must name the newest release"
               exit 1
               ;;
-            '' | *[!A-Za-z0-9._-]* | [0-9]* | v[0-9]*)
+            '' | *[!A-Za-z0-9._-]*)
               echo "::error::Invalid snapshot_dist_tag:" \
                 "$(printf '%s' "${SNAPSHOT_DIST_TAG}" | tr -d '\r\n')"
+              exit 1
+              ;;
+          esac
+          # Exit 10: a range, refused. Exit 11: not a range. Any other
+          # status -- including the 1 Node exits with when the require
+          # throws -- means npm's semver could not be loaded, and the
+          # gate must not pass a tag it never checked.
+          set +e
+          node -e '
+            const path = require("path");
+            const semver = require(path.join(process.argv[1], "npm",
+              "node_modules", "semver", "ranges", "valid.js"));
+            process.exit(semver(process.argv[2]) === null ? 11 : 10);
+          ' "$(npm root -g)" "${SNAPSHOT_DIST_TAG}"
+          rc=$?
+          set -e
+          case "${rc}" in
+            10)
+              echo "::error::snapshot_dist_tag '${SNAPSHOT_DIST_TAG}'" \
+                "parses as a semver range, which npm refuses as a" \
+                "dist-tag"
+              exit 1
+              ;;
+            11) ;;
+            *)
+              echo "::error::Cannot load npm's semver module to" \
+                "check snapshot_dist_tag"
               exit 1
               ;;
           esac
@@ -879,8 +963,9 @@ jobs:
       # A live run without credentials fails: this workflow runs on
       # merges, where a missing secret is a misconfiguration, and
       # skipping would leave a green run that published nothing
-      # (#120). A dry run needs no credential, so it notes their
-      # absence and carries on without loading one (#121).
+      # (#120). A dry run needs no credential and never loads one,
+      # even when the secrets are set, so a stale grant or a 1Password
+      # outage cannot fail a rehearsal (#121).
       - name: 'Check publish credentials'
         id: creds
         shell: bash
@@ -889,14 +974,14 @@ jobs:
           HAS_CREDENTIALS: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN != '' && secrets.VAULT_MAPPING_JSON != '' }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # Gate publishing on credential availability
-          if [ "${HAS_CREDENTIALS}" = 'true' ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          elif [ "${DRY_RUN}" = 'true' ]; then
-            echo "::notice::OP_SERVICE_ACCOUNT_TOKEN and/or" \
-              "VAULT_MAPPING_JSON unavailable; dry run continues" \
-              "without loading a credential"
+          # Gate publishing on credential availability. Dry run
+          # first: node-publish-action configures no credential in
+          # dry-run mode, so loading one could only add a failure.
+          if [ "${DRY_RUN}" = 'true' ]; then
+            echo "Dry run: publishing without loading a credential"
             echo "available=false" >> "$GITHUB_OUTPUT"
+          elif [ "${HAS_CREDENTIALS}" = 'true' ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "::error::OP_SERVICE_ACCOUNT_TOKEN and/or" \
               "VAULT_MAPPING_JSON unavailable; a live run cannot" \
@@ -1080,8 +1165,17 @@ jobs:
               "shallow checkout; cannot detect release files"
             exit 1
           fi
+          # Past that guard, a HEAD with no parent is the repository's
+          # genuine first commit. Plain diff-tree prints nothing for a
+          # root commit, which would silently miss an initial release,
+          # so --root diffs it against the empty tree instead.
+          root=()
+          if ! git rev-parse -q --verify 'HEAD^' > /dev/null; then
+            root=(--root)
+          fi
           if ! files=$(git diff-tree -m --first-parent --diff-filter=A \
-            --no-commit-id -r HEAD --name-only -- "releases/"); then
+            "${root[@]}" --no-commit-id -r HEAD --name-only -- "releases/")
+          then
             echo "::error::git diff-tree failed; cannot detect" \
               "release files (insufficient checkout history?)"
             exit 1
@@ -1122,8 +1216,9 @@ jobs:
 
       # The release file's version must match version.properties; a
       # mismatch means the release descriptor and committed version
-      # metadata diverged, and nothing may publish or be signed for
-      # either version.
+      # metadata diverged, so no release tarball may pack, sign,
+      # attest or publish. The snapshot lane does not depend on this
+      # job and still publishes the merge's snapshot.
       - name: 'Verify release version matches version.properties'
         id: verify-version
         if: steps.detect.outputs.has_release == 'true'
@@ -1258,8 +1353,9 @@ jobs:
       # A live run without credentials fails: this workflow runs on
       # merges, where a missing secret is a misconfiguration, and
       # skipping would leave a green run that published nothing
-      # (#120). A dry run needs no credential, so it notes their
-      # absence and carries on without loading one (#121).
+      # (#120). A dry run needs no credential and never loads one,
+      # even when the secrets are set, so a stale grant or a 1Password
+      # outage cannot fail a rehearsal (#121).
       - name: 'Check publish credentials'
         id: creds
         shell: bash
@@ -1268,14 +1364,14 @@ jobs:
           HAS_CREDENTIALS: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN != '' && secrets.VAULT_MAPPING_JSON != '' }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # Gate publishing on credential availability
-          if [ "${HAS_CREDENTIALS}" = 'true' ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          elif [ "${DRY_RUN}" = 'true' ]; then
-            echo "::notice::OP_SERVICE_ACCOUNT_TOKEN and/or" \
-              "VAULT_MAPPING_JSON unavailable; dry run continues" \
-              "without loading a credential"
+          # Gate publishing on credential availability. Dry run
+          # first: node-publish-action configures no credential in
+          # dry-run mode, so loading one could only add a failure.
+          if [ "${DRY_RUN}" = 'true' ]; then
+            echo "Dry run: publishing without loading a credential"
             echo "available=false" >> "$GITHUB_OUTPUT"
+          elif [ "${HAS_CREDENTIALS}" = 'true' ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "::error::OP_SERVICE_ACCOUNT_TOKEN and/or" \
               "VAULT_MAPPING_JSON unavailable; a live run cannot" \

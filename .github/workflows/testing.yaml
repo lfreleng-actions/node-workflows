@@ -939,14 +939,18 @@ jobs:
             'releases/1.1.2.yaml=version: 1.1.2'
 
           errors=0
-          # $1 case, $2 branch, $3 depth, $4 want (pass|fail),
-          # $5 expected has_release, $6 expected version
+          # $1 case, $2 branch, $3 depth (0 = full history),
+          # $4 want (pass|fail), $5 expected has_release,
+          # $6 expected version; FROM overrides the source repository
           check() {
-            local work="${RUNNER_TEMP}/case-$1"
+            local work="${RUNNER_TEMP}/case-$1" depth=()
             rm -rf "${work}"
             git init -q "${work}"
-            git -C "${work}" fetch -q --depth="$3" \
-              "file://${src}" "refs/heads/$2"
+            if [ "$3" != '0' ]; then
+              depth=(--depth="$3")
+            fi
+            git -C "${work}" fetch -q "${depth[@]}" \
+              "file://${FROM:-${src}}" "refs/heads/$2"
             git -C "${work}" checkout -q FETCH_HEAD
             : > "${work}.out"
             set +e
@@ -1008,6 +1012,18 @@ jobs:
           check 'release, shallow without parent' release 1 fail
           check 'no release, shallow without parent' plain 1 fail
 
+          # A repository whose first commit adds the release file has
+          # no parent at all, and is not shallow: an initial release
+          # must still be found, not read as no release
+          first="${RUNNER_TEMP}/first"
+          git init -q -b main "${first}"
+          mkdir -p "${first}/releases"
+          echo 'version: 1.0.0' > "${first}/releases/1.0.0.yaml"
+          git -C "${first}" add releases
+          git -C "${first}" commit -q -m 'Initial release'
+          FROM="${first}" check 'release in the root commit' main 0 \
+            pass true 1.0.0
+
           if [ "${errors}" != '0' ]; then
             echo "Release detection incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1
@@ -1055,7 +1071,7 @@ jobs:
           steps = doc['jobs']['resolve-commit']['steps']
           print([s for s in steps if s.get('id') == 'resolve'][0]['run'])
           EXTRACT
-          if ! grep -q 'is-ancestor' "${resolve}"; then
+          if ! grep -q 'ancestry-path' "${resolve}"; then
             echo "Could not extract commit resolution ❌"
             echo "Update the extraction in this job to match"
             exit 1
@@ -1067,55 +1083,76 @@ jobs:
           export GIT_COMMITTER_NAME="${GIT_AUTHOR_NAME}"
           export GIT_COMMITTER_EMAIL="${GIT_AUTHOR_EMAIL}"
 
-          # A stand-in Gerrit: <server>/<project>, with a merged
-          # history on main and an unmerged patchset beside it
+          # A stand-in Gerrit (<server>/<project>) whose main branch
+          # holds each shape a merge-if-necessary submit produces
           server="${RUNNER_TEMP}/gerrit"
           src="${server}/project"
           git init -q -b main "${src}"
-          for n in 1 2 3; do
-            git -C "${src}" commit -q --allow-empty -m "merged ${n}"
-          done
-          merged=$(git -C "${src}" rev-parse HEAD~1)
-          git -C "${src}" switch -q -c unmerged HEAD~2
-          git -C "${src}" commit -q --allow-empty -m 'unmerged patchset'
-          unmerged=$(git -C "${src}" rev-parse HEAD)
-          git -C "${src}" switch -q main
+          g() { git -C "${src}" "$@"; }
+          g commit -q --allow-empty -m 'base'
+          base=$(g rev-parse HEAD)
+          # A change fast-forwarded onto main: it is its own commit
+          g commit -q --allow-empty -m 'fast-forwarded change'
+          ff=$(g rev-parse HEAD)
+          # A change Gerrit merged with a merge commit
+          g switch -q -c change "${base}"
+          g commit -q --allow-empty -m 'merged change'
+          merged=$(g rev-parse HEAD)
+          g switch -q main
+          g merge -q --no-ff -m 'Merge "merged change"' "${merged}"
+          merge_commit=$(g rev-parse HEAD)
+          # A later merge that moves the tip after the event fired
+          g commit -q --allow-empty -m 'later change'
+          tip=$(g rev-parse HEAD)
+          # Change refs, as Gerrit publishes them, and a patchset
+          # nobody merged
+          g update-ref refs/changes/01/1/1 "${ff}"
+          g switch -q -c abandoned "${base}"
+          g commit -q --allow-empty -m 'unmerged patchset'
+          g update-ref refs/changes/02/2/1 HEAD
+          unmerged=$(g rev-parse HEAD)
+          g switch -q main
 
           errors=0
-          # $1 case, $2 commit to check out, $3 want (pass|fail)
+          # $1 case, $2 refspec, $3 revision, $4 want (commit SHA|fail)
           check() {
-            local work="${RUNNER_TEMP}/case-$1"
-            rm -rf "${work}"
-            git init -q "${work}"
-            # As the checkout action leaves it: shallow, at the commit
-            git -C "${work}" fetch -q --depth=1 "file://${src}" "$2"
-            git -C "${work}" checkout -q FETCH_HEAD
-            : > "${work}.out"
+            local out_file="${RUNNER_TEMP}/case.out"
+            : > "${out_file}"
             set +e
-            out="$(cd "${work}" && GITHUB_OUTPUT="${work}.out" \
+            out="$(RUNNER_TEMP="${RUNNER_TEMP}" GITHUB_OUTPUT="${out_file}" \
               GERRIT_URL="file://${server}" GERRIT_PROJECT=project \
-              GERRIT_BRANCH=main bash -eo pipefail "${resolve}" 2>&1)"
+              GERRIT_BRANCH=main GERRIT_REFSPEC="$2" REVISION="$3" \
+              bash -eo pipefail "${resolve}" 2>&1)"
             rc=$?
             set -e
-            if [ "$3" = 'pass' ]; then
-              if [ "${rc}" != '0' ] \
-                || ! grep -qx "commit=$2" "${work}.out"; then
-                echo "$1: did not resolve to $2 ❌"
-                printf '%s\n' "${out}" | tail -n 3
+            if [ "$4" = 'fail' ]; then
+              if [ "${rc}" = '0' ] \
+                || ! printf '%s' "${out}" | grep -q '^::error::'; then
+                echo "$1: resolved, expected a refusal ❌"
                 errors=1
               fi
-            elif [ "${rc}" = '0' ] \
-              || ! printf '%s' "${out}" | grep -q '^::error::'; then
-              echo "$1: resolved, expected a refusal ❌"
+            elif [ "${rc}" != '0' ] \
+              || ! grep -qx "commit=$4" "${out_file}"; then
+              echo "$1: expected commit=$4 ❌"
+              printf '%s\n' "${out}" | tail -n 3
               errors=1
             fi
           }
 
-          check 'branch tip' "$(git -C "${src}" rev-parse main)" pass
-          # Re-running an already-merged change by its change ref
-          check 'merged, behind the tip' "${merged}" pass
+          heads='refs/heads/main'
+          # The triggering revision pins the run, however far the tip
+          # has moved since the event (the stale/moving-tip case)
+          check 'revision fast-forwarded' "${heads}" "${ff}" "${ff}"
+          check 'revision merged by a merge commit' \
+            "${heads}" "${merged}" "${merge_commit}"
+          # Without a revision, a branch refspec builds the tip
+          check 'branch refspec, no revision' "${heads}" '' "${tip}"
+          # A change ref re-runs that already-merged change
+          check 'merged change ref' 'refs/changes/01/1/1' '' "${ff}"
           # A patchset nobody merged must never build or publish
-          check 'unmerged patchset' "${unmerged}" fail
+          check 'unmerged revision' "${heads}" "${unmerged}" fail
+          check 'unmerged change ref' 'refs/changes/02/2/1' '' fail
+          check 'malformed revision' "${heads}" 'abc123' fail
 
           if [ "${errors}" != '0' ]; then
             echo "Commit resolution incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
@@ -1208,9 +1245,10 @@ jobs:
           }
 
           check 'live, credentials' true false available
-          check 'dry run, credentials' true true available
-          # Carries on credential-free; the publish step then runs
-          # node-publish-action's dry run (#121)
+          # A dry run never loads a credential, set or not, so a stale
+          # grant or a vault outage cannot fail it; the publish step
+          # then runs node-publish-action's dry run (#121)
+          check 'dry run, credentials' true true no-credential
           check 'dry run, no credentials' false true no-credential
           # The defect: this used to warn, skip and go green (#120)
           check 'live, no credentials' false false fail
@@ -1289,14 +1327,39 @@ jobs:
           check 'snapshot' accept
           check 'next' accept
           check 'dev-build_1.x' accept
+          # Look like ranges, but npm's semver says they are not
+          check 'v' accept
+          check 'x-ray' accept
           # The point of the input: snapshots never take latest
           check 'latest' reject
           check '' reject
-          # npm refuses a dist-tag that parses as a semver range
+          # npm refuses a dist-tag that parses as a semver range,
+          # wildcards included
           check '1.0' reject
           check 'v2' reject
+          check 'x' reject
+          check 'X' reject
+          check 'x.x' reject
+          check 'vx' reject
           check 'has space' reject
           check 'semi;colon' reject
+
+          # An npm whose semver module cannot load must fail the gate,
+          # not pass a tag nobody checked
+          shim="${RUNNER_TEMP}/broken-npm"
+          mkdir -p "${shim}"
+          printf '#!/bin/sh\necho /nonexistent\n' > "${shim}/npm"
+          chmod +x "${shim}/npm"
+          set +e
+          out="$(PATH="${shim}:${PATH}" SNAPSHOT_DIST_TAG=snapshot \
+            bash -eo pipefail "${validate}" 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" = '0' ] \
+            || ! printf '%s' "${out}" | grep -q 'Cannot load'; then
+            echo "unloadable semver: gate passed, expected a failure ❌"
+            errors=1
+          fi
 
           if [ "${errors}" != '0' ]; then
             echo "Dist-tag validation incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
