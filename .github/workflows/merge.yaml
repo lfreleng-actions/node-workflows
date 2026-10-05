@@ -219,16 +219,16 @@ on:
           1Password service-account token used by credential-load-action
           to fetch the per-repository Nexus credential from the common
           per-org CI/CD vault (op://<vault>/<repository-name>/password).
-          The publish jobs skip credential loading and publishing with a
-          warning when unset, so PR/self-test contexts still work.
+          A live run fails when this is unset; a dry run warns and
+          skips publishing.
         required: false
       VAULT_MAPPING_JSON:
         description: >-
           Base64-encoded JSON mapping of organisation name to 1Password
           vault ID, keyed on github.repository_owner; consumed by
-          credential-load-action to resolve the correct vault. The
-          publish jobs skip credential loading and publishing with a
-          warning when unset, so PR/self-test contexts still work.
+          credential-load-action to resolve the correct vault. A live
+          run fails when this is unset; a dry run warns and skips
+          publishing.
         required: false
 
 permissions: {}
@@ -838,23 +838,30 @@ jobs:
           name: node-build-content
           path: ${{ inputs.path_prefix }}
 
-      # The credential secrets stay optional so PR/self-test contexts
-      # can exercise the pipeline; when absent the publish steps skip
-      # with a warning rather than failing.
+      # A live run without credentials fails: this workflow runs on
+      # merges, where a missing secret is a misconfiguration, and
+      # skipping would leave a green run that published nothing
+      # (#120). A dry run publishes nothing anyway, so it only warns.
       - name: 'Check publish credentials'
         id: creds
         shell: bash
         env:
           # yamllint disable-line rule:line-length
           HAS_CREDENTIALS: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN != '' && secrets.VAULT_MAPPING_JSON != '' }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           # Gate publishing on credential availability
           if [ "${HAS_CREDENTIALS}" = 'true' ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "${DRY_RUN}" = 'true' ]; then
             echo "::warning::OP_SERVICE_ACCOUNT_TOKEN and/or" \
               "VAULT_MAPPING_JSON unavailable; skipping publish"
             echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::OP_SERVICE_ACCOUNT_TOKEN and/or" \
+              "VAULT_MAPPING_JSON unavailable; a live run cannot" \
+              "publish without them"
+            exit 1
           fi
 
       - name: 'Resolve Nexus username'
@@ -1201,23 +1208,30 @@ jobs:
           fi
           echo "Release version verified: ${RELEASE_VERSION}"
 
-      # The credential secrets stay optional so PR/self-test contexts
-      # can exercise the pipeline; when absent the publish steps skip
-      # with a warning rather than failing.
+      # A live run without credentials fails: this workflow runs on
+      # merges, where a missing secret is a misconfiguration, and
+      # skipping would leave a green run that published nothing
+      # (#120). A dry run publishes nothing anyway, so it only warns.
       - name: 'Check publish credentials'
         id: creds
         shell: bash
         env:
           # yamllint disable-line rule:line-length
           HAS_CREDENTIALS: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN != '' && secrets.VAULT_MAPPING_JSON != '' }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           # Gate publishing on credential availability
           if [ "${HAS_CREDENTIALS}" = 'true' ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "${DRY_RUN}" = 'true' ]; then
             echo "::warning::OP_SERVICE_ACCOUNT_TOKEN and/or" \
               "VAULT_MAPPING_JSON unavailable; skipping publish"
             echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::OP_SERVICE_ACCOUNT_TOKEN and/or" \
+              "VAULT_MAPPING_JSON unavailable; a live run cannot" \
+              "publish without them"
+            exit 1
           fi
 
       - name: 'Resolve Nexus username'

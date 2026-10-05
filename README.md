@@ -270,9 +270,9 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 
 <!-- markdownlint-enable MD013 -->
 
-The secrets stay optional so PR and self-test contexts work; the
-publish steps check credential availability and skip with a warning
-when the secrets stay unset.
+A live run fails when either secret is unset, since `merge.yaml`
+runs on merges, where a missing secret is a misconfiguration. A dry
+run warns and skips publishing instead.
 
 ## Node.js Version Selection
 

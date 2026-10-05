@@ -1076,6 +1076,102 @@ jobs:
           fi
           echo "Commit resolution correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
 
+  # Both publish jobs decide whether to publish from the same
+  # credential check. A live run without credentials must fail rather
+  # than skip and go green (#120); a dry run only warns. Extracted and
+  # driven directly, since merge.yaml cannot run in CI.
+  credential-gate:
+    name: 'Test: credential gate'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise the credential gate'
+        shell: bash
+        run: |
+          # Exercise the credential gate
+          gate="${RUNNER_TEMP}/creds.sh"
+          python3 - <<'EXTRACT' > "${gate}"
+          import sys
+
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              jobs = yaml.safe_load(handle)['jobs']
+          bodies = {
+              job_id: [
+                  s for s in jobs[job_id]['steps'] if s.get('id') == 'creds'
+              ][0]['run']
+              for job_id in ('snapshot-publish', 'release-publish')
+          }
+          # One rule for both lanes: a gate that drifted between them
+          # would publish snapshots and skip releases, or the reverse
+          if len(set(bodies.values())) != 1:
+              sys.exit('The two credential checks differ')
+          print(next(iter(bodies.values())))
+          EXTRACT
+
+          errors=0
+          # $1 case, $2 HAS_CREDENTIALS, $3 DRY_RUN,
+          # $4 want (available|skip|fail)
+          check() {
+            local out_file="${RUNNER_TEMP}/gate-$2-$3.out"
+            : > "${out_file}"
+            set +e
+            out="$(HAS_CREDENTIALS="$2" DRY_RUN="$3" \
+              GITHUB_OUTPUT="${out_file}" bash -eo pipefail "${gate}" 2>&1)"
+            rc=$?
+            set -e
+            case "$4" in
+              available|skip)
+                local want=true
+                [ "$4" = 'skip' ] && want=false
+                if [ "${rc}" != '0' ] \
+                  || ! grep -qx "available=${want}" "${out_file}"; then
+                  echo "$1: expected available=${want} ❌"
+                  errors=1
+                fi
+                ;;
+              fail)
+                if [ "${rc}" = '0' ] \
+                  || ! printf '%s' "${out}" | grep -q '^::error::'; then
+                  echo "$1: expected a failure with an error ❌"
+                  errors=1
+                fi
+                ;;
+            esac
+          }
+
+          check 'live, credentials' true false available
+          check 'dry run, credentials' true true available
+          check 'dry run, no credentials' false true skip
+          # The defect: this used to warn, skip and go green (#120)
+          check 'live, no credentials' false false fail
+
+          if [ "${errors}" != '0' ]; then
+            echo "Credential gate incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Credential gate correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
   # The node-metadata resolver decides which Node.js version each job
   # runs on, including the build/test split that lets a legacy
   # toolchain coexist with a modern pack/publish lane. Calling
