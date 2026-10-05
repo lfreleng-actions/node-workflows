@@ -786,20 +786,31 @@ jobs:
           git -C "${src}" commit -q -m 'Initial commit'
           base=$(git -C "${src}" rev-parse HEAD)
 
-          # $1 branch, then path=content pairs to write and commit
+          # $1 branch, $2 base revision, then path=content pairs to
+          # write and commit; a pair with no '=' deletes that path
           commit_on() {
-            local branch="$1"
-            shift
-            git -C "${src}" switch -q -c "${branch}" "${base}"
+            local branch="$1" from="$2"
+            shift 2
+            git -C "${src}" switch -q -c "${branch}" "${from}"
             for pair in "$@"; do
+              if [ "${pair}" = "${pair%%=*}" ]; then
+                git -C "${src}" rm -q "${pair}"
+                continue
+              fi
               mkdir -p "$(dirname "${src}/${pair%%=*}")"
               printf '%s\n' "${pair#*=}" > "${src}/${pair%%=*}"
               git -C "${src}" add "${pair%%=*}"
             done
             git -C "${src}" commit -q -m "${branch}"
           }
-          commit_on release 'releases/1.1.1.yaml=version: 1.1.1'
-          commit_on plain 'README=no release here'
+          commit_on release "${base}" 'releases/1.1.1.yaml=version: 1.1.1'
+          commit_on plain "${base}" 'README=no release here'
+          # Only an ADDED release file is a release: editing or
+          # deleting an earlier one is maintenance
+          commit_on edited release 'releases/1.1.1.yaml=version: 1.1.1 # note'
+          commit_on deleted release 'releases/1.1.1.yaml'
+          commit_on two "${base}" 'releases/1.1.1.yaml=version: 1.1.1' \
+            'releases/1.1.2.yaml=version: 1.1.2'
 
           errors=0
           # $1 case, $2 branch, $3 depth, $4 want (pass|fail),
@@ -843,6 +854,9 @@ jobs:
 
           check 'release, parent fetched' release 2 pass true 1.1.1
           check 'no release, parent fetched' plain 2 pass false ''
+          check 'release file edited' edited 2 pass false ''
+          check 'release file deleted' deleted 2 pass false ''
+          check 'two release files' two 2 fail
           # The defect: a depth-1 clone has no parent, and must fail
           # rather than report no release (#117)
           check 'release, shallow without parent' release 1 fail

@@ -898,7 +898,10 @@ jobs:
         id: detect
         shell: bash
         run: |
-          # Detect a release file added/changed by the merged commit.
+          # Detect a release file added by the merged commit. Only
+          # additions count: editing or deleting an existing release
+          # file is maintenance, not a request to publish its version
+          # again.
           # -m --first-parent makes merge commits diff against their
           # first parent (plain diff-tree emits nothing for merges,
           # which would silently suppress release detection). A
@@ -916,7 +919,7 @@ jobs:
               "shallow checkout; cannot detect release files"
             exit 1
           fi
-          if ! files=$(git diff-tree -m --first-parent \
+          if ! files=$(git diff-tree -m --first-parent --diff-filter=A \
             --no-commit-id -r HEAD --name-only -- "releases/"); then
             echo "::error::git diff-tree failed; cannot detect" \
               "release files (insufficient checkout history?)"
@@ -937,12 +940,6 @@ jobs:
             exit 1
           fi
           release_file="${files}"
-          if [ ! -f "${release_file}" ]; then
-            echo "Release file removed by merged commit; not a release"
-            echo "has_release=false" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           echo "Release file detected: ${release_file}"
           # Tolerate a missing version: line (grep exits 1 under
           # pipefail); the guard below then reports it cleanly
