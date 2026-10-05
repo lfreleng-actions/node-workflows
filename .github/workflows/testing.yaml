@@ -551,6 +551,29 @@ jobs:
                       'permanent record for a version that never shipped'
                   )
 
+          # Snapshots publish under snapshot_dist_tag, never the
+          # action's default 'latest', which npm install resolves and
+          # which has to keep naming the newest release (#122).
+          # Releases keep that default.
+          dist_tags = {}
+          for job_id in ('snapshot-publish', 'release-publish'):
+              for step in merge_jobs[job_id].get('steps') or []:
+                  if 'node-publish-action' in str(step.get('uses', '')):
+                      dist_tags[job_id] = str(
+                          (step.get('with') or {}).get('tag', '')).strip()
+          wanted_tag = OPEN + 'inputs.snapshot_dist_tag' + CLOSE
+          if dist_tags.get('snapshot-publish') != wanted_tag:
+              errors.append(
+                  'merge.yaml/snapshot-publish passes tag '
+                  f"{dist_tags.get('snapshot-publish')!r}, expected "
+                  f'{wanted_tag!r}; snapshots must not take latest'
+              )
+          if dist_tags.get('release-publish'):
+              errors.append(
+                  'merge.yaml/release-publish overrides the dist-tag; '
+                  'releases keep latest'
+              )
+
           if errors:
               for message in errors:
                   print(f'::error::{message}')
@@ -1197,6 +1220,89 @@ jobs:
             exit 1
           fi
           echo "Credential gate correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # snapshot_dist_tag must never be 'latest', and must be a tag npm
+  # accepts (#122). The validation step is extracted and driven with
+  # the values that matter.
+  snapshot-dist-tag:
+    name: 'Test: snapshot dist-tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise dist-tag validation'
+        shell: bash
+        run: |
+          # Exercise dist-tag validation
+          validate="${RUNNER_TEMP}/dist-tag.sh"
+          python3 - <<'EXTRACT' > "${validate}"
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['jobs']['resolve-version']['steps']
+          print([
+              s for s in steps
+              if s.get('name') == 'Validate snapshot dist-tag'
+          ][0]['run'])
+          EXTRACT
+          if ! grep -q 'SNAPSHOT_DIST_TAG' "${validate}"; then
+            echo "Could not extract dist-tag validation ❌"
+            exit 1
+          fi
+
+          errors=0
+          # $1 tag, $2 want (accept|reject)
+          check() {
+            set +e
+            out="$(SNAPSHOT_DIST_TAG="$1" bash -eo pipefail "${validate}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$2" = 'accept' ] && [ "${rc}" != '0' ]; then
+              echo "'$1': rejected, expected accepted ❌"
+              errors=1
+            elif [ "$2" = 'reject' ] && { [ "${rc}" = '0' ] \
+              || ! printf '%s' "${out}" | grep -q '^::error::'; }; then
+              echo "'$1': accepted, expected rejected ❌"
+              errors=1
+            fi
+          }
+
+          check 'snapshot' accept
+          check 'next' accept
+          check 'dev-build_1.x' accept
+          # The point of the input: snapshots never take latest
+          check 'latest' reject
+          check '' reject
+          # npm refuses a dist-tag that parses as a semver range
+          check '1.0' reject
+          check 'v2' reject
+          check 'has space' reject
+          check 'semi;colon' reject
+
+          if [ "${errors}" != '0' ]; then
+            echo "Dist-tag validation incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Dist-tag validation correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # The node-metadata resolver decides which Node.js version each job
   # runs on, including the build/test split that lets a legacy

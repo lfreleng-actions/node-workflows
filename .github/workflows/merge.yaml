@@ -156,6 +156,14 @@ on:
         required: false
         type: string
         default: ''
+      snapshot_dist_tag:
+        description: >-
+          npm dist-tag for snapshot publishes. Not 'latest': npm
+          install resolves 'latest', which has to keep naming the
+          newest release rather than whichever snapshot merged last.
+        required: false
+        type: string
+        default: 'snapshot'
       dry_run:
         description: >-
           Rehearse the publish steps without uploading. Needs no
@@ -679,6 +687,32 @@ jobs:
           fi
           echo "Resolved version: ${PROPS_VERSION}"
 
+      # Snapshots must never take 'latest', which npm install resolves
+      # and which must keep naming the newest release (#122). Checked
+      # here so a bad value fails before anything builds. The
+      # character set matches the one node-publish-action enforces; a
+      # leading digit or 'v' is refused because npm rejects a dist-tag
+      # that parses as a semver range.
+      - name: 'Validate snapshot dist-tag'
+        shell: bash
+        env:
+          SNAPSHOT_DIST_TAG: ${{ inputs.snapshot_dist_tag }}
+        run: |
+          # Validate the snapshot dist-tag
+          case "${SNAPSHOT_DIST_TAG}" in
+            latest)
+              echo "::error::snapshot_dist_tag cannot be 'latest';" \
+                "that tag must name the newest release"
+              exit 1
+              ;;
+            '' | *[!A-Za-z0-9._-]* | [0-9]* | v[0-9]*)
+              echo "::error::Invalid snapshot_dist_tag:" \
+                "$(printf '%s' "${SNAPSHOT_DIST_TAG}" | tr -d '\r\n')"
+              exit 1
+              ;;
+          esac
+          echo "Snapshot dist-tag: ${SNAPSHOT_DIST_TAG}"
+
   build:
     name: 'Build'
     needs:
@@ -939,6 +973,9 @@ jobs:
           registry_url: ${{ matrix.target.registry_url }}
           path_prefix: ${{ inputs.path_prefix }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
+          # Never 'latest', the action's default: that tag has to keep
+          # naming the newest release (#122)
+          tag: ${{ inputs.snapshot_dist_tag }}
           dry_run: ${{ inputs.dry_run }}
           provenance: 'false'
           load_credential: 'false'
