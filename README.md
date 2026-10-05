@@ -90,6 +90,9 @@ the merged commit adds a file under `releases/` whose `version:`
 matches `version.properties`, the workflow also publishes the plain
 `X.Y.Z` release to the release targets. A version mismatch between
 the release file and `version.properties` fails the release publish.
+Detection compares the merged commit against its parent, so the run
+fails rather than reporting no release when the checkout lacks that
+parent.
 
 Release publishes also gain attestation and a signature. The build job
 uploads the built tree rather than a tarball, so a `pack-release` job

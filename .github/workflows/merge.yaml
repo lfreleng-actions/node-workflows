@@ -315,7 +315,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -378,7 +378,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -525,7 +525,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -613,7 +613,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -863,12 +863,15 @@ jobs:
 
       # On Gerrit change-merged dispatches GERRIT_REFSPEC is the branch
       # ref (refs/heads/<branch>), so both checkout paths land on the
-      # merged commit. The plain checkout fetches depth 2 so diff-tree
-      # can compare HEAD against its parent.
+      # merged commit. Both fetch depth 2 so diff-tree can compare HEAD
+      # against its parent. The Gerrit path states the depth rather
+      # than inheriting the action's default: v1.1.0 defaulted to 1,
+      # which grafted HEAD as a root commit and hid every release
+      # file (#117).
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
           gerrit-refspec: ${{ inputs.gerrit_refspec }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -877,6 +880,7 @@ jobs:
           delay: '0s'
           repository: ${{ inputs.repository || github.repository }}
           ref: refs/heads/${{ inputs.gerrit_branch }}
+          fetch-depth: '2'
       - name: 'Checkout repository'
         if: inputs.gerrit_refspec == ''
         # yamllint disable-line rule:line-length
@@ -900,6 +904,18 @@ jobs:
           # which would silently suppress release detection). A
           # diff-tree failure (e.g. insufficient history) fails loudly
           # rather than silently skipping an intended release.
+          #
+          # diff-tree does not fail when HEAD's parent was not
+          # fetched: a shallow clone grafts HEAD as a root commit, for
+          # which it prints nothing and exits 0. That reads exactly
+          # like a merge with no release file, so check for the parent
+          # first (#117).
+          if [ "$(git rev-parse --is-shallow-repository)" = 'true' ] \
+            && ! git rev-parse -q --verify 'HEAD^' > /dev/null; then
+            echo "::error::The merged commit's parent is not in the" \
+              "shallow checkout; cannot detect release files"
+            exit 1
+          fi
           if ! files=$(git diff-tree -m --first-parent \
             --no-commit-id -r HEAD --name-only -- "releases/"); then
             echo "::error::git diff-tree failed; cannot detect" \

@@ -720,6 +720,140 @@ jobs:
           echo "Every rejection rule behaved correctly ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
+  # merge.yaml cannot run in CI, but its release detection is a shell
+  # step that needs only a git checkout. Extract the shipped step and
+  # drive it against local repositories built to each shape a merge
+  # run meets, including the shallow clone that silently hid the
+  # onap-ui-common 1.1.1 release (#117).
+  release-detection:
+    name: 'Test: release detection'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise release detection'
+        shell: bash
+        run: |
+          # Exercise release detection
+          detect="${RUNNER_TEMP}/detect.sh"
+          python3 - <<'EXTRACT' > "${detect}"
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['jobs']['check-release']['steps']
+          print([s for s in steps if s.get('id') == 'detect'][0]['run'])
+          EXTRACT
+          # Fail loudly rather than silently testing nothing if the
+          # step is renamed or loses its parent check
+          if ! grep -q 'is-shallow-repository' "${detect}"; then
+            echo "Could not extract release detection ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          # Local repositories only: an identity, no signing, and none
+          # of the runner's own git settings
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+          export GIT_AUTHOR_NAME='Release Detection'
+          export GIT_AUTHOR_EMAIL='release-detection@example.org'
+          export GIT_COMMITTER_NAME="${GIT_AUTHOR_NAME}"
+          export GIT_COMMITTER_EMAIL="${GIT_AUTHOR_EMAIL}"
+
+          # Upstream history; each branch is one merged commit
+          src="${RUNNER_TEMP}/src"
+          git init -q -b main "${src}"
+          echo 'major=1' > "${src}/version.properties"
+          git -C "${src}" add version.properties
+          git -C "${src}" commit -q -m 'Initial commit'
+          base=$(git -C "${src}" rev-parse HEAD)
+
+          # $1 branch, then path=content pairs to write and commit
+          commit_on() {
+            local branch="$1"
+            shift
+            git -C "${src}" switch -q -c "${branch}" "${base}"
+            for pair in "$@"; do
+              mkdir -p "$(dirname "${src}/${pair%%=*}")"
+              printf '%s\n' "${pair#*=}" > "${src}/${pair%%=*}"
+              git -C "${src}" add "${pair%%=*}"
+            done
+            git -C "${src}" commit -q -m "${branch}"
+          }
+          commit_on release 'releases/1.1.1.yaml=version: 1.1.1'
+          commit_on plain 'README=no release here'
+
+          errors=0
+          # $1 case, $2 branch, $3 depth, $4 want (pass|fail),
+          # $5 expected has_release, $6 expected version
+          check() {
+            local work="${RUNNER_TEMP}/case-$1"
+            rm -rf "${work}"
+            git init -q "${work}"
+            git -C "${work}" fetch -q --depth="$3" \
+              "file://${src}" "refs/heads/$2"
+            git -C "${work}" checkout -q FETCH_HEAD
+            : > "${work}.out"
+            set +e
+            out="$(cd "${work}" && GITHUB_OUTPUT="${work}.out" \
+              bash -eo pipefail "${detect}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$4" = 'fail' ]; then
+              if [ "${rc}" = '0' ]; then
+                echo "$1: detection passed, expected a failure ❌"
+                errors=1
+              elif ! printf '%s' "${out}" | grep -q '^::error::'; then
+                echo "$1: failed without an error annotation ❌"
+                errors=1
+              fi
+              return
+            fi
+            if [ "${rc}" != '0' ]; then
+              echo "$1: detection failed (${rc}) ❌"
+              printf '%s\n' "${out}" | tail -n 3
+              errors=1
+              return
+            fi
+            if ! grep -qx "has_release=$5" "${work}.out" \
+              || ! grep -qx "version=$6" "${work}.out"; then
+              echo "$1: wrong outputs ❌"
+              cat "${work}.out"
+              errors=1
+            fi
+          }
+
+          check 'release, parent fetched' release 2 pass true 1.1.1
+          check 'no release, parent fetched' plain 2 pass false ''
+          # The defect: a depth-1 clone has no parent, and must fail
+          # rather than report no release (#117)
+          check 'release, shallow without parent' release 1 fail
+          check 'no release, shallow without parent' plain 1 fail
+
+          if [ "${errors}" != '0' ]; then
+            echo "Release detection incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Release detection correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
   # The node-metadata resolver decides which Node.js version each job
   # runs on, including the build/test split that lets a legacy
   # toolchain coexist with a modern pack/publish lane. Calling
