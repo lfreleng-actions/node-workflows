@@ -157,7 +157,11 @@ on:
         type: string
         default: ''
       dry_run:
-        description: 'Run the publish steps without uploading'
+        description: >-
+          Rehearse the publish steps without uploading. Needs no
+          credentials, and skips attestation and signing, which would
+          otherwise leave permanent public records for a version that
+          never shipped.
         required: false
         type: boolean
         default: false
@@ -841,7 +845,8 @@ jobs:
       # A live run without credentials fails: this workflow runs on
       # merges, where a missing secret is a misconfiguration, and
       # skipping would leave a green run that published nothing
-      # (#120). A dry run publishes nothing anyway, so it only warns.
+      # (#120). A dry run needs no credential, so it notes their
+      # absence and carries on without loading one (#121).
       - name: 'Check publish credentials'
         id: creds
         shell: bash
@@ -854,8 +859,9 @@ jobs:
           if [ "${HAS_CREDENTIALS}" = 'true' ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           elif [ "${DRY_RUN}" = 'true' ]; then
-            echo "::warning::OP_SERVICE_ACCOUNT_TOKEN and/or" \
-              "VAULT_MAPPING_JSON unavailable; skipping publish"
+            echo "::notice::OP_SERVICE_ACCOUNT_TOKEN and/or" \
+              "VAULT_MAPPING_JSON unavailable; dry run continues" \
+              "without loading a credential"
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
             echo "::error::OP_SERVICE_ACCOUNT_TOKEN and/or" \
@@ -920,7 +926,11 @@ jobs:
       # repositories carry no registry-native provenance anyway. The
       # pack-release/attest/sign-artefacts jobs cover releases only.
       - name: 'Publish snapshot'
-        if: steps.creds.outputs.available == 'true'
+        # A dry run publishes nothing and needs no credential, so it
+        # runs node-publish-action's dry run even without secrets
+        # (#121).
+        # yamllint disable-line rule:line-length
+        if: steps.creds.outputs.available == 'true' || inputs.dry_run
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/node-publish-action@d9098d8589fc72737c504d4b6acbc9a440e0e477  # v0.2.0
         with:
@@ -1211,7 +1221,8 @@ jobs:
       # A live run without credentials fails: this workflow runs on
       # merges, where a missing secret is a misconfiguration, and
       # skipping would leave a green run that published nothing
-      # (#120). A dry run publishes nothing anyway, so it only warns.
+      # (#120). A dry run needs no credential, so it notes their
+      # absence and carries on without loading one (#121).
       - name: 'Check publish credentials'
         id: creds
         shell: bash
@@ -1224,8 +1235,9 @@ jobs:
           if [ "${HAS_CREDENTIALS}" = 'true' ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           elif [ "${DRY_RUN}" = 'true' ]; then
-            echo "::warning::OP_SERVICE_ACCOUNT_TOKEN and/or" \
-              "VAULT_MAPPING_JSON unavailable; skipping publish"
+            echo "::notice::OP_SERVICE_ACCOUNT_TOKEN and/or" \
+              "VAULT_MAPPING_JSON unavailable; dry run continues" \
+              "without loading a credential"
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
             echo "::error::OP_SERVICE_ACCOUNT_TOKEN and/or" \
@@ -1298,7 +1310,11 @@ jobs:
       # the attest and sign-artefacts jobs consumed makes the attested
       # bytes and the published bytes one object.
       - name: 'Publish release'
-        if: steps.creds.outputs.available == 'true'
+        # A dry run publishes nothing and needs no credential, so it
+        # runs node-publish-action's dry run even without secrets
+        # (#121).
+        # yamllint disable-line rule:line-length
+        if: steps.creds.outputs.available == 'true' || inputs.dry_run
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/node-publish-action@d9098d8589fc72737c504d4b6acbc9a440e0e477  # v0.2.0
         with:
@@ -1463,13 +1479,18 @@ jobs:
           if-no-files-found: error
 
   # A dedicated job so id-token/attestations grants stay scoped to
-  # attestation work and never apply when the toggle is off
+  # attestation work and never apply when the toggle is off.
+  #
+  # Neither this job nor sign-artefacts runs on a dry run: each makes
+  # a permanent record -- a GitHub attestation, a public Rekor
+  # transparency-log entry -- for a version that never shipped
+  # (#121). release-publish already accepts both as skipped.
   attest:
     name: 'Attest Build Provenance'
     runs-on: ubuntu-latest
     needs: 'pack-release'
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && needs.pack-release.result == 'success' && inputs.attestations }}
+    if: ${{ !cancelled() && needs.pack-release.result == 'success' && inputs.attestations && !inputs.dry_run }}
     permissions:
       contents: read
       id-token: write       # Needed for attestations
@@ -1523,7 +1544,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: 'pack-release'
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && needs.pack-release.result == 'success' && inputs.sigstore_sign }}
+    if: ${{ !cancelled() && needs.pack-release.result == 'success' && inputs.sigstore_sign && !inputs.dry_run }}
     permissions:
       contents: read
       id-token: write  # Sigstore keyless/OIDC signing

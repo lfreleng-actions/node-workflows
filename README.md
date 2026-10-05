@@ -251,7 +251,7 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 | `snapshot_registry_url`   | string  | `''`      | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
 | `release_registry_url`    | string  | `''`      | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
 | `nexus_user`              | string  | `''`      | Nexus username override; empty derives it from the repository name                                                               |
-| `dry_run`                 | boolean | `false`   | Run the publish steps without uploading                                                                                          |
+| `dry_run`                 | boolean | `false`   | Rehearse publishing without uploading; needs no secrets, and skips attestation and signing                                       |
 | `harden_runner_egress`    | string  | `'block'` | Harden-runner egress policy: `block` or `audit`                                                                                  |
 | `harden_runner_allowlist` | string  | (pinned)  | Out-of-band harden-runner allow-list configuration                                                                               |
 | `gerrit_refspec`          | string  | `''`      | Gerrit refspec: the branch ref, or a merged change's ref to re-run it; resolved once for every job                               |
@@ -272,7 +272,9 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 
 A live run fails when either secret is unset, since `merge.yaml`
 runs on merges, where a missing secret is a misconfiguration. A dry
-run warns and skips publishing instead.
+run needs neither: it rehearses each publish without a credential,
+and skips attestation and signing, which would leave permanent public
+records for a version that never shipped.
 
 ## Node.js Version Selection
 

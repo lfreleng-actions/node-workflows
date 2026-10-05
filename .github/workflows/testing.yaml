@@ -527,6 +527,30 @@ jobs:
                           'resolve-commit, so it cannot read the commit'
                       )
 
+          # dry_run must be a safe rehearsal (#121). It needs no
+          # secrets, so each publish step runs on a dry run whether or
+          # not a credential loaded; and it leaves no permanent
+          # record, so attestation and signing never run on one.
+          for job_id, step_name in (('snapshot-publish', 'Publish snapshot'),
+                                    ('release-publish', 'Publish release')):
+              step = [
+                  s for s in merge_jobs[job_id].get('steps') or []
+                  if s.get('name') == step_name
+              ]
+              step_if = str(step[0].get('if', '')) if step else ''
+              if '|| inputs.dry_run' not in step_if:
+                  errors.append(
+                      f"merge.yaml/{job_id} '{step_name}' does not run on "
+                      'a dry run without credentials'
+                  )
+          for job_id in ('attest', 'sign-artefacts'):
+              if '!inputs.dry_run' not in str(
+                      merge_jobs[job_id].get('if', '')):
+                  errors.append(
+                      f'merge.yaml/{job_id} runs on a dry run, leaving a '
+                      'permanent record for a version that never shipped'
+                  )
+
           if errors:
               for message in errors:
                   print(f'::error::{message}')
@@ -1131,7 +1155,7 @@ jobs:
 
           errors=0
           # $1 case, $2 HAS_CREDENTIALS, $3 DRY_RUN,
-          # $4 want (available|skip|fail)
+          # $4 want (available|no-credential|fail)
           check() {
             local out_file="${RUNNER_TEMP}/gate-$2-$3.out"
             : > "${out_file}"
@@ -1141,9 +1165,9 @@ jobs:
             rc=$?
             set -e
             case "$4" in
-              available|skip)
+              available|no-credential)
                 local want=true
-                [ "$4" = 'skip' ] && want=false
+                [ "$4" = 'no-credential' ] && want=false
                 if [ "${rc}" != '0' ] \
                   || ! grep -qx "available=${want}" "${out_file}"; then
                   echo "$1: expected available=${want} ❌"
@@ -1162,7 +1186,9 @@ jobs:
 
           check 'live, credentials' true false available
           check 'dry run, credentials' true true available
-          check 'dry run, no credentials' false true skip
+          # Carries on credential-free; the publish step then runs
+          # node-publish-action's dry run (#121)
+          check 'dry run, no credentials' false true no-credential
           # The defect: this used to warn, skip and go green (#120)
           check 'live, no credentials' false false fail
 
