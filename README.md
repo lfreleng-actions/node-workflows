@@ -52,8 +52,9 @@ build -> sign-artefacts -> attach-artefacts
 `merge.yaml`:
 
 ```text
-gerrit-validate -> { repository-metadata | node-metadata
-                     | resolve-version }
+gerrit-validate -> resolve-commit -> { repository-metadata
+                                      | node-metadata
+                                      | resolve-version }
 resolve-version -> check-release
 node-metadata -> build
 { resolve-version | build } -> snapshot-publish
@@ -95,6 +96,12 @@ anything packs, signs or publishes.
 Detection compares the merged commit against its parent, so the run
 fails rather than reporting no release when the checkout lacks that
 parent.
+
+On the Gerrit path a `resolve-commit` job resolves `gerrit_refspec` to
+one commit, and every job checks out that commit, so a change merging
+mid-run cannot split one run across two commits. The commit has to be
+on `gerrit_branch`: a change ref re-runs an already-merged change,
+and an unmerged one fails the run.
 
 Release publishes also gain attestation and a signature. The build job
 uploads the built tree rather than a tarball, so a `pack-release` job
@@ -247,7 +254,7 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 | `dry_run`                 | boolean | `false`   | Run the publish steps without uploading                                                                                          |
 | `harden_runner_egress`    | string  | `'block'` | Harden-runner egress policy: `block` or `audit`                                                                                  |
 | `harden_runner_allowlist` | string  | (pinned)  | Out-of-band harden-runner allow-list configuration                                                                               |
-| `gerrit_refspec`          | string  | `''`      | Gerrit refspec of the merged change                                                                                              |
+| `gerrit_refspec`          | string  | `''`      | Gerrit refspec: the branch ref, or a merged change's ref to re-run it; resolved once for every job                               |
 | `gerrit_project`          | string  | `''`      | Gerrit project name                                                                                                              |
 | `gerrit_branch`           | string  | `''`      | Gerrit target branch                                                                                                             |
 | `gerrit_url`              | string  | `''`      | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                                                                 |

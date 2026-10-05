@@ -498,6 +498,35 @@ jobs:
                   'instead of failing the run'
               )
 
+          # One commit per run (#119): every Gerrit checkout but the
+          # resolver's own fetches the SHA resolve-commit chose, and
+          # its job depends on resolve-commit directly -- a job can
+          # read only the outputs of the jobs it names in needs.
+          resolved = OPEN + 'needs.resolve-commit.outputs.commit' + CLOSE
+          for job_id, job in merge_jobs.items():
+              for step in job.get('steps') or []:
+                  if 'checkout-gerrit-change-action' not in str(
+                          step.get('uses', '')):
+                      continue
+                  refspec = str((step.get('with') or {}).get(
+                      'gerrit-refspec', '')).strip()
+                  if job_id == 'resolve-commit':
+                      continue
+                  if refspec != resolved:
+                      errors.append(
+                          f'merge.yaml/{job_id} checks out {refspec!r}; '
+                          f'it must check out {resolved!r} so the run '
+                          'builds one commit'
+                      )
+                  job_needs = job.get('needs') or []
+                  if isinstance(job_needs, str):
+                      job_needs = [job_needs]
+                  if 'resolve-commit' not in job_needs:
+                      errors.append(
+                          f'merge.yaml/{job_id} does not need '
+                          'resolve-commit, so it cannot read the commit'
+                      )
+
           if errors:
               for message in errors:
                   print(f'::error::{message}')
@@ -937,6 +966,115 @@ jobs:
             exit 1
           fi
           echo "Release detection correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # resolve-commit picks the one commit a Gerrit merge run builds, and
+  # refuses one that is not on the target branch (#119). Its resolve
+  # step needs only git, so it is extracted and driven against local
+  # repositories standing in for Gerrit.
+  commit-resolution:
+    name: 'Test: commit resolution'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise commit resolution'
+        shell: bash
+        run: |
+          # Exercise commit resolution
+          resolve="${RUNNER_TEMP}/resolve-commit.sh"
+          python3 - <<'EXTRACT' > "${resolve}"
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['jobs']['resolve-commit']['steps']
+          print([s for s in steps if s.get('id') == 'resolve'][0]['run'])
+          EXTRACT
+          if ! grep -q 'is-ancestor' "${resolve}"; then
+            echo "Could not extract commit resolution ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+          export GIT_AUTHOR_NAME='Commit Resolution'
+          export GIT_AUTHOR_EMAIL='commit-resolution@example.org'
+          export GIT_COMMITTER_NAME="${GIT_AUTHOR_NAME}"
+          export GIT_COMMITTER_EMAIL="${GIT_AUTHOR_EMAIL}"
+
+          # A stand-in Gerrit: <server>/<project>, with a merged
+          # history on main and an unmerged patchset beside it
+          server="${RUNNER_TEMP}/gerrit"
+          src="${server}/project"
+          git init -q -b main "${src}"
+          for n in 1 2 3; do
+            git -C "${src}" commit -q --allow-empty -m "merged ${n}"
+          done
+          merged=$(git -C "${src}" rev-parse HEAD~1)
+          git -C "${src}" switch -q -c unmerged HEAD~2
+          git -C "${src}" commit -q --allow-empty -m 'unmerged patchset'
+          unmerged=$(git -C "${src}" rev-parse HEAD)
+          git -C "${src}" switch -q main
+
+          errors=0
+          # $1 case, $2 commit to check out, $3 want (pass|fail)
+          check() {
+            local work="${RUNNER_TEMP}/case-$1"
+            rm -rf "${work}"
+            git init -q "${work}"
+            # As the checkout action leaves it: shallow, at the commit
+            git -C "${work}" fetch -q --depth=1 "file://${src}" "$2"
+            git -C "${work}" checkout -q FETCH_HEAD
+            : > "${work}.out"
+            set +e
+            out="$(cd "${work}" && GITHUB_OUTPUT="${work}.out" \
+              GERRIT_URL="file://${server}" GERRIT_PROJECT=project \
+              GERRIT_BRANCH=main bash -eo pipefail "${resolve}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$3" = 'pass' ]; then
+              if [ "${rc}" != '0' ] \
+                || ! grep -qx "commit=$2" "${work}.out"; then
+                echo "$1: did not resolve to $2 ❌"
+                printf '%s\n' "${out}" | tail -n 3
+                errors=1
+              fi
+            elif [ "${rc}" = '0' ] \
+              || ! printf '%s' "${out}" | grep -q '^::error::'; then
+              echo "$1: resolved, expected a refusal ❌"
+              errors=1
+            fi
+          }
+
+          check 'branch tip' "$(git -C "${src}" rev-parse main)" pass
+          # Re-running an already-merged change by its change ref
+          check 'merged, behind the tip' "${merged}" pass
+          # A patchset nobody merged must never build or publish
+          check 'unmerged patchset' "${unmerged}" fail
+
+          if [ "${errors}" != '0' ]; then
+            echo "Commit resolution incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Commit resolution correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # The node-metadata resolver decides which Node.js version each job
   # runs on, including the build/test split that lets a legacy

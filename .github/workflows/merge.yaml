@@ -187,7 +187,11 @@ on:
 
       # --- Gerrit-aware checkout (empty unless dispatched via Gerrit) ---
       gerrit_refspec:
-        description: 'Gerrit refspec of the merged change'
+        description: >-
+          Gerrit refspec of the merged change: normally the branch ref
+          a change-merged event carries, or a change ref to re-run an
+          already-merged change. Resolved once, so every job builds
+          the same commit; it must be on gerrit_branch.
         required: false
         type: string
         default: ''
@@ -291,9 +295,102 @@ jobs:
           fi
           echo "Gerrit inputs validated ✅"
 
+  # Resolve, once, the commit this run builds and publishes (#119).
+  #
+  # A Gerrit refspec is usually the branch ref (refs/heads/<branch>),
+  # and checking that out in each job separately means each job gets
+  # whatever the branch tip is when it starts. A merge landing
+  # mid-run then splits one run across commits: version.properties
+  # from one, the built tree from another, release detection from a
+  # third. Every later Gerrit checkout fetches the SHA resolved here
+  # instead, so the whole run sees one commit.
+  #
+  # The commit must also be on the target branch. Re-dispatching a
+  # merged release change by its change ref is a legitimate recovery;
+  # dispatching an unmerged patchset would publish code nobody
+  # merged, so it is refused.
+  resolve-commit:
+    name: 'Resolve Commit'
+    needs: gerrit-validate
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+          allow_list_summary: 'false'
+      - name: 'Harden runner'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          # yamllint disable-line rule:line-length
+          egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          repository: ${{ inputs.repository || github.repository }}
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+          fetch-depth: '1'
+
+      # The GitHub-native path checks out inputs.ref, which the caller
+      # already pins; there is nothing to resolve, and every job keeps
+      # checking out that ref as before.
+      - name: 'Resolve the commit to build'
+        id: resolve
+        if: inputs.gerrit_refspec != ''
+        shell: bash
+        env:
+          GERRIT_BRANCH: ${{ inputs.gerrit_branch }}
+          # yamllint disable-line rule:line-length
+          GERRIT_URL: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          GERRIT_PROJECT: ${{ inputs.gerrit_project }}
+        run: |
+          # Resolve the commit, then prove it is on the target branch
+          commit=$(git rev-parse --verify 'HEAD^{commit}')
+          # Ask Gerrit, the source of truth, for the branch: the
+          # mirror may lag behind it. Unshallow first, because
+          # ancestry needs the history between the tip and the commit.
+          deepen=()
+          if [ "$(git rev-parse --is-shallow-repository)" = 'true' ]; then
+            deepen=(--unshallow)
+          fi
+          if ! git fetch -q "${deepen[@]}" --no-tags -- \
+            "${GERRIT_URL}/${GERRIT_PROJECT}" \
+            "refs/heads/${GERRIT_BRANCH}" 2> /dev/null; then
+            echo "::error::Cannot fetch ${GERRIT_BRANCH} from Gerrit" \
+              "to confirm the commit is on it"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${commit}" FETCH_HEAD; then
+            echo "::error::Commit ${commit} is not on" \
+              "${GERRIT_BRANCH}; refusing to build or publish an" \
+              "unmerged change"
+            exit 1
+          fi
+          echo "Building ${commit} (on ${GERRIT_BRANCH})"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
   repository-metadata:
     name: 'Repository Metadata'
-    needs: gerrit-validate
+    needs: resolve-commit
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -318,7 +415,7 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
@@ -348,7 +445,7 @@ jobs:
 
   node-metadata:
     name: 'Node.js Metadata'
-    needs: gerrit-validate
+    needs: resolve-commit
     runs-on: ubuntu-latest
     outputs:
       node_version: ${{ steps.resolve.outputs.node_version }}
@@ -381,7 +478,7 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
@@ -498,7 +595,7 @@ jobs:
 
   resolve-version:
     name: 'Resolve Version'
-    needs: gerrit-validate
+    needs: resolve-commit
     runs-on: ubuntu-latest
     outputs:
       # yamllint disable-line rule:line-length
@@ -528,7 +625,7 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
@@ -580,7 +677,9 @@ jobs:
 
   build:
     name: 'Build'
-    needs: node-metadata
+    needs:
+      - 'node-metadata'
+      - 'resolve-commit'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -616,7 +715,7 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
@@ -844,7 +943,7 @@ jobs:
     # placed on a later job's 'if:' skips that job, and everything
     # after it, without a word (#118).
     needs:
-      - 'gerrit-validate'
+      - 'resolve-commit'
       - 'resolve-version'
     runs-on: ubuntu-latest
     outputs:
@@ -869,19 +968,19 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      # On Gerrit change-merged dispatches GERRIT_REFSPEC is the branch
-      # ref (refs/heads/<branch>), so both checkout paths land on the
-      # merged commit. Both fetch depth 2 so diff-tree can compare HEAD
-      # against its parent. The Gerrit path states the depth rather
-      # than inheriting the action's default: v1.1.0 defaulted to 1,
-      # which grafted HEAD as a root commit and hid every release
-      # file (#117).
+      # Both checkout paths land on the merged commit: the Gerrit path
+      # fetches the one resolve-commit chose for the whole run. Both
+      # fetch depth 2 so diff-tree can compare HEAD against its
+      # parent. The Gerrit path states the depth rather than
+      # inheriting the action's default: v1.1.0 defaulted to 1, which
+      # grafted HEAD as a root commit and hid every release file
+      # (#117).
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
