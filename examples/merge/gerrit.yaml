@@ -140,6 +140,9 @@ jobs:
       gerrit_refspec: ${{ inputs.GERRIT_REFSPEC }}
       gerrit_project: ${{ inputs.GERRIT_PROJECT }}
       gerrit_branch: ${{ inputs.GERRIT_BRANCH }}
+      # Pins the run to the commit that merged this change, however
+      # far the branch tip moves before the run resolves it.
+      gerrit_patchset_revision: ${{ inputs.GERRIT_PATCHSET_REVISION }}
       # gerrit_url falls back to the GERRIT_URL repository variable.
       # REQUIRED: the npm registries receiving publishes.
       #

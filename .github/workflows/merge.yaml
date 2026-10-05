@@ -9,7 +9,8 @@
 # version.properties -> X.Y.Z-SNAPSHOT), and a release publish triggers
 # when the merged commit adds a release file under releases/:
 #   { resolve-version | node-metadata -> build } -> snapshot-publish
-#   check-release -> release-publish (only when a release file merged)
+#   resolve-version -> check-release -> release-publish (only when a
+#   release file merged, and its version matches version.properties)
 #
 # The project builds once: the build job uploads the complete built
 # tree (including gitignored build output such as lib/ or dist/) as a
@@ -155,8 +156,20 @@ on:
         required: false
         type: string
         default: ''
+      snapshot_dist_tag:
+        description: >-
+          npm dist-tag for snapshot publishes. Not 'latest': npm
+          install resolves 'latest', which has to keep naming the
+          newest release rather than whichever snapshot merged last.
+        required: false
+        type: string
+        default: 'snapshot'
       dry_run:
-        description: 'Run the publish steps without uploading'
+        description: >-
+          Rehearse the publish steps without uploading. Needs no
+          credentials, and skips attestation and signing, which would
+          otherwise leave permanent public records for a version that
+          never shipped.
         required: false
         type: boolean
         default: false
@@ -186,7 +199,20 @@ on:
 
       # --- Gerrit-aware checkout (empty unless dispatched via Gerrit) ---
       gerrit_refspec:
-        description: 'Gerrit refspec of the merged change'
+        description: >-
+          Gerrit refspec of the merged change: normally the branch ref
+          a change-merged event carries, or a change ref to re-run an
+          already-merged change. Resolved once, so every job builds
+          the same commit; it must be on gerrit_branch.
+        required: false
+        type: string
+        default: ''
+      gerrit_patchset_revision:
+        description: >-
+          The triggering change's revision (GERRIT_PATCHSET_REVISION).
+          Pins the run to the commit that merged it; without it a
+          branch refspec builds whatever the branch tip is when the
+          run resolves it.
         required: false
         type: string
         default: ''
@@ -214,16 +240,16 @@ on:
           1Password service-account token used by credential-load-action
           to fetch the per-repository Nexus credential from the common
           per-org CI/CD vault (op://<vault>/<repository-name>/password).
-          The publish jobs skip credential loading and publishing with a
-          warning when unset, so PR/self-test contexts still work.
+          A live run fails when this is unset. A dry run never loads a
+          credential, set or not, and still rehearses each publish.
         required: false
       VAULT_MAPPING_JSON:
         description: >-
           Base64-encoded JSON mapping of organisation name to 1Password
           vault ID, keyed on github.repository_owner; consumed by
-          credential-load-action to resolve the correct vault. The
-          publish jobs skip credential loading and publishing with a
-          warning when unset, so PR/self-test contexts still work.
+          credential-load-action to resolve the correct vault. A live
+          run fails when this is unset. A dry run never loads a
+          credential, set or not, and still rehearses each publish.
         required: false
 
 permissions: {}
@@ -290,9 +316,146 @@ jobs:
           fi
           echo "Gerrit inputs validated ✅"
 
+  # Resolve, once, the commit this run builds and publishes (#119).
+  #
+  # A merge event's refspec is usually the branch ref, and checking
+  # that out in each job separately means each job gets whatever the
+  # branch tip is when it starts -- on the GitHub mirror, which can
+  # also lag Gerrit. A merge landing mid-run then splits one run across
+  # commits, or misses the triggering change entirely. Every later
+  # Gerrit checkout fetches the SHA resolved here instead.
+  #
+  # Resolution asks Gerrit, never the mirror, and starts from the
+  # triggering revision (gerrit_patchset_revision) when the caller
+  # forwards it. Under a merge-if-necessary submit type that revision
+  # need not be the commit on the branch: Gerrit may have merged it
+  # with a merge commit. So the build commit is the first-parent
+  # commit that brought the revision onto the branch -- the revision
+  # itself when it was fast-forwarded.
+  #
+  # The revision must be on the target branch. Re-dispatching a
+  # merged release change by its change ref is a legitimate recovery;
+  # an unmerged patchset would publish code nobody merged, so it is
+  # refused.
+  resolve-commit:
+    name: 'Resolve Commit'
+    needs: gerrit-validate
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+    # Reads Gerrit over HTTPS and checks nothing out
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+          allow_list_summary: 'false'
+      - name: 'Harden runner'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          # yamllint disable-line rule:line-length
+          egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # The GitHub-native path checks out inputs.ref, which the caller
+      # already pins; there is nothing to resolve, and every job keeps
+      # checking out that ref as before.
+      - name: 'Resolve the commit to build'
+        id: resolve
+        if: inputs.gerrit_refspec != ''
+        shell: bash
+        env:
+          GERRIT_REFSPEC: ${{ inputs.gerrit_refspec }}
+          GERRIT_BRANCH: ${{ inputs.gerrit_branch }}
+          REVISION: ${{ inputs.gerrit_patchset_revision }}
+          # yamllint disable-line rule:line-length
+          GERRIT_URL: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          GERRIT_PROJECT: ${{ inputs.gerrit_project }}
+        run: |
+          # Resolve the triggering revision against Gerrit's branch
+          if [ -n "${REVISION}" ] \
+            && [[ ! "${REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::gerrit_patchset_revision must be a full" \
+              "40-character commit SHA"
+            exit 1
+          fi
+          repo="${RUNNER_TEMP}/resolve-commit"
+          rm -rf "${repo}"
+          git init -q "${repo}"
+          cd "${repo}"
+          remote="${GERRIT_URL}/${GERRIT_PROJECT}"
+          branch_ref='refs/remotes/gerrit/branch'
+          # The whole branch history: mapping a revision to the commit
+          # that merged it, and proving ancestry, both walk it
+          if ! git fetch -q --no-tags -- "${remote}" \
+            "+refs/heads/${GERRIT_BRANCH}:${branch_ref}" 2> /dev/null; then
+            echo "::error::Cannot fetch ${GERRIT_BRANCH} from Gerrit"
+            exit 1
+          fi
+          if [ -n "${REVISION}" ]; then
+            revision="${REVISION}"
+            if ! git cat-file -e "${revision}^{commit}" 2> /dev/null \
+              && ! git fetch -q --no-tags -- "${remote}" \
+                "${revision}" 2> /dev/null; then
+              echo "::error::Gerrit does not serve revision" \
+                "${revision}"
+              exit 1
+            fi
+          elif [ "${GERRIT_REFSPEC}" = "refs/heads/${GERRIT_BRANCH}" ]; then
+            # No triggering revision to anchor on: the branch tip is
+            # the closest available, but a merge landing between the
+            # event and this job moves it. Forward
+            # GERRIT_PATCHSET_REVISION to pin the exact change.
+            echo "::notice::No gerrit_patchset_revision; building the" \
+              "current tip of ${GERRIT_BRANCH}"
+            revision=$(git rev-parse "${branch_ref}")
+          else
+            if ! git fetch -q --no-tags -- "${remote}" \
+              "${GERRIT_REFSPEC}" 2> /dev/null; then
+              echo "::error::Cannot fetch ${GERRIT_REFSPEC} from Gerrit"
+              exit 1
+            fi
+            revision=$(git rev-parse 'FETCH_HEAD^{commit}')
+          fi
+          if ! git merge-base --is-ancestor "${revision}" "${branch_ref}"
+          then
+            echo "::error::Revision ${revision} is not on" \
+              "${GERRIT_BRANCH}; refusing to build or publish an" \
+              "unmerged change"
+            exit 1
+          fi
+          # The commit Gerrit put on the branch for this revision: the
+          # revision itself when fast-forwarded, otherwise the oldest
+          # first-parent commit descending from it, i.e. its merge.
+          # Listed into a variable rather than piped to grep -q, which
+          # can exit early and SIGPIPE rev-list under pipefail.
+          mainline=$(git rev-list --first-parent "${branch_ref}")
+          if grep -qx "${revision}" <<< "${mainline}"; then
+            commit="${revision}"
+          else
+            commit=$(git rev-list --first-parent \
+              --ancestry-path="${revision}" \
+              "${revision}..${branch_ref}" | tail -n 1)
+          fi
+          if [[ ! "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Cannot find the commit that merged" \
+              "${revision} onto ${GERRIT_BRANCH}"
+            exit 1
+          fi
+          echo "Building ${commit} (merged ${revision} on" \
+            "${GERRIT_BRANCH})"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
   repository-metadata:
     name: 'Repository Metadata'
-    needs: gerrit-validate
+    needs: resolve-commit
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -315,9 +478,9 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
@@ -347,7 +510,7 @@ jobs:
 
   node-metadata:
     name: 'Node.js Metadata'
-    needs: gerrit-validate
+    needs: resolve-commit
     runs-on: ubuntu-latest
     outputs:
       node_version: ${{ steps.resolve.outputs.node_version }}
@@ -378,9 +541,9 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
@@ -497,7 +660,7 @@ jobs:
 
   resolve-version:
     name: 'Resolve Version'
-    needs: gerrit-validate
+    needs: resolve-commit
     runs-on: ubuntu-latest
     outputs:
       # yamllint disable-line rule:line-length
@@ -525,9 +688,9 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
@@ -577,9 +740,68 @@ jobs:
           fi
           echo "Resolved version: ${PROPS_VERSION}"
 
+      # Snapshots must never take 'latest', which npm install resolves
+      # and which must keep naming the newest release (#122). Checked
+      # here so a bad value fails before anything builds.
+      #
+      # npm refuses a dist-tag that parses as a semver range, which
+      # covers more than leading digits: 'x', 'X', 'x.x' and 'vx' are
+      # all wildcard ranges. Rather than approximate that rule, ask
+      # the semver module npm itself bundles, so this gate refuses
+      # exactly what 'npm publish --tag' would. The character set
+      # matches the one node-publish-action enforces.
+      - name: 'Validate snapshot dist-tag'
+        shell: bash
+        env:
+          SNAPSHOT_DIST_TAG: ${{ inputs.snapshot_dist_tag }}
+        run: |
+          # Validate the snapshot dist-tag
+          case "${SNAPSHOT_DIST_TAG}" in
+            latest)
+              echo "::error::snapshot_dist_tag cannot be 'latest';" \
+                "that tag must name the newest release"
+              exit 1
+              ;;
+            '' | *[!A-Za-z0-9._-]*)
+              echo "::error::Invalid snapshot_dist_tag:" \
+                "$(printf '%s' "${SNAPSHOT_DIST_TAG}" | tr -d '\r\n')"
+              exit 1
+              ;;
+          esac
+          # Exit 10: a range, refused. Exit 11: not a range. Any other
+          # status -- including the 1 Node exits with when the require
+          # throws -- means npm's semver could not be loaded, and the
+          # gate must not pass a tag it never checked.
+          set +e
+          node -e '
+            const path = require("path");
+            const semver = require(path.join(process.argv[1], "npm",
+              "node_modules", "semver", "ranges", "valid.js"));
+            process.exit(semver(process.argv[2]) === null ? 11 : 10);
+          ' "$(npm root -g)" "${SNAPSHOT_DIST_TAG}"
+          rc=$?
+          set -e
+          case "${rc}" in
+            10)
+              echo "::error::snapshot_dist_tag '${SNAPSHOT_DIST_TAG}'" \
+                "parses as a semver range, which npm refuses as a" \
+                "dist-tag"
+              exit 1
+              ;;
+            11) ;;
+            *)
+              echo "::error::Cannot load npm's semver module to" \
+                "check snapshot_dist_tag"
+              exit 1
+              ;;
+          esac
+          echo "Snapshot dist-tag: ${SNAPSHOT_DIST_TAG}"
+
   build:
     name: 'Build'
-    needs: node-metadata
+    needs:
+      - 'node-metadata'
+      - 'resolve-commit'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -613,9 +835,9 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
@@ -738,23 +960,33 @@ jobs:
           name: node-build-content
           path: ${{ inputs.path_prefix }}
 
-      # The credential secrets stay optional so PR/self-test contexts
-      # can exercise the pipeline; when absent the publish steps skip
-      # with a warning rather than failing.
+      # A live run without credentials fails: this workflow runs on
+      # merges, where a missing secret is a misconfiguration, and
+      # skipping would leave a green run that published nothing
+      # (#120). A dry run needs no credential and never loads one,
+      # even when the secrets are set, so a stale grant or a 1Password
+      # outage cannot fail a rehearsal (#121).
       - name: 'Check publish credentials'
         id: creds
         shell: bash
         env:
           # yamllint disable-line rule:line-length
           HAS_CREDENTIALS: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN != '' && secrets.VAULT_MAPPING_JSON != '' }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # Gate publishing on credential availability
-          if [ "${HAS_CREDENTIALS}" = 'true' ]; then
+          # Gate publishing on credential availability. Dry run
+          # first: node-publish-action configures no credential in
+          # dry-run mode, so loading one could only add a failure.
+          if [ "${DRY_RUN}" = 'true' ]; then
+            echo "Dry run: publishing without loading a credential"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          elif [ "${HAS_CREDENTIALS}" = 'true' ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::OP_SERVICE_ACCOUNT_TOKEN and/or" \
-              "VAULT_MAPPING_JSON unavailable; skipping publish"
-            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::error::OP_SERVICE_ACCOUNT_TOKEN and/or" \
+              "VAULT_MAPPING_JSON unavailable; a live run cannot" \
+              "publish without them"
+            exit 1
           fi
 
       - name: 'Resolve Nexus username'
@@ -813,7 +1045,11 @@ jobs:
       # repositories carry no registry-native provenance anyway. The
       # pack-release/attest/sign-artefacts jobs cover releases only.
       - name: 'Publish snapshot'
-        if: steps.creds.outputs.available == 'true'
+        # A dry run publishes nothing and needs no credential, so it
+        # runs node-publish-action's dry run even without secrets
+        # (#121).
+        # yamllint disable-line rule:line-length
+        if: steps.creds.outputs.available == 'true' || inputs.dry_run
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/node-publish-action@d9098d8589fc72737c504d4b6acbc9a440e0e477  # v0.2.0
         with:
@@ -822,6 +1058,9 @@ jobs:
           registry_url: ${{ matrix.target.registry_url }}
           path_prefix: ${{ inputs.path_prefix }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
+          # Never 'latest', the action's default: that tag has to keep
+          # naming the newest release (#122)
+          tag: ${{ inputs.snapshot_dist_tag }}
           dry_run: ${{ inputs.dry_run }}
           provenance: 'false'
           load_credential: 'false'
@@ -837,7 +1076,14 @@ jobs:
 
   check-release:
     name: 'Check for Release File'
-    needs: gerrit-validate
+    # resolve-version supplies the version.properties version the
+    # release file must match. Comparing here, rather than only in
+    # release-publish, is what makes a mismatch fail the run: a gate
+    # placed on a later job's 'if:' skips that job, and everything
+    # after it, without a word (#118).
+    needs:
+      - 'resolve-commit'
+      - 'resolve-version'
     runs-on: ubuntu-latest
     outputs:
       has_release: ${{ steps.detect.outputs.has_release }}
@@ -861,22 +1107,26 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      # On Gerrit change-merged dispatches GERRIT_REFSPEC is the branch
-      # ref (refs/heads/<branch>), so both checkout paths land on the
-      # merged commit. The plain checkout fetches depth 2 so diff-tree
-      # can compare HEAD against its parent.
+      # Both checkout paths land on the merged commit: the Gerrit path
+      # fetches the one resolve-commit chose for the whole run. Both
+      # fetch depth 2 so diff-tree can compare HEAD against its
+      # parent. The Gerrit path states the depth rather than
+      # inheriting the action's default: v1.1.0 defaulted to 1, which
+      # grafted HEAD as a root commit and hid every release file
+      # (#117).
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@298f53bbbc1d5f9e54df9feb484d110dc2b33197  # v1.1.0
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
         with:
-          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
           # yamllint disable-line rule:line-length
           gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
           delay: '0s'
           repository: ${{ inputs.repository || github.repository }}
           ref: refs/heads/${{ inputs.gerrit_branch }}
+          fetch-depth: '2'
       - name: 'Checkout repository'
         if: inputs.gerrit_refspec == ''
         # yamllint disable-line rule:line-length
@@ -894,14 +1144,38 @@ jobs:
         id: detect
         shell: bash
         run: |
-          # Detect a release file added/changed by the merged commit.
+          # Detect a release file added by the merged commit. Only
+          # additions count: editing or deleting an existing release
+          # file is maintenance, not a request to publish its version
+          # again.
           # -m --first-parent makes merge commits diff against their
           # first parent (plain diff-tree emits nothing for merges,
           # which would silently suppress release detection). A
           # diff-tree failure (e.g. insufficient history) fails loudly
           # rather than silently skipping an intended release.
-          if ! files=$(git diff-tree -m --first-parent \
-            --no-commit-id -r HEAD --name-only -- "releases/"); then
+          #
+          # diff-tree does not fail when HEAD's parent was not
+          # fetched: a shallow clone grafts HEAD as a root commit, for
+          # which it prints nothing and exits 0. That reads exactly
+          # like a merge with no release file, so check for the parent
+          # first (#117).
+          if [ "$(git rev-parse --is-shallow-repository)" = 'true' ] \
+            && ! git rev-parse -q --verify 'HEAD^' > /dev/null; then
+            echo "::error::The merged commit's parent is not in the" \
+              "shallow checkout; cannot detect release files"
+            exit 1
+          fi
+          # Past that guard, a HEAD with no parent is the repository's
+          # genuine first commit. Plain diff-tree prints nothing for a
+          # root commit, which would silently miss an initial release,
+          # so --root diffs it against the empty tree instead.
+          root=()
+          if ! git rev-parse -q --verify 'HEAD^' > /dev/null; then
+            root=(--root)
+          fi
+          if ! files=$(git diff-tree -m --first-parent --diff-filter=A \
+            "${root[@]}" --no-commit-id -r HEAD --name-only -- "releases/")
+          then
             echo "::error::git diff-tree failed; cannot detect" \
               "release files (insufficient checkout history?)"
             exit 1
@@ -921,12 +1195,6 @@ jobs:
             exit 1
           fi
           release_file="${files}"
-          if [ ! -f "${release_file}" ]; then
-            echo "Release file removed by merged commit; not a release"
-            echo "has_release=false" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           echo "Release file detected: ${release_file}"
           # Tolerate a missing version: line (grep exits 1 under
           # pipefail); the guard below then reports it cleanly
@@ -945,6 +1213,28 @@ jobs:
           echo "Release version: ${version}"
           echo "has_release=true" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # The release file's version must match version.properties; a
+      # mismatch means the release descriptor and committed version
+      # metadata diverged, so no release tarball may pack, sign,
+      # attest or publish. The snapshot lane does not depend on this
+      # job and still publishes the merge's snapshot.
+      - name: 'Verify release version matches version.properties'
+        id: verify-version
+        if: steps.detect.outputs.has_release == 'true'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.detect.outputs.version }}
+          RESOLVED_VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          # Cross-check the release file against version.properties
+          if [ "${RELEASE_VERSION}" != "${RESOLVED_VERSION}" ]; then
+            echo "::error::Release file version" \
+              "(${RELEASE_VERSION}) does not match" \
+              "version.properties (${RESOLVED_VERSION})"
+            exit 1
+          fi
+          echo "Release version verified: ${RELEASE_VERSION}"
 
   release-publish:
     # The leg name comes from the target, so a failed check names the
@@ -985,6 +1275,7 @@ jobs:
     # than a clear skip.
     if: >-
       ${{ !cancelled()
+      && needs.check-release.result == 'success'
       && needs.check-release.outputs.has_release == 'true'
       && needs.resolve-version.result == 'success'
       && needs.build.result == 'success'
@@ -1040,9 +1331,10 @@ jobs:
           name: node-release-package
           path: pack-dist
 
-      # The release file's version must match version.properties; a
-      # mismatch means the release descriptor and committed version
-      # metadata diverged
+      # The release file's version must match version.properties.
+      # check-release enforces this and fails the run on a mismatch;
+      # this repeats it as defence in depth, since this job writes the
+      # version to a registry and the check costs nothing.
       - name: 'Verify release version matches version.properties'
         shell: bash
         env:
@@ -1058,23 +1350,33 @@ jobs:
           fi
           echo "Release version verified: ${RELEASE_VERSION}"
 
-      # The credential secrets stay optional so PR/self-test contexts
-      # can exercise the pipeline; when absent the publish steps skip
-      # with a warning rather than failing.
+      # A live run without credentials fails: this workflow runs on
+      # merges, where a missing secret is a misconfiguration, and
+      # skipping would leave a green run that published nothing
+      # (#120). A dry run needs no credential and never loads one,
+      # even when the secrets are set, so a stale grant or a 1Password
+      # outage cannot fail a rehearsal (#121).
       - name: 'Check publish credentials'
         id: creds
         shell: bash
         env:
           # yamllint disable-line rule:line-length
           HAS_CREDENTIALS: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN != '' && secrets.VAULT_MAPPING_JSON != '' }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # Gate publishing on credential availability
-          if [ "${HAS_CREDENTIALS}" = 'true' ]; then
+          # Gate publishing on credential availability. Dry run
+          # first: node-publish-action configures no credential in
+          # dry-run mode, so loading one could only add a failure.
+          if [ "${DRY_RUN}" = 'true' ]; then
+            echo "Dry run: publishing without loading a credential"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          elif [ "${HAS_CREDENTIALS}" = 'true' ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::OP_SERVICE_ACCOUNT_TOKEN and/or" \
-              "VAULT_MAPPING_JSON unavailable; skipping publish"
-            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::error::OP_SERVICE_ACCOUNT_TOKEN and/or" \
+              "VAULT_MAPPING_JSON unavailable; a live run cannot" \
+              "publish without them"
+            exit 1
           fi
 
       - name: 'Resolve Nexus username'
@@ -1141,7 +1443,11 @@ jobs:
       # the attest and sign-artefacts jobs consumed makes the attested
       # bytes and the published bytes one object.
       - name: 'Publish release'
-        if: steps.creds.outputs.available == 'true'
+        # A dry run publishes nothing and needs no credential, so it
+        # runs node-publish-action's dry run even without secrets
+        # (#121).
+        # yamllint disable-line rule:line-length
+        if: steps.creds.outputs.available == 'true' || inputs.dry_run
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/node-publish-action@d9098d8589fc72737c504d4b6acbc9a440e0e477  # v0.2.0
         with:
@@ -1194,12 +1500,14 @@ jobs:
     # toggles would leave a caller with both switched off publishing
     # nothing at all.
     #
-    # The version equality mirrors the cross-check release-publish
-    # performs against version.properties. On a mismatch that job
-    # fails, and skipping here stops the run leaving behind signed
-    # provenance for a version that never passed release validation.
+    # check-release must succeed, not merely report a release: it
+    # fails on a version mismatch with version.properties, and its
+    # outputs survive that failure. The check lives there, not in
+    # this condition, because a version gate here skipped this job,
+    # attestation, signing and the publish without failing anything
+    # (#118).
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && needs.check-release.outputs.has_release == 'true' && needs.check-release.outputs.version == needs.resolve-version.outputs.version && needs.resolve-version.result == 'success' && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.check-release.result == 'success' && needs.check-release.outputs.has_release == 'true' && needs.resolve-version.result == 'success' && needs.build.result == 'success' }}
     outputs:
       tarball_name: ${{ steps.pack.outputs.tarball_name }}
     permissions:
@@ -1304,13 +1612,18 @@ jobs:
           if-no-files-found: error
 
   # A dedicated job so id-token/attestations grants stay scoped to
-  # attestation work and never apply when the toggle is off
+  # attestation work and never apply when the toggle is off.
+  #
+  # Neither this job nor sign-artefacts runs on a dry run: each makes
+  # a permanent record -- a GitHub attestation, a public Rekor
+  # transparency-log entry -- for a version that never shipped
+  # (#121). release-publish already accepts both as skipped.
   attest:
     name: 'Attest Build Provenance'
     runs-on: ubuntu-latest
     needs: 'pack-release'
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && needs.pack-release.result == 'success' && inputs.attestations }}
+    if: ${{ !cancelled() && needs.pack-release.result == 'success' && inputs.attestations && !inputs.dry_run }}
     permissions:
       contents: read
       id-token: write       # Needed for attestations
@@ -1364,7 +1677,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: 'pack-release'
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && needs.pack-release.result == 'success' && inputs.sigstore_sign }}
+    if: ${{ !cancelled() && needs.pack-release.result == 'success' && inputs.sigstore_sign && !inputs.dry_run }}
     permissions:
       contents: read
       id-token: write  # Sigstore keyless/OIDC signing

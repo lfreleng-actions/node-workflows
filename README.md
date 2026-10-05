@@ -52,8 +52,10 @@ build -> sign-artefacts -> attach-artefacts
 `merge.yaml`:
 
 ```text
-gerrit-validate -> { repository-metadata | node-metadata
-                     | resolve-version | check-release }
+gerrit-validate -> resolve-commit -> { repository-metadata
+                                      | node-metadata
+                                      | resolve-version }
+resolve-version -> check-release
 node-metadata -> build
 { resolve-version | build } -> snapshot-publish
 { check-release | resolve-version | build } -> release-publish
@@ -85,11 +87,28 @@ projects. Every merge publishes a snapshot: the `build-metadata-action`
 parses `version.properties` (`major=`/`minor=`/`patch=` keys, a
 combined `release_version=X.Y.Z` key, or a `version=X.Y.Z` key,
 skipping Jenkins-era `${...}` interpolated values) and the
-workflow publishes `X.Y.Z-SNAPSHOT` to the snapshot targets. When
+workflow publishes `X.Y.Z-SNAPSHOT` to the snapshot targets under
+the `snapshot` dist-tag, leaving `latest` on the newest release. When
 the merged commit adds a file under `releases/` whose `version:`
 matches `version.properties`, the workflow also publishes the plain
 `X.Y.Z` release to the release targets. A version mismatch between
-the release file and `version.properties` fails the release publish.
+the release file and `version.properties` fails the run before the
+release tarball packs, signs, attests or publishes. The snapshot
+publish does not wait on that check, so the merge's snapshot can
+still publish.
+Detection compares the merged commit against its parent, so the run
+fails rather than reporting no release when the checkout lacks that
+parent.
+
+On the Gerrit path a `resolve-commit` job asks Gerrit, not the
+mirror, for one commit, and every job checks out that commit. Given
+`gerrit_patchset_revision` (forward `GERRIT_PATCHSET_REVISION`), it
+builds the commit that merged that change: the change itself when
+fast-forwarded, otherwise its merge commit, so a change merging
+mid-run cannot move or split the run. Without it, a branch refspec
+builds the current tip. The change has to be on `gerrit_branch`: a
+change ref re-runs an already-merged change, and an unmerged one
+fails the run.
 
 Release publishes also gain attestation and a signature. The build job
 uploads the built tree rather than a tarball, so a `pack-release` job
@@ -223,29 +242,31 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 
 <!-- markdownlint-disable MD013 -->
 
-| Input                     | Type    | Default   | Description                                                                                                                      |
-| ------------------------- | ------- | --------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `repository`              | string  | `''`      | Repository to check out (owner/name); empty uses the caller                                                                      |
-| `ref`                     | string  | `''`      | Checkout ref (empty = event ref; other repos: default branch)                                                                    |
-| `path_prefix`             | string  | `'.'`     | Path to the project root directory                                                                                               |
-| `node_version`            | string  | `''`      | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
-| `build_node_version`      | string  | `''`      | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
-| `build_tool`              | string  | `''`      | `npm` or `yarn`; empty auto-detects from project metadata                                                                        |
-| `build_scripts`           | string  | `'build'` | package.json script(s) the build job runs                                                                                        |
-| `attestations`            | boolean | `true`    | SLSA build provenance for the packed release tarball (release publishes)                                                         |
-| `sigstore_sign`           | boolean | `true`    | Sign the packed release tarball with Sigstore (release publishes)                                                                |
-| `snapshot_targets`        | string  | `''`      | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
-| `release_targets`         | string  | `''`      | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
-| `snapshot_registry_url`   | string  | `''`      | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
-| `release_registry_url`    | string  | `''`      | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
-| `nexus_user`              | string  | `''`      | Nexus username override; empty derives it from the repository name                                                               |
-| `dry_run`                 | boolean | `false`   | Run the publish steps without uploading                                                                                          |
-| `harden_runner_egress`    | string  | `'block'` | Harden-runner egress policy: `block` or `audit`                                                                                  |
-| `harden_runner_allowlist` | string  | (pinned)  | Out-of-band harden-runner allow-list configuration                                                                               |
-| `gerrit_refspec`          | string  | `''`      | Gerrit refspec of the merged change                                                                                              |
-| `gerrit_project`          | string  | `''`      | Gerrit project name                                                                                                              |
-| `gerrit_branch`           | string  | `''`      | Gerrit target branch                                                                                                             |
-| `gerrit_url`              | string  | `''`      | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                                                                 |
+| Input                      | Type    | Default      | Description                                                                                                                      |
+| -------------------------- | ------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `repository`               | string  | `''`         | Repository to check out (owner/name); empty uses the caller                                                                      |
+| `ref`                      | string  | `''`         | Checkout ref (empty = event ref; other repos: default branch)                                                                    |
+| `path_prefix`              | string  | `'.'`        | Path to the project root directory                                                                                               |
+| `node_version`             | string  | `''`         | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
+| `build_node_version`       | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
+| `build_tool`               | string  | `''`         | `npm` or `yarn`; empty auto-detects from project metadata                                                                        |
+| `build_scripts`            | string  | `'build'`    | package.json script(s) the build job runs                                                                                        |
+| `attestations`             | boolean | `true`       | SLSA build provenance for the packed release tarball (release publishes)                                                         |
+| `sigstore_sign`            | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
+| `snapshot_targets`         | string  | `''`         | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
+| `release_targets`          | string  | `''`         | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
+| `snapshot_registry_url`    | string  | `''`         | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
+| `release_registry_url`     | string  | `''`         | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
+| `nexus_user`               | string  | `''`         | Nexus username override; empty derives it from the repository name                                                               |
+| `snapshot_dist_tag`        | string  | `'snapshot'` | npm dist-tag for snapshot publishes; never `latest`, which must name the newest release                                          |
+| `dry_run`                  | boolean | `false`      | Rehearse publishing without uploading; needs no secrets, and skips attestation and signing                                       |
+| `harden_runner_egress`     | string  | `'block'`    | Harden-runner egress policy: `block` or `audit`                                                                                  |
+| `harden_runner_allowlist`  | string  | (pinned)     | Out-of-band harden-runner allow-list configuration                                                                               |
+| `gerrit_refspec`           | string  | `''`         | Gerrit refspec: the branch ref, or a merged change's ref to re-run it; resolved once for every job                               |
+| `gerrit_patchset_revision` | string  | `''`         | Triggering change revision (`GERRIT_PATCHSET_REVISION`); pins the run to the commit that merged it                               |
+| `gerrit_project`           | string  | `''`         | Gerrit project name                                                                                                              |
+| `gerrit_branch`            | string  | `''`         | Gerrit target branch                                                                                                             |
+| `gerrit_url`               | string  | `''`         | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                                                                 |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -258,9 +279,12 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 
 <!-- markdownlint-enable MD013 -->
 
-The secrets stay optional so PR and self-test contexts work; the
-publish steps check credential availability and skip with a warning
-when the secrets stay unset.
+A live run fails when either secret is unset, since `merge.yaml`
+runs on merges, where a missing secret is a misconfiguration. A dry
+run needs neither and never loads a credential, even when the caller
+supplies both: it rehearses each publish without one, and skips
+attestation and signing, which would leave permanent public records
+for a version that never shipped.
 
 ## Node.js Version Selection
 

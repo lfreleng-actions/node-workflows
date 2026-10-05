@@ -457,6 +457,123 @@ jobs:
                   "pack-release, but publishes that job's tarball"
               )
 
+          # A release version that disagrees with version.properties
+          # has to fail the run (#118). It used to be a version
+          # equality in pack-release's 'if:', which skipped the pack,
+          # and with it attestation, signing and the publish, while
+          # the run stayed green. The comparison now lives in
+          # check-release, and failing there only stops the release
+          # if the downstream jobs require check-release to succeed:
+          # its outputs survive a failure, and both jobs run under
+          # !cancelled().
+          check_needs = merge_jobs['check-release'].get('needs') or []
+          if isinstance(check_needs, str):
+              check_needs = [check_needs]
+          if 'resolve-version' not in check_needs:
+              errors.append(
+                  'merge.yaml/check-release does not need '
+                  'resolve-version, so it cannot compare the release '
+                  'file with version.properties'
+              )
+          verify = [
+              s for s in merge_jobs['check-release'].get('steps') or []
+              if s.get('id') == 'verify-version'
+          ]
+          if len(verify) != 1:
+              errors.append(
+                  'merge.yaml/check-release has no verify-version step'
+              )
+          for job_id in ('pack-release', 'release-publish'):
+              job_if = str(merge_jobs[job_id].get('if', ''))
+              if "needs.check-release.result == 'success'" not in job_if:
+                  errors.append(
+                      f'merge.yaml/{job_id} does not require '
+                      'check-release to succeed, so a version mismatch '
+                      'would not stop it'
+                  )
+          if 'outputs.version ==' in pack_if:
+              errors.append(
+                  'merge.yaml/pack-release gates on a version '
+                  'equality, which skips the release on a mismatch '
+                  'instead of failing the run'
+              )
+
+          # One commit per run (#119): every Gerrit checkout but the
+          # resolver's own fetches the SHA resolve-commit chose, and
+          # its job depends on resolve-commit directly -- a job can
+          # read only the outputs of the jobs it names in needs.
+          resolved = OPEN + 'needs.resolve-commit.outputs.commit' + CLOSE
+          for job_id, job in merge_jobs.items():
+              for step in job.get('steps') or []:
+                  if 'checkout-gerrit-change-action' not in str(
+                          step.get('uses', '')):
+                      continue
+                  refspec = str((step.get('with') or {}).get(
+                      'gerrit-refspec', '')).strip()
+                  if job_id == 'resolve-commit':
+                      continue
+                  if refspec != resolved:
+                      errors.append(
+                          f'merge.yaml/{job_id} checks out {refspec!r}; '
+                          f'it must check out {resolved!r} so the run '
+                          'builds one commit'
+                      )
+                  job_needs = job.get('needs') or []
+                  if isinstance(job_needs, str):
+                      job_needs = [job_needs]
+                  if 'resolve-commit' not in job_needs:
+                      errors.append(
+                          f'merge.yaml/{job_id} does not need '
+                          'resolve-commit, so it cannot read the commit'
+                      )
+
+          # dry_run must be a safe rehearsal (#121). It needs no
+          # secrets, so each publish step runs on a dry run whether or
+          # not a credential loaded; and it leaves no permanent
+          # record, so attestation and signing never run on one.
+          for job_id, step_name in (('snapshot-publish', 'Publish snapshot'),
+                                    ('release-publish', 'Publish release')):
+              step = [
+                  s for s in merge_jobs[job_id].get('steps') or []
+                  if s.get('name') == step_name
+              ]
+              step_if = str(step[0].get('if', '')) if step else ''
+              if '|| inputs.dry_run' not in step_if:
+                  errors.append(
+                      f"merge.yaml/{job_id} '{step_name}' does not run on "
+                      'a dry run without credentials'
+                  )
+          for job_id in ('attest', 'sign-artefacts'):
+              if '!inputs.dry_run' not in str(
+                      merge_jobs[job_id].get('if', '')):
+                  errors.append(
+                      f'merge.yaml/{job_id} runs on a dry run, leaving a '
+                      'permanent record for a version that never shipped'
+                  )
+
+          # Snapshots publish under snapshot_dist_tag, never the
+          # action's default 'latest', which npm install resolves and
+          # which has to keep naming the newest release (#122).
+          # Releases keep that default.
+          dist_tags = {}
+          for job_id in ('snapshot-publish', 'release-publish'):
+              for step in merge_jobs[job_id].get('steps') or []:
+                  if 'node-publish-action' in str(step.get('uses', '')):
+                      dist_tags[job_id] = str(
+                          (step.get('with') or {}).get('tag', '')).strip()
+          wanted_tag = OPEN + 'inputs.snapshot_dist_tag' + CLOSE
+          if dist_tags.get('snapshot-publish') != wanted_tag:
+              errors.append(
+                  'merge.yaml/snapshot-publish passes tag '
+                  f"{dist_tags.get('snapshot-publish')!r}, expected "
+                  f'{wanted_tag!r}; snapshots must not take latest'
+              )
+          if dist_tags.get('release-publish'):
+              errors.append(
+                  'merge.yaml/release-publish overrides the dist-tag; '
+                  'releases keep latest'
+              )
+
           if errors:
               for message in errors:
                   print(f'::error::{message}')
@@ -719,6 +836,536 @@ jobs:
           echo "Every rejection rule behaved correctly ✅"
           echo "Every rejection rule behaved correctly ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  # merge.yaml cannot run in CI, but its release detection is a shell
+  # step that needs only a git checkout. Extract the shipped step and
+  # drive it against local repositories built to each shape a merge
+  # run meets, including the shallow clone that silently hid the
+  # onap-ui-common 1.1.1 release (#117).
+  release-detection:
+    name: 'Test: release detection'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise release detection'
+        shell: bash
+        run: |
+          # Exercise release detection
+          detect="${RUNNER_TEMP}/detect.sh"
+          verify="${RUNNER_TEMP}/verify.sh"
+          python3 - <<'EXTRACT'
+          import os
+
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['jobs']['check-release']['steps']
+          tmp = os.environ['RUNNER_TEMP']
+          for step_id, name in (('detect', 'detect.sh'),
+                                ('verify-version', 'verify.sh')):
+              run = [s for s in steps if s.get('id') == step_id][0]['run']
+              with open(os.path.join(tmp, name), 'w') as handle:
+                  handle.write(run)
+          EXTRACT
+          # Fail loudly rather than silently testing nothing if a
+          # step is renamed or loses its check
+          if ! grep -q 'is-shallow-repository' "${detect}" \
+            || ! grep -q 'RESOLVED_VERSION' "${verify}"; then
+            echo "Could not extract release detection ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          # Local repositories only: an identity, no signing, and none
+          # of the runner's own git settings
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+          export GIT_AUTHOR_NAME='Release Detection'
+          export GIT_AUTHOR_EMAIL='release-detection@example.org'
+          export GIT_COMMITTER_NAME="${GIT_AUTHOR_NAME}"
+          export GIT_COMMITTER_EMAIL="${GIT_AUTHOR_EMAIL}"
+
+          # Upstream history; each branch is one merged commit
+          src="${RUNNER_TEMP}/src"
+          git init -q -b main "${src}"
+          echo 'major=1' > "${src}/version.properties"
+          git -C "${src}" add version.properties
+          git -C "${src}" commit -q -m 'Initial commit'
+          base=$(git -C "${src}" rev-parse HEAD)
+
+          # $1 branch, $2 base revision, then path=content pairs to
+          # write and commit; a pair with no '=' deletes that path
+          commit_on() {
+            local branch="$1" from="$2"
+            shift 2
+            git -C "${src}" switch -q -c "${branch}" "${from}"
+            for pair in "$@"; do
+              if [ "${pair}" = "${pair%%=*}" ]; then
+                git -C "${src}" rm -q "${pair}"
+                continue
+              fi
+              mkdir -p "$(dirname "${src}/${pair%%=*}")"
+              printf '%s\n' "${pair#*=}" > "${src}/${pair%%=*}"
+              git -C "${src}" add "${pair%%=*}"
+            done
+            git -C "${src}" commit -q -m "${branch}"
+          }
+          commit_on release "${base}" 'releases/1.1.1.yaml=version: 1.1.1'
+          commit_on plain "${base}" 'README=no release here'
+          # Only an ADDED release file is a release: editing or
+          # deleting an earlier one is maintenance
+          commit_on edited release 'releases/1.1.1.yaml=version: 1.1.1 # note'
+          commit_on deleted release 'releases/1.1.1.yaml'
+          commit_on two "${base}" 'releases/1.1.1.yaml=version: 1.1.1' \
+            'releases/1.1.2.yaml=version: 1.1.2'
+
+          errors=0
+          # $1 case, $2 branch, $3 depth (0 = full history),
+          # $4 want (pass|fail), $5 expected has_release,
+          # $6 expected version; FROM overrides the source repository
+          check() {
+            local work="${RUNNER_TEMP}/case-$1" depth=()
+            rm -rf "${work}"
+            git init -q "${work}"
+            if [ "$3" != '0' ]; then
+              depth=(--depth="$3")
+            fi
+            git -C "${work}" fetch -q "${depth[@]}" \
+              "file://${FROM:-${src}}" "refs/heads/$2"
+            git -C "${work}" checkout -q FETCH_HEAD
+            : > "${work}.out"
+            set +e
+            out="$(cd "${work}" && GITHUB_OUTPUT="${work}.out" \
+              bash -eo pipefail "${detect}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$4" = 'fail' ]; then
+              if [ "${rc}" = '0' ]; then
+                echo "$1: detection passed, expected a failure ❌"
+                errors=1
+              elif ! printf '%s' "${out}" | grep -q '^::error::'; then
+                echo "$1: failed without an error annotation ❌"
+                errors=1
+              fi
+              return
+            fi
+            if [ "${rc}" != '0' ]; then
+              echo "$1: detection failed (${rc}) ❌"
+              printf '%s\n' "${out}" | tail -n 3
+              errors=1
+              return
+            fi
+            if ! grep -qx "has_release=$5" "${work}.out" \
+              || ! grep -qx "version=$6" "${work}.out"; then
+              echo "$1: wrong outputs ❌"
+              cat "${work}.out"
+              errors=1
+            fi
+          }
+
+          check 'release, parent fetched' release 2 pass true 1.1.1
+          check 'no release, parent fetched' plain 2 pass false ''
+          check 'release file edited' edited 2 pass false ''
+          check 'release file deleted' deleted 2 pass false ''
+          check 'two release files' two 2 fail
+
+          # A release version must match version.properties, or the
+          # run fails (#118). $1 case, $2 release, $3 resolved, $4 want
+          verify_case() {
+            set +e
+            out="$(RELEASE_VERSION="$2" RESOLVED_VERSION="$3" \
+              bash -eo pipefail "${verify}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$4" = 'pass' ] && [ "${rc}" != '0' ]; then
+              echo "$1: verification failed (${rc}) ❌"
+              errors=1
+            elif [ "$4" = 'fail' ] && { [ "${rc}" = '0' ] \
+              || ! printf '%s' "${out}" | grep -q '^::error::'; }; then
+              echo "$1: mismatch did not fail with an error ❌"
+              errors=1
+            fi
+          }
+          verify_case 'versions match' 1.1.1 1.1.1 pass
+          verify_case 'versions differ' 1.1.2 1.1.1 fail
+          # The defect: a depth-1 clone has no parent, and must fail
+          # rather than report no release (#117)
+          check 'release, shallow without parent' release 1 fail
+          check 'no release, shallow without parent' plain 1 fail
+
+          # A repository whose first commit adds the release file has
+          # no parent at all, and is not shallow: an initial release
+          # must still be found, not read as no release
+          first="${RUNNER_TEMP}/first"
+          git init -q -b main "${first}"
+          mkdir -p "${first}/releases"
+          echo 'version: 1.0.0' > "${first}/releases/1.0.0.yaml"
+          git -C "${first}" add releases
+          git -C "${first}" commit -q -m 'Initial release'
+          FROM="${first}" check 'release in the root commit' main 0 \
+            pass true 1.0.0
+
+          if [ "${errors}" != '0' ]; then
+            echo "Release detection incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Release detection correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # resolve-commit picks the one commit a Gerrit merge run builds, and
+  # refuses one that is not on the target branch (#119). Its resolve
+  # step needs only git, so it is extracted and driven against local
+  # repositories standing in for Gerrit.
+  commit-resolution:
+    name: 'Test: commit resolution'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise commit resolution'
+        shell: bash
+        run: |
+          # Exercise commit resolution
+          resolve="${RUNNER_TEMP}/resolve-commit.sh"
+          python3 - <<'EXTRACT' > "${resolve}"
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['jobs']['resolve-commit']['steps']
+          print([s for s in steps if s.get('id') == 'resolve'][0]['run'])
+          EXTRACT
+          if ! grep -q 'ancestry-path' "${resolve}"; then
+            echo "Could not extract commit resolution ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+          export GIT_AUTHOR_NAME='Commit Resolution'
+          export GIT_AUTHOR_EMAIL='commit-resolution@example.org'
+          export GIT_COMMITTER_NAME="${GIT_AUTHOR_NAME}"
+          export GIT_COMMITTER_EMAIL="${GIT_AUTHOR_EMAIL}"
+
+          # A stand-in Gerrit (<server>/<project>) whose main branch
+          # holds each shape a merge-if-necessary submit produces
+          server="${RUNNER_TEMP}/gerrit"
+          src="${server}/project"
+          git init -q -b main "${src}"
+          g() { git -C "${src}" "$@"; }
+          g commit -q --allow-empty -m 'base'
+          base=$(g rev-parse HEAD)
+          # A change fast-forwarded onto main: it is its own commit
+          g commit -q --allow-empty -m 'fast-forwarded change'
+          ff=$(g rev-parse HEAD)
+          # A change Gerrit merged with a merge commit
+          g switch -q -c change "${base}"
+          g commit -q --allow-empty -m 'merged change'
+          merged=$(g rev-parse HEAD)
+          g switch -q main
+          g merge -q --no-ff -m 'Merge "merged change"' "${merged}"
+          merge_commit=$(g rev-parse HEAD)
+          # A later merge that moves the tip after the event fired
+          g commit -q --allow-empty -m 'later change'
+          tip=$(g rev-parse HEAD)
+          # Change refs, as Gerrit publishes them, and a patchset
+          # nobody merged
+          g update-ref refs/changes/01/1/1 "${ff}"
+          g switch -q -c abandoned "${base}"
+          g commit -q --allow-empty -m 'unmerged patchset'
+          g update-ref refs/changes/02/2/1 HEAD
+          unmerged=$(g rev-parse HEAD)
+          g switch -q main
+
+          errors=0
+          # $1 case, $2 refspec, $3 revision, $4 want (commit SHA|fail)
+          check() {
+            local out_file="${RUNNER_TEMP}/case.out"
+            : > "${out_file}"
+            set +e
+            out="$(RUNNER_TEMP="${RUNNER_TEMP}" GITHUB_OUTPUT="${out_file}" \
+              GERRIT_URL="file://${server}" GERRIT_PROJECT=project \
+              GERRIT_BRANCH=main GERRIT_REFSPEC="$2" REVISION="$3" \
+              bash -eo pipefail "${resolve}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$4" = 'fail' ]; then
+              if [ "${rc}" = '0' ] \
+                || ! printf '%s' "${out}" | grep -q '^::error::'; then
+                echo "$1: resolved, expected a refusal ❌"
+                errors=1
+              fi
+            elif [ "${rc}" != '0' ] \
+              || ! grep -qx "commit=$4" "${out_file}"; then
+              echo "$1: expected commit=$4 ❌"
+              printf '%s\n' "${out}" | tail -n 3
+              errors=1
+            fi
+          }
+
+          heads='refs/heads/main'
+          # The triggering revision pins the run, however far the tip
+          # has moved since the event (the stale/moving-tip case)
+          check 'revision fast-forwarded' "${heads}" "${ff}" "${ff}"
+          check 'revision merged by a merge commit' \
+            "${heads}" "${merged}" "${merge_commit}"
+          # Without a revision, a branch refspec builds the tip
+          check 'branch refspec, no revision' "${heads}" '' "${tip}"
+          # A change ref re-runs that already-merged change
+          check 'merged change ref' 'refs/changes/01/1/1' '' "${ff}"
+          # A patchset nobody merged must never build or publish
+          check 'unmerged revision' "${heads}" "${unmerged}" fail
+          check 'unmerged change ref' 'refs/changes/02/2/1' '' fail
+          check 'malformed revision' "${heads}" 'abc123' fail
+
+          if [ "${errors}" != '0' ]; then
+            echo "Commit resolution incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Commit resolution correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Both publish jobs decide whether to publish from the same
+  # credential check. A live run without credentials must fail rather
+  # than skip and go green (#120); a dry run only warns. Extracted and
+  # driven directly, since merge.yaml cannot run in CI.
+  credential-gate:
+    name: 'Test: credential gate'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise the credential gate'
+        shell: bash
+        run: |
+          # Exercise the credential gate
+          gate="${RUNNER_TEMP}/creds.sh"
+          python3 - <<'EXTRACT' > "${gate}"
+          import sys
+
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              jobs = yaml.safe_load(handle)['jobs']
+          bodies = {
+              job_id: [
+                  s for s in jobs[job_id]['steps'] if s.get('id') == 'creds'
+              ][0]['run']
+              for job_id in ('snapshot-publish', 'release-publish')
+          }
+          # One rule for both lanes: a gate that drifted between them
+          # would publish snapshots and skip releases, or the reverse
+          if len(set(bodies.values())) != 1:
+              sys.exit('The two credential checks differ')
+          print(next(iter(bodies.values())))
+          EXTRACT
+
+          errors=0
+          # $1 case, $2 HAS_CREDENTIALS, $3 DRY_RUN,
+          # $4 want (available|no-credential|fail)
+          check() {
+            local out_file="${RUNNER_TEMP}/gate-$2-$3.out"
+            : > "${out_file}"
+            set +e
+            out="$(HAS_CREDENTIALS="$2" DRY_RUN="$3" \
+              GITHUB_OUTPUT="${out_file}" bash -eo pipefail "${gate}" 2>&1)"
+            rc=$?
+            set -e
+            case "$4" in
+              available|no-credential)
+                local want=true
+                [ "$4" = 'no-credential' ] && want=false
+                if [ "${rc}" != '0' ] \
+                  || ! grep -qx "available=${want}" "${out_file}"; then
+                  echo "$1: expected available=${want} ❌"
+                  errors=1
+                fi
+                ;;
+              fail)
+                if [ "${rc}" = '0' ] \
+                  || ! printf '%s' "${out}" | grep -q '^::error::'; then
+                  echo "$1: expected a failure with an error ❌"
+                  errors=1
+                fi
+                ;;
+            esac
+          }
+
+          check 'live, credentials' true false available
+          # A dry run never loads a credential, set or not, so a stale
+          # grant or a vault outage cannot fail it; the publish step
+          # then runs node-publish-action's dry run (#121)
+          check 'dry run, credentials' true true no-credential
+          check 'dry run, no credentials' false true no-credential
+          # The defect: this used to warn, skip and go green (#120)
+          check 'live, no credentials' false false fail
+
+          if [ "${errors}" != '0' ]; then
+            echo "Credential gate incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Credential gate correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # snapshot_dist_tag must never be 'latest', and must be a tag npm
+  # accepts (#122). The validation step is extracted and driven with
+  # the values that matter.
+  snapshot-dist-tag:
+    name: 'Test: snapshot dist-tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise dist-tag validation'
+        shell: bash
+        run: |
+          # Exercise dist-tag validation
+          validate="${RUNNER_TEMP}/dist-tag.sh"
+          python3 - <<'EXTRACT' > "${validate}"
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['jobs']['resolve-version']['steps']
+          print([
+              s for s in steps
+              if s.get('name') == 'Validate snapshot dist-tag'
+          ][0]['run'])
+          EXTRACT
+          if ! grep -q 'SNAPSHOT_DIST_TAG' "${validate}"; then
+            echo "Could not extract dist-tag validation ❌"
+            exit 1
+          fi
+
+          errors=0
+          # $1 tag, $2 want (accept|reject)
+          check() {
+            set +e
+            out="$(SNAPSHOT_DIST_TAG="$1" bash -eo pipefail "${validate}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$2" = 'accept' ] && [ "${rc}" != '0' ]; then
+              echo "'$1': rejected, expected accepted ❌"
+              errors=1
+            elif [ "$2" = 'reject' ] && { [ "${rc}" = '0' ] \
+              || ! printf '%s' "${out}" | grep -q '^::error::'; }; then
+              echo "'$1': accepted, expected rejected ❌"
+              errors=1
+            fi
+          }
+
+          check 'snapshot' accept
+          check 'next' accept
+          check 'dev-build_1.x' accept
+          # Look like ranges, but npm's semver says they are not
+          check 'v' accept
+          check 'x-ray' accept
+          # The point of the input: snapshots never take latest
+          check 'latest' reject
+          check '' reject
+          # npm refuses a dist-tag that parses as a semver range,
+          # wildcards included
+          check '1.0' reject
+          check 'v2' reject
+          check 'x' reject
+          check 'X' reject
+          check 'x.x' reject
+          check 'vx' reject
+          check 'has space' reject
+          check 'semi;colon' reject
+
+          # An npm whose semver module cannot load must fail the gate,
+          # not pass a tag nobody checked
+          shim="${RUNNER_TEMP}/broken-npm"
+          mkdir -p "${shim}"
+          printf '#!/bin/sh\necho /nonexistent\n' > "${shim}/npm"
+          chmod +x "${shim}/npm"
+          set +e
+          out="$(PATH="${shim}:${PATH}" SNAPSHOT_DIST_TAG=snapshot \
+            bash -eo pipefail "${validate}" 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" = '0' ] \
+            || ! printf '%s' "${out}" | grep -q 'Cannot load'; then
+            echo "unloadable semver: gate passed, expected a failure ❌"
+            errors=1
+          fi
+
+          if [ "${errors}" != '0' ]; then
+            echo "Dist-tag validation incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Dist-tag validation correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # The node-metadata resolver decides which Node.js version each job
   # runs on, including the build/test split that lets a legacy
