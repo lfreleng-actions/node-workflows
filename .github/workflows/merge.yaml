@@ -9,7 +9,8 @@
 # version.properties -> X.Y.Z-SNAPSHOT), and a release publish triggers
 # when the merged commit adds a release file under releases/:
 #   { resolve-version | node-metadata -> build } -> snapshot-publish
-#   check-release -> release-publish (only when a release file merged)
+#   resolve-version -> check-release -> release-publish (only when a
+#   release file merged, and its version matches version.properties)
 #
 # The project builds once: the build job uploads the complete built
 # tree (including gitignored build output such as lib/ or dist/) as a
@@ -837,7 +838,14 @@ jobs:
 
   check-release:
     name: 'Check for Release File'
-    needs: gerrit-validate
+    # resolve-version supplies the version.properties version the
+    # release file must match. Comparing here, rather than only in
+    # release-publish, is what makes a mismatch fail the run: a gate
+    # placed on a later job's 'if:' skips that job, and everything
+    # after it, without a word (#118).
+    needs:
+      - 'gerrit-validate'
+      - 'resolve-version'
     runs-on: ubuntu-latest
     outputs:
       has_release: ${{ steps.detect.outputs.has_release }}
@@ -959,6 +967,27 @@ jobs:
           echo "has_release=true" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
+      # The release file's version must match version.properties; a
+      # mismatch means the release descriptor and committed version
+      # metadata diverged, and nothing may publish or be signed for
+      # either version.
+      - name: 'Verify release version matches version.properties'
+        id: verify-version
+        if: steps.detect.outputs.has_release == 'true'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.detect.outputs.version }}
+          RESOLVED_VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          # Cross-check the release file against version.properties
+          if [ "${RELEASE_VERSION}" != "${RESOLVED_VERSION}" ]; then
+            echo "::error::Release file version" \
+              "(${RELEASE_VERSION}) does not match" \
+              "version.properties (${RESOLVED_VERSION})"
+            exit 1
+          fi
+          echo "Release version verified: ${RELEASE_VERSION}"
+
   release-publish:
     # The leg name comes from the target, so a failed check names the
     # registry that failed rather than leaving the reader to open it.
@@ -998,6 +1027,7 @@ jobs:
     # than a clear skip.
     if: >-
       ${{ !cancelled()
+      && needs.check-release.result == 'success'
       && needs.check-release.outputs.has_release == 'true'
       && needs.resolve-version.result == 'success'
       && needs.build.result == 'success'
@@ -1053,9 +1083,10 @@ jobs:
           name: node-release-package
           path: pack-dist
 
-      # The release file's version must match version.properties; a
-      # mismatch means the release descriptor and committed version
-      # metadata diverged
+      # The release file's version must match version.properties.
+      # check-release enforces this and fails the run on a mismatch;
+      # this repeats it as defence in depth, since this job writes the
+      # version to a registry and the check costs nothing.
       - name: 'Verify release version matches version.properties'
         shell: bash
         env:
@@ -1207,12 +1238,14 @@ jobs:
     # toggles would leave a caller with both switched off publishing
     # nothing at all.
     #
-    # The version equality mirrors the cross-check release-publish
-    # performs against version.properties. On a mismatch that job
-    # fails, and skipping here stops the run leaving behind signed
-    # provenance for a version that never passed release validation.
+    # check-release must succeed, not merely report a release: it
+    # fails on a version mismatch with version.properties, and its
+    # outputs survive that failure. The check lives there, not in
+    # this condition, because a version gate here skipped this job,
+    # attestation, signing and the publish without failing anything
+    # (#118).
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && needs.check-release.outputs.has_release == 'true' && needs.check-release.outputs.version == needs.resolve-version.outputs.version && needs.resolve-version.result == 'success' && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.check-release.result == 'success' && needs.check-release.outputs.has_release == 'true' && needs.resolve-version.result == 'success' && needs.build.result == 'success' }}
     outputs:
       tarball_name: ${{ steps.pack.outputs.tarball_name }}
     permissions:

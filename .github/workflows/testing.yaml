@@ -457,6 +457,47 @@ jobs:
                   "pack-release, but publishes that job's tarball"
               )
 
+          # A release version that disagrees with version.properties
+          # has to fail the run (#118). It used to be a version
+          # equality in pack-release's 'if:', which skipped the pack,
+          # and with it attestation, signing and the publish, while
+          # the run stayed green. The comparison now lives in
+          # check-release, and failing there only stops the release
+          # if the downstream jobs require check-release to succeed:
+          # its outputs survive a failure, and both jobs run under
+          # !cancelled().
+          check_needs = merge_jobs['check-release'].get('needs') or []
+          if isinstance(check_needs, str):
+              check_needs = [check_needs]
+          if 'resolve-version' not in check_needs:
+              errors.append(
+                  'merge.yaml/check-release does not need '
+                  'resolve-version, so it cannot compare the release '
+                  'file with version.properties'
+              )
+          verify = [
+              s for s in merge_jobs['check-release'].get('steps') or []
+              if s.get('id') == 'verify-version'
+          ]
+          if len(verify) != 1:
+              errors.append(
+                  'merge.yaml/check-release has no verify-version step'
+              )
+          for job_id in ('pack-release', 'release-publish'):
+              job_if = str(merge_jobs[job_id].get('if', ''))
+              if "needs.check-release.result == 'success'" not in job_if:
+                  errors.append(
+                      f'merge.yaml/{job_id} does not require '
+                      'check-release to succeed, so a version mismatch '
+                      'would not stop it'
+                  )
+          if 'outputs.version ==' in pack_if:
+              errors.append(
+                  'merge.yaml/pack-release gates on a version '
+                  'equality, which skips the release on a mismatch '
+                  'instead of failing the run'
+              )
+
           if errors:
               for message in errors:
                   print(f'::error::{message}')
@@ -754,17 +795,26 @@ jobs:
         run: |
           # Exercise release detection
           detect="${RUNNER_TEMP}/detect.sh"
-          python3 - <<'EXTRACT' > "${detect}"
+          verify="${RUNNER_TEMP}/verify.sh"
+          python3 - <<'EXTRACT'
+          import os
+
           import yaml
 
           with open('.github/workflows/merge.yaml') as handle:
               doc = yaml.safe_load(handle)
           steps = doc['jobs']['check-release']['steps']
-          print([s for s in steps if s.get('id') == 'detect'][0]['run'])
+          tmp = os.environ['RUNNER_TEMP']
+          for step_id, name in (('detect', 'detect.sh'),
+                                ('verify-version', 'verify.sh')):
+              run = [s for s in steps if s.get('id') == step_id][0]['run']
+              with open(os.path.join(tmp, name), 'w') as handle:
+                  handle.write(run)
           EXTRACT
-          # Fail loudly rather than silently testing nothing if the
-          # step is renamed or loses its parent check
-          if ! grep -q 'is-shallow-repository' "${detect}"; then
+          # Fail loudly rather than silently testing nothing if a
+          # step is renamed or loses its check
+          if ! grep -q 'is-shallow-repository' "${detect}" \
+            || ! grep -q 'RESOLVED_VERSION' "${verify}"; then
             echo "Could not extract release detection ❌"
             echo "Update the extraction in this job to match"
             exit 1
@@ -857,6 +907,26 @@ jobs:
           check 'release file edited' edited 2 pass false ''
           check 'release file deleted' deleted 2 pass false ''
           check 'two release files' two 2 fail
+
+          # A release version must match version.properties, or the
+          # run fails (#118). $1 case, $2 release, $3 resolved, $4 want
+          verify_case() {
+            set +e
+            out="$(RELEASE_VERSION="$2" RESOLVED_VERSION="$3" \
+              bash -eo pipefail "${verify}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$4" = 'pass' ] && [ "${rc}" != '0' ]; then
+              echo "$1: verification failed (${rc}) ❌"
+              errors=1
+            elif [ "$4" = 'fail' ] && { [ "${rc}" = '0' ] \
+              || ! printf '%s' "${out}" | grep -q '^::error::'; }; then
+              echo "$1: mismatch did not fail with an error ❌"
+              errors=1
+            fi
+          }
+          verify_case 'versions match' 1.1.1 1.1.1 pass
+          verify_case 'versions differ' 1.1.2 1.1.1 fail
           # The defect: a depth-1 clone has no parent, and must fail
           # rather than report no release (#117)
           check 'release, shallow without parent' release 1 fail

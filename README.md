@@ -53,7 +53,8 @@ build -> sign-artefacts -> attach-artefacts
 
 ```text
 gerrit-validate -> { repository-metadata | node-metadata
-                     | resolve-version | check-release }
+                     | resolve-version }
+resolve-version -> check-release
 node-metadata -> build
 { resolve-version | build } -> snapshot-publish
 { check-release | resolve-version | build } -> release-publish
@@ -89,7 +90,8 @@ workflow publishes `X.Y.Z-SNAPSHOT` to the snapshot targets. When
 the merged commit adds a file under `releases/` whose `version:`
 matches `version.properties`, the workflow also publishes the plain
 `X.Y.Z` release to the release targets. A version mismatch between
-the release file and `version.properties` fails the release publish.
+the release file and `version.properties` fails the run before
+anything packs, signs or publishes.
 Detection compares the merged commit against its parent, so the run
 fails rather than reporting no release when the checkout lacks that
 parent.
