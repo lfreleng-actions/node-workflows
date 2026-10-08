@@ -39,18 +39,100 @@ concurrency:
 permissions: {}
 
 jobs:
+  # Dependabot reads only 'uses:' references, so a fixture pinned as a
+  # plain matrix 'ref' never receives a bump. test-node-project ships a
+  # composite action that reports the commit it was pinned at; calling
+  # it here puts the pin where Dependabot tracks it, and this job hands
+  # the commit to the matrix below. A Dependabot bump then runs the new
+  # fixture through the audit and Grype gates before it can merge.
+  node-fixture-ref:
+    name: 'Resolve Node.js fixture'
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Report fixture commit'
+        id: fixture
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/test-node-project@bfd41d325a99c1ca15351f368fdd339d05d340b9  # v0.1.0
+      # The pin must name a release of the canonical repository. GitHub
+      # resolves a commit pushed to any fork through the parent too, so
+      # the reported repository alone cannot prove that; requiring a
+      # tag's commit rejects fork, impostor and branch-head pins alike.
+      # An empty ref would also reach build-test as the default branch.
+      - name: 'Verify fixture release'
+        id: verify
+        shell: bash
+        env:
+          EXPECTED: 'lfreleng-actions/test-node-project'
+          REPOSITORY: ${{ steps.fixture.outputs.repository }}
+          SHA: ${{ steps.fixture.outputs.ref }}
+        run: |
+          # Verify fixture release
+          if [[ ! "${SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Fixture action reported '${SHA}', not a" \
+              "commit SHA"
+            exit 1
+          fi
+          if [ "${REPOSITORY}" != "${EXPECTED}" ]; then
+            echo "::error::Fixture pinned from '${REPOSITORY}'; pin" \
+              "${EXPECTED} instead"
+            exit 1
+          fi
+          if ! tags="$(git ls-remote --tags -- \
+            "https://github.com/${EXPECTED}.git")"; then
+            echo "::error::Cannot list ${EXPECTED} tags"
+            exit 1
+          fi
+          # Each tag's commit: the peeled ^{} line of an annotated tag,
+          # else the line of a lightweight tag. A tag object SHA never
+          # matches, as uses: needs the commit.
+          if ! tag="$(awk -v sha="${SHA}" '
+            { ref = $2
+              if (sub(/\^\{\}$/, "", ref)) peeled[ref] = $1
+              else direct[ref] = $1 }
+            END {
+              for (ref in direct) {
+                commit = (ref in peeled) ? peeled[ref] : direct[ref]
+                if (commit == sha) { sub(/^refs\/tags\//, "", ref)
+                  print ref; found = 1 }
+              }
+              exit !found
+            }' <<< "${tags}")"; then
+            echo "::error::${SHA} is not the commit of any ${EXPECTED}" \
+              "release tag; pin a release"
+            exit 1
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Fixture ${EXPECTED} pinned at" \
+            "$(tr '\n' ' ' <<< "${tag}")(${SHA})"
+
   # Node.js fixture repositories, fanned out in parallel via a matrix:
   # a modern npm project and a legacy 2020-era ONAP project, pinned to
   # exact commits so runs stay reproducible.
   build-test:
-    name: 'Build/Test'
+    name: 'Build/Test (${{ matrix.name }})'
+    needs: node-fixture-ref
     strategy:
       fail-fast: false
       matrix:
         include:
+          # ref comes from node-fixture-ref
           - name: 'test-node-project'
             repository: 'lfreleng-actions/test-node-project'
-            ref: 'bd3a321aedba81210e475ee88a3e1de89a06ee72'  # v0.0.8
+            ref: ''
             node_version: ''
             test_permit_fail: false
             # This lane gates on both scanners. The fixture is meant
@@ -78,7 +160,7 @@ jobs:
     uses: $/.github/workflows/build-test.yaml
     with:
       repository: ${{ matrix.repository }}
-      ref: ${{ matrix.ref }}
+      ref: ${{ matrix.ref || needs.node-fixture-ref.outputs.sha }}
       node_version: ${{ matrix.node_version }}
       test_permit_fail: ${{ matrix.test_permit_fail }}
       audit_permit_fail: ${{ matrix.audit_permit_fail }}

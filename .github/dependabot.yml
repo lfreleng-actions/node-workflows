@@ -15,4 +15,8 @@ updates:
     # This is required to satisfy the zizmor workflow auditing tool.
     cooldown:
       default-days: 7
+      # Our own test fixture, not third-party code: a fixture release
+      # usually carries a security fix the CI gates are waiting on.
+      exclude:
+        - "lfreleng-actions/test-node-project"
     open-pull-requests-limit: 15
