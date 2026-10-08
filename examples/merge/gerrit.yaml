@@ -24,6 +24,12 @@
 #     and GERRIT_REFSPEC is refs/heads/<branch>.
 #   * Merge workflows COMMENT on the change (comment-only) — they never
 #     vote; the change already merged.
+#   * Needs a node-workflows release of v0.7.3 or later. From v0.7.3 the
+#     reusable workflow resolves the merged commit from Gerrit rather
+#     than the GitHub mirror, so this caller does not wait for
+#     replication: a mirror that has not caught up yet cannot change
+#     what the run builds. An older release builds the mirror's branch
+#     tip, and the run can build the commit before this change.
 #   * Set the repository variables GERRIT_SERVER, GERRIT_SSH_USER,
 #     GERRIT_KNOWN_HOSTS, GERRIT_URL, the secret GERRIT_SSH_PRIVKEY, and
 #     (for Nexus publishing) the secrets OP_SERVICE_ACCOUNT_TOKEN and
@@ -81,9 +87,28 @@ on:
         type: string
         default: ''
 
+# Keyed on the repository, not the change or the branch. Every merge
+# publishes the same X.Y.Z-SNAPSHOT version under one dist-tag, so two
+# merges running at once race to publish it. Group on the change ID
+# and two different changes run side by side. Never cancel a running
+# lane, as one stopped mid-publish can leave its targets inconsistent.
+# queue: max holds up to 100 pending runs instead of letting a newer
+# one replace the one pending. The queue is bounded: once 100 runs
+# wait, GitHub cancels each further run, which then neither publishes
+# nor reports to Gerrit. Re-run a cancelled run once the queue drains.
+#
+# Each run builds the commit its change merged as, not the branch tip.
+# GitHub starts queued runs in the order they began waiting, which
+# mostly but not always matches merge order. If two merges on one
+# branch run out of order, the older commit's snapshot publishes last
+# and stays the published snapshot until the next merge on that branch
+# replaces it; re-run the newer merge's run to restore it sooner. Give
+# each active branch its own SNAPSHOT version, or the branch whose run
+# finishes last replaces the others' snapshot.
 concurrency:
-  group: ${{ github.event.inputs.GERRIT_CHANGE_ID || github.run_id }}
-  cancel-in-progress: true
+  group: node-merge-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
 
 permissions: {}
 
@@ -113,8 +138,6 @@ jobs:
           gerrit-patchset-number: ${{ inputs.GERRIT_PATCHSET_NUMBER }}
           vote-type: clear
           comment-only: 'true'
-      - name: 'Allow replication'
-        run: sleep 10s
 
   # Call the reusable merge workflow, forwarding the Nexus credential
   # secrets it needs once the publish placeholders are replaced.
