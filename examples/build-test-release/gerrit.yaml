@@ -70,6 +70,7 @@ jobs:
     #          "https://nexus3.example.org/repository/npm.release/",
     #        "auth": "nexus"}
     #     ]
+    #   publish_environment: ''       # environment gating the publish
     # Uncomment the secrets block when nexus_publish is true:
     # secrets:
     #   OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}

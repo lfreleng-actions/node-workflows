@@ -216,6 +216,9 @@ jobs:
       # build_tool: ''                # 'npm' or 'yarn'; empty auto-detects
       # attestations: true            # SLSA provenance for releases
       # sigstore_sign: true           # Sigstore bundle for releases
+      # Optional environments gating the publish jobs; empty uses none:
+      # snapshot_environment: ''
+      # release_environment: ''       # e.g. one requiring a reviewer
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
       VAULT_MAPPING_JSON: ${{ secrets.VAULT_MAPPING_JSON }}
