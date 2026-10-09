@@ -666,6 +666,92 @@ jobs:
           echo "Publish target wiring correct ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
+  # setup-node v5+ restores and saves an npm cache unasked when
+  # package.json names npm in packageManager or
+  # devEngines.packageManager. merge.yaml and build-test-release.yaml
+  # pack, attest and publish releases, so a poisoned cache would reach
+  # what they ship (CWE-349). Neither can run here, so read every
+  # setup-node step instead: each must switch the implicit cache off
+  # and must not request an explicit one. Actions that run setup-node
+  # internally are out of this check's reach: each has to disable the
+  # cache itself, and the pin bump that picks up that fix is how it
+  # reaches these lanes.
+  setup-node-cache:
+    name: 'Test: setup-node caching disabled'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Assert every setup-node step disables caching'
+        shell: bash
+        run: |
+          # Assert every setup-node step disables caching
+          python3 - <<'PY'
+          import glob
+          import sys
+
+          import yaml
+
+          paths = sorted(
+              glob.glob('.github/workflows/*.yaml')
+              + glob.glob('.github/workflows/*.yml')
+          )
+          errors = []
+          checked = 0
+          for path in paths:
+              with open(path) as handle:
+                  jobs = yaml.safe_load(handle).get('jobs') or {}
+              for job_id, job in jobs.items():
+                  for index, step in enumerate(job.get('steps') or []):
+                      action = str(step.get('uses', '')).split('@')[0]
+                      if action.lower() != 'actions/setup-node':
+                          continue
+                      checked += 1
+                      label = step.get('name', f'step {index}')
+                      where = f'{path}/{job_id} ({label})'
+                      inputs = step.get('with') or {}
+                      # Literal false, so no expression can switch the
+                      # cache back on at run time.
+                      if inputs.get('package-manager-cache') is not False:
+                          errors.append(
+                              f'{where} does not set '
+                              'package-manager-cache: false'
+                          )
+                      if 'cache' in inputs:
+                          errors.append(f'{where} requests a cache')
+
+          # Matching nothing would pass while checking nothing, the
+          # silent skip this job exists to prevent.
+          if checked == 0:
+              errors.append('No actions/setup-node step found to check')
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('setup-node caching enabled \u274c')
+
+          print(f'{checked} setup-node steps disable caching \u2705')
+          PY
+          echo "setup-node caching disabled ✅" >> "$GITHUB_STEP_SUMMARY"
+
 
   publish-targets-rejections:
     name: 'Test: publish targets (rejections)'
