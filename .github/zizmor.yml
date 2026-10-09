@@ -61,4 +61,4 @@ rules:
       # those two lines in the same way as the entries above; the
       # build-test example's gerrit.yaml has no secret on either line.
       - gerrit.yaml:139
-      - gerrit.yaml:348
+      - gerrit.yaml:351
