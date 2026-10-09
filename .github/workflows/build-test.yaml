@@ -109,6 +109,23 @@ on:
         required: false
         type: string
         default: ''
+      junit_report_path:
+        description: >-
+          Glob (relative to path_prefix) of JUnit XML reports to render
+          in the tests job summary and upload as node-junit; empty
+          disables
+        required: false
+        type: string
+        default: ''
+      coverage_path:
+        description: >-
+          Path (relative to path_prefix) of an lcov.info or istanbul
+          coverage-summary.json file, or a directory holding either, to
+          summarise in the tests job summary and upload as
+          node-coverage; empty disables
+        required: false
+        type: string
+        default: ''
 
       # --- Audit ---
       audit_enabled:
@@ -288,6 +305,35 @@ jobs:
               "${TEST_ARTIFACT_PATH}"
             exit 1
           fi
+
+      - name: 'Validate test report path inputs'
+        id: validate-report-paths
+        if: inputs.junit_report_path != '' || inputs.coverage_path != ''
+        shell: bash
+        env:
+          JUNIT_REPORT_PATH: ${{ inputs.junit_report_path }}
+          COVERAGE_PATH: ${{ inputs.coverage_path }}
+        run: |
+          # The test_artifact_path rules: the tests job joins these
+          # onto path_prefix, so absolute paths or .. segments could
+          # read or upload files from outside the checkout. Only the
+          # JUnit glob takes the * wildcard; coverage_path names one
+          # file or directory
+          errors=0
+          check() {
+            local name="$1" value="$2" chars="$3"
+            local valid="^[${chars}]+(/[${chars}]+)*/?$"
+            if [ -n "${value}" ] && { [[ ! "${value}" =~ ${valid} ]] \
+              || [[ "${value}" =~ (^|/)\.\.(/|$) ]]; }; then
+              # A newline in the value could forge a workflow command
+              echo "::error::Invalid ${name} input:" \
+                "$(printf '%s' "${value}" | tr -d '\r\n')"
+              errors=1
+            fi
+          }
+          check junit_report_path "${JUNIT_REPORT_PATH}" 'A-Za-z0-9._*-'
+          check coverage_path "${COVERAGE_PATH}" 'A-Za-z0-9._-'
+          exit "${errors}"
 
       - name: 'Validate job timeout inputs'
         shell: bash
@@ -727,6 +773,135 @@ jobs:
         with:
           name: node-test-results
           path: ${{ inputs.path_prefix }}/${{ inputs.test_artifact_path }}
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Test reporting. The Run tests step alone decides pass or fail
+      # (honouring test_permit_fail), so these steps never fail the
+      # job on results; they run after a failed test step too, when
+      # the reports matter most. A missing report warns: tests that
+      # crash before writing one already fail the Run tests step.
+      # Artefact names: a per-leg '-node-<version>' suffix belongs on
+      # node-junit and node-coverage if this job fans out over
+      # several Node.js versions, as uploads in one run need distinct
+      # names.
+      - name: 'Summarise JUnit test results'
+        id: junit
+        if: ${{ !cancelled() && inputs.junit_report_path != '' }}
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/junit-test-report-action@cbc41af8f2e0cf6363d5b04df00025f938bf9a5e  # v0.0.2
+        with:
+          # yamllint disable-line rule:line-length
+          report-paths: ${{ inputs.path_prefix }}/${{ inputs.junit_report_path }}
+          fail-on-failure: 'false'
+          artifact-name: 'node-junit'
+
+      - name: 'Report missing JUnit reports'
+        if: ${{ !cancelled() && steps.junit.outputs.result == 'none' }}
+        shell: bash
+        env:
+          JUNIT_REPORT_PATH: ${{ inputs.junit_report_path }}
+        run: |
+          # Report missing JUnit reports
+          echo "::warning::No JUnit reports match junit_report_path" \
+            "${JUNIT_REPORT_PATH}"
+
+      - name: 'Summarise coverage'
+        id: coverage
+        if: ${{ !cancelled() && inputs.coverage_path != '' }}
+        shell: bash
+        working-directory: ${{ inputs.path_prefix }}
+        env:
+          COVERAGE_PATH: ${{ inputs.coverage_path }}
+        run: |
+          # Summarise coverage (reporting only: no thresholds)
+          target="${COVERAGE_PATH%/}"
+          summary=''
+          lcov=''
+          if [ -d "${target}" ]; then
+            if [ -f "${target}/coverage-summary.json" ]; then
+              summary="${target}/coverage-summary.json"
+            fi
+            if [ -f "${target}/lcov.info" ]; then
+              lcov="${target}/lcov.info"
+            fi
+          elif [ -f "${target}" ]; then
+            case "${target}" in
+              *.json) summary="${target}" ;;
+              *) lcov="${target}" ;;
+            esac
+          else
+            echo "::warning::No coverage report at coverage_path" \
+              "${COVERAGE_PATH}"
+            echo 'found=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The path exists, so it is uploaded whatever its format
+          echo 'found=true' >> "$GITHUB_OUTPUT"
+
+          # Each parser prints one 'metric<TAB>covered<TAB>total' row
+          # per metric it knows, and fails on input it cannot read
+          parse_summary() {
+            # istanbul json-summary: totals sit under .total, and a
+            # metric short of numeric counts makes the file unreadable
+            jq -r '
+              .total as $t
+              | ("lines", "branches", "functions", "statements") as $m
+              | $t[$m] as $v
+              | if ($v | type) == "object"
+                  and ($v.covered | type) == "number"
+                  and ($v.total | type) == "number"
+                then [$m, $v.covered, $v.total] | @tsv
+                else error("no numeric total.\($m)") end' "$1"
+          }
+          parse_lcov() {
+            # Sum each record's totals; lcov has no statement count
+            awk -F: '
+              { sub(/\r$/, "") }
+              $1 == "SF" { records++ }
+              $1 == "LF" { lf += $2 } $1 == "LH" { lh += $2 }
+              $1 == "BRF" { brf += $2 } $1 == "BRH" { brh += $2 }
+              $1 == "FNF" { fnf += $2 } $1 == "FNH" { fnh += $2 }
+              END {
+                if (!records) exit 1
+                printf "lines\t%d\t%d\n", lh, lf
+                printf "branches\t%d\t%d\n", brh, brf
+                printf "functions\t%d\t%d\n", fnh, fnf
+              }' "$1"
+          }
+          if [ -n "${summary}" ] \
+            && rows="$(parse_summary "${summary}")"; then
+            report="${summary}"
+          elif [ -n "${lcov}" ] && rows="$(parse_lcov "${lcov}")"; then
+            report="${lcov}"
+          else
+            echo "::warning::No readable lcov.info or" \
+              "coverage-summary.json at coverage_path ${COVERAGE_PATH}"
+            exit 0
+          fi
+
+          table="$(awk -F'\t' '{
+            pct = ($3 > 0) ? sprintf("%.2f%%", 100 * $2 / $3) : "n/a"
+            printf "| %s%s | %d | %d | %s |\n",
+              toupper(substr($1, 1, 1)), substr($1, 2), $2, $3, pct
+          }' <<< "${rows}")"
+          {
+            echo '## 📊 Coverage'
+            echo ''
+            echo "From \`${report}\`"
+            echo ''
+            echo '| Metric | Covered | Total | Coverage |'
+            echo '| ------ | ------- | ----- | -------- |'
+            echo "${table}"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Upload coverage artefact'
+        if: ${{ !cancelled() && steps.coverage.outputs.found == 'true' }}
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: 'node-coverage'
+          path: ${{ inputs.path_prefix }}/${{ inputs.coverage_path }}
           retention-days: 7
           if-no-files-found: warn
 

@@ -1449,6 +1449,302 @@ jobs:
           fi
           echo "Dist-tag validation correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
 
+  # The test-node-project fixture's Jest run writes no JUnit XML or
+  # coverage, and node-build-action runs package.json scripts by
+  # name only, so no caller input can add the flags. Until the
+  # fixture gains such scripts, the tests job's reporting steps are
+  # exercised here: the shipped steps run against crafted JUnit XML,
+  # lcov.info and istanbul coverage-summary.json reports.
+  test-reporting:
+    name: 'Test: test reports and coverage'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Write JUnit samples'
+        shell: bash
+        run: |
+          # Write JUnit samples: jest-junit and mocha-junit-reporter
+          # shapes, the second one directory deeper to exercise **
+          mkdir -p samples/junit/nested
+          cat > samples/junit/jest.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <testsuites name="jest tests" tests="3" failures="1" errors="0">
+            <testsuite name="sum" tests="3" failures="1" errors="0"
+                skipped="1" time="0.5">
+              <testcase classname="sum" name="adds" time="0.1"/>
+              <testcase classname="sum" name="fails" time="0.2">
+                <failure message="expected 3">Error: expected 3</failure>
+              </testcase>
+              <testcase classname="sum" name="skips" time="0">
+                <skipped/>
+              </testcase>
+            </testsuite>
+          </testsuites>
+          XML
+          cat > samples/junit/nested/mocha.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <testsuites name="Mocha Tests" tests="2" failures="0">
+            <testsuite name="app" tests="2" failures="0" errors="1"
+                skipped="0" time="0.25">
+              <testcase classname="app" name="starts" time="0.1"/>
+              <testcase classname="app" name="throws" time="0.15">
+                <error message="boom">TypeError: boom</error>
+              </testcase>
+            </testsuite>
+          </testsuites>
+          XML
+
+      # The same action, pin and path join the tests job uses; the
+      # next step proves the pins match
+      - name: 'Render JUnit samples'
+        id: junit-samples
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/junit-test-report-action@cbc41af8f2e0cf6363d5b04df00025f938bf9a5e  # v0.0.2
+        with:
+          report-paths: './samples/junit/**/*.xml'
+          fail-on-failure: 'false'
+          artifact-upload: 'false'
+      - name: 'Render absent JUnit reports'
+        id: junit-absent
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/junit-test-report-action@cbc41af8f2e0cf6363d5b04df00025f938bf9a5e  # v0.0.2
+        with:
+          report-paths: './samples/absent/*.xml'
+          fail-on-failure: 'false'
+          artifact-upload: 'false'
+
+      - name: 'Exercise test reporting'
+        shell: bash
+        env:
+          JUNIT_SAMPLES: ${{ toJSON(steps.junit-samples.outputs) }}
+          JUNIT_ABSENT: ${{ steps.junit-absent.outputs.result }}
+        run: |
+          # Exercise test reporting
+          scripts="${RUNNER_TEMP}/reporting"
+          mkdir -p "${scripts}"
+          python3 - "${scripts}" <<'EXTRACT'
+          import sys
+          import yaml
+
+          out = sys.argv[1]
+          paths = [
+              '.github/workflows/build-test.yaml',
+              '.github/workflows/build-test-release.yaml',
+          ]
+          docs = {}
+          for path in paths:
+              with open(path) as handle:
+                  docs[path] = yaml.safe_load(handle)
+
+          def step(doc, job, step_id):
+              steps = doc['jobs'][job]['steps']
+              return [s for s in steps if s.get('id') == step_id][0]
+
+          # Both workflows ship the same reporting steps, and this job
+          # renders through the same action pin they call
+          with open('.github/workflows/testing.yaml') as handle:
+              own = yaml.safe_load(handle)
+          pin = step(own, 'test-reporting', 'junit-samples')['uses']
+          ref = docs[paths[0]]
+          for path, doc in docs.items():
+              for job, step_id in (
+                  ('gerrit-validate', 'validate-report-paths'),
+                  ('tests', 'junit'),
+                  ('tests', 'coverage'),
+              ):
+                  if step(doc, job, step_id) != step(ref, job, step_id):
+                      sys.exit(f'{step_id} step in {path} diverged')
+              if step(doc, 'tests', 'junit')['uses'] != pin:
+                  sys.exit(f'junit-test-report-action pin in {path}'
+                           ' differs from this job')
+
+          for job, step_id in (
+              ('gerrit-validate', 'validate-report-paths'),
+              ('tests', 'coverage'),
+          ):
+              with open(f'{out}/{step_id}.sh', 'w') as handle:
+                  handle.write(step(ref, job, step_id)['run'])
+          EXTRACT
+          # Fail loudly rather than silently testing nothing if a step
+          # is renamed
+          if ! grep -q 'COVERAGE_PATH' "${scripts}/coverage.sh" \
+            || ! grep -q 'JUNIT_REPORT_PATH' \
+              "${scripts}/validate-report-paths.sh"; then
+            echo "Could not extract the reporting steps ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          errors=0
+          fail() {
+            echo "$1 ❌"
+            errors=1
+          }
+
+          # The pinned action's contract the tests job relies on:
+          # counts across a ** glob, and 'none' when nothing matches
+          got="$(jq -r '[.total, .passed, .failures, .errors,
+            .skipped, .report_count, .result] | join(" ")' \
+            <<< "${JUNIT_SAMPLES}")"
+          if [ "${got}" != '5 2 1 1 1 2 failure' ]; then
+            fail "JUnit samples: got '${got}'"
+          fi
+          if [ "${JUNIT_ABSENT}" != 'none' ]; then
+            fail "absent JUnit reports: got '${JUNIT_ABSENT}'"
+          fi
+
+          # $1 junit_report_path, $2 coverage_path, $3 accept|reject
+          check_paths() {
+            set +e
+            out="$(JUNIT_REPORT_PATH="$1" COVERAGE_PATH="$2" \
+              bash -eo pipefail "${scripts}/validate-report-paths.sh" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$3" = 'accept' ] && [ "${rc}" != '0' ]; then
+              fail "paths '$1' '$2': rejected, expected accepted"
+            elif [ "$3" = 'reject' ] && { [ "${rc}" = '0' ] \
+              || ! printf '%s' "${out}" | grep -q '^::error::'; }; then
+              fail "paths '$1' '$2': accepted, expected rejected"
+            fi
+          }
+          check_paths 'reports/junit.xml' '' accept
+          check_paths '**/junit-*.xml' 'coverage' accept
+          check_paths '' 'coverage/' accept
+          check_paths '' 'coverage/lcov.info' accept
+          check_paths '/tmp/junit.xml' '' reject
+          check_paths '../junit.xml' '' reject
+          check_paths 'a/../../junit.xml' '' reject
+          check_paths '' '/coverage' reject
+          check_paths '' 'coverage/..' reject
+          check_paths '' 'coverage*' reject
+          check_paths 'has space.xml' '' reject
+          check_paths '' 'semi;colon' reject
+          # A rejected value reaches the log; a newline in it must not
+          # start a second workflow command
+          check_paths "$(printf 'x\n::warning::forged')" '' reject
+          if printf '%s\n' "${out}" | grep -q '^::warning::forged'; then
+            fail 'a newline in a rejected path forged a command'
+          fi
+
+          # Coverage samples: an istanbul json-summary (Jest, Vitest,
+          # c8) beside an lcov.info with CRLF endings and two records
+          cov="${RUNNER_TEMP}/coverage"
+          mkdir -p "${cov}/both" "${cov}/lcov" "${cov}/bad" "${cov}/junk" \
+            "${cov}/partial"
+          cat > "${cov}/both/coverage-summary.json" <<'JSON'
+          {"total": {
+            "lines": {"total": 40, "covered": 30, "pct": 75},
+            "statements": {"total": 50, "covered": 45, "pct": 90},
+            "functions": {"total": 8, "covered": 8, "pct": 100},
+            "branches": {"total": 0, "covered": 0, "pct": 100}},
+           "/src/sum.js": {"lines": {"total": 40, "covered": 30}}}
+          JSON
+          printf '%s\r\n' TN: SF:src/a.js FNF:2 FNH:1 LF:10 LH:5 BRF:4 \
+            BRH:3 end_of_record SF:src/b.js FNF:2 FNH:2 LF:10 LH:10 \
+            BRF:0 BRH:0 end_of_record > "${cov}/lcov/lcov.info"
+          cp "${cov}/lcov/lcov.info" "${cov}/both/lcov.info"
+          echo '{"not": "a summary"}' > "${cov}/bad/coverage-summary.json"
+          cp "${cov}/lcov/lcov.info" "${cov}/bad/lcov.info"
+          # Partial totals must not render as 0/0 over a usable lcov
+          echo '{"total": {"lines": {"total": 4, "covered": 2}}}' \
+            > "${cov}/partial/coverage-summary.json"
+          cp "${cov}/lcov/lcov.info" "${cov}/partial/lcov.info"
+          echo 'not coverage' > "${cov}/junk/lcov.info"
+
+          # $1 case, $2 coverage_path, $3 expected found output, then
+          # the summary lines expected, or 'none' for no table
+          check_coverage() {
+            local name="$1" target="$2" found="$3"
+            shift 3
+            : > "${RUNNER_TEMP}/cov-out.txt"
+            : > "${RUNNER_TEMP}/cov-summary.md"
+            set +e
+            out="$(cd "${cov}" && COVERAGE_PATH="${target}" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/cov-out.txt" \
+              GITHUB_STEP_SUMMARY="${RUNNER_TEMP}/cov-summary.md" \
+              bash -eo pipefail "${scripts}/coverage.sh" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${rc}" != '0' ]; then
+              fail "${name}: step failed (reporting must not)"
+              printf '%s\n' "${out}" | tail -3
+              return
+            fi
+            if ! grep -qx "found=${found}" "${RUNNER_TEMP}/cov-out.txt"; then
+              fail "${name}: expected found=${found}"
+            fi
+            if [ "$1" = 'none' ]; then
+              if [ -s "${RUNNER_TEMP}/cov-summary.md" ]; then
+                fail "${name}: wrote a summary, expected none"
+              fi
+              if ! printf '%s' "${out}" | grep -q '^::warning::'; then
+                fail "${name}: no warning"
+              fi
+              return
+            fi
+            for line in "$@"; do
+              # The summary quotes the report path in backticks
+              if ! tr -d '\140' < "${RUNNER_TEMP}/cov-summary.md" \
+                | grep -qxF "${line}"; then
+                fail "${name}: summary lacks '${line}'"
+              fi
+            done
+          }
+
+          # The json-summary wins when both exist, and is the only
+          # source of a statement count; a zero total reads n/a
+          check_coverage 'json-summary' 'both' true \
+            'From both/coverage-summary.json' \
+            '| Lines | 30 | 40 | 75.00% |' \
+            '| Branches | 0 | 0 | n/a |' \
+            '| Functions | 8 | 8 | 100.00% |' \
+            '| Statements | 45 | 50 | 90.00% |'
+          check_coverage 'trailing slash' 'both/' true \
+            '| Lines | 30 | 40 | 75.00% |'
+          check_coverage 'json-summary file' 'both/coverage-summary.json' \
+            true 'From both/coverage-summary.json'
+          check_coverage 'lcov file' 'lcov/lcov.info' true \
+            'From lcov/lcov.info' \
+            '| Lines | 15 | 20 | 75.00% |' \
+            '| Branches | 3 | 4 | 75.00% |' \
+            '| Functions | 3 | 4 | 75.00% |'
+          if grep -q 'Statements' "${RUNNER_TEMP}/cov-summary.md"; then
+            fail 'lcov file: reported statements lcov does not carry'
+          fi
+          check_coverage 'unreadable summary' 'bad' true \
+            'From bad/lcov.info' \
+            '| Lines | 15 | 20 | 75.00% |'
+          check_coverage 'partial summary' 'partial' true \
+            'From partial/lcov.info' \
+            '| Branches | 3 | 4 | 75.00% |'
+          check_coverage 'unreadable lcov' 'junk' true none
+          check_coverage 'missing path' 'absent' false none
+
+          if [ "${errors}" != '0' ]; then
+            echo "Test reporting incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Test reporting correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
   # The node-metadata resolver decides which Node.js version each job
   # runs on, including the build/test split that lets a legacy
   # toolchain coexist with a modern pack/publish lane. Calling
