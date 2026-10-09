@@ -1652,8 +1652,14 @@ jobs:
           name: node-release-package
           path: 'attest'
 
-      # SLSA build provenance for the packed tarball; consumers verify
-      # with `gh attestation verify <tarball> --repo <owner/repo>`.
+      # SLSA build provenance for the packed tarball. The signer is
+      # this reusable workflow, not the caller, so `gh attestation
+      # verify` needs --signer-workflow naming merge.yaml, and
+      # --source-ref the caller run's GitHub ref: the pushed branch,
+      # or the ref a workflow_dispatch targeted, which need not be
+      # GERRIT_BRANCH. The README's "Verifying Release Artefacts
+      # (Model A)" section shows the form, with
+      # build-test-release.yaml in place of merge.yaml.
       #
       # actions/attest rather than actions/attest-build-provenance: as
       # of v4 the latter is a thin wrapper that forwards its inputs to
@@ -1709,8 +1715,13 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
 
-      # Keyless signing against the public Sigstore infrastructure;
-      # consumers verify with `cosign verify-blob --bundle`
+      # Keyless signing against the public Sigstore infrastructure.
+      # The certificate names this reusable workflow (merge.yaml), so
+      # cosign verify-blob needs the identity flags in the README's
+      # "Verifying Release Artefacts (Model A)" section, with merge.yaml
+      # in the identity regexp, and the caller run's GitHub ref and
+      # trigger as the workflow ref and trigger (as for the attest
+      # job's --source-ref above).
       - name: 'Sign tarball with Sigstore'
         shell: bash
         env:
