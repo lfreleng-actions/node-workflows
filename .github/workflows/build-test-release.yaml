@@ -73,6 +73,15 @@ on:
         required: false
         type: string
         default: ''
+      test_node_versions:
+        description: >-
+          Node.js versions to run the tests job on, one leg each: a
+          JSON array such as '["20", "22", "24"]', or a comma, space
+          or newline separated list (at most 10). Empty (the default)
+          runs one leg on test_node_version. Set one or the other.
+        required: false
+        type: string
+        default: ''
       build_tool:
         description: >-
           Build tool: 'npm' or 'yarn'. Empty (the default) auto-detects
@@ -507,8 +516,7 @@ jobs:
       build_tool: ${{ steps.resolve.outputs.build_tool }}
       # yamllint disable-line rule:line-length
       build_node_version: ${{ steps.resolve.outputs.build_node_version }}
-      # yamllint disable-line rule:line-length
-      test_node_version: ${{ steps.resolve.outputs.test_node_version }}
+      test_matrix: ${{ steps.resolve.outputs.test_matrix }}
       # yamllint disable-line rule:line-length
       has_lock_file: ${{ steps.build-metadata.outputs.javascript_has_lock_file }}
     permissions:
@@ -566,6 +574,7 @@ jobs:
           NODE_VERSION_INPUT: ${{ inputs.node_version }}
           BUILD_NODE_VERSION_INPUT: ${{ inputs.build_node_version }}
           TEST_NODE_VERSION_INPUT: ${{ inputs.test_node_version }}
+          TEST_NODE_VERSIONS_INPUT: ${{ inputs.test_node_versions }}
           BUILD_TOOL_INPUT: ${{ inputs.build_tool }}
           # yamllint disable-line rule:line-length
           DETECTED_PACKAGE_MANAGER: ${{ steps.build-metadata.outputs.javascript_package_manager }}
@@ -653,15 +662,98 @@ jobs:
           if [ -z "${test_node_version}" ]; then
             test_node_version="${node_version}"
           fi
+          # test_node_versions fans the tests job out, one leg per
+          # version. Each entry carries the node_version allowlist: it
+          # reaches setup-node, a job name and an artefact name. Both
+          # inputs set leaves the precedence unclear, so it is refused.
+          versions_input="${TEST_NODE_VERSIONS_INPUT}"
+          if [[ "${versions_input}" =~ ^[[:space:]]*$ ]]; then
+            versions_input=''
+          elif [ -n "${TEST_NODE_VERSION_INPUT}" ]; then
+            echo "::error::Set test_node_version or" \
+              "test_node_versions, not both"
+            exit 1
+          fi
+          versions=()
+          if [[ "${versions_input}" =~ ^[[:space:]]*\[ ]]; then
+            # A JSON array of strings or whole numbers, read back
+            # NUL-delimited so an entry holding a newline reaches the
+            # allowlist whole instead of splitting into two
+            if ! jq -es 'length == 1 and (.[0] | type == "array"
+                and all(.[]; type == "string"
+                  or (type == "number" and . == floor)))' \
+                <<< "${versions_input}" > /dev/null 2>&1; then
+              echo "::error::test_node_versions is not a JSON array" \
+                "of version strings"
+              exit 1
+            fi
+            mapfile -d '' versions < <(jq -j \
+              '.[] | tostring, "\u0000"' <<< "${versions_input}")
+          elif [ -n "${versions_input}" ] &&
+            [[ "${versions_input}" =~ (^|,)[[:space:]]*(,|$) ]]; then
+            # An empty field between commas is a typo, as "" is in JSON
+            echo "::error::test_node_versions has an empty entry"
+            exit 1
+          elif [ -n "${versions_input}" ]; then
+            # read -a splits without globbing, so lts/* stays literal
+            read -r -a versions <<< "${versions_input//[,$'\r\n\t']/ }"
+          fi
+          # Every value passed the allowlist, which admits no JSON
+          # metacharacter, so plain interpolation yields valid JSON
+          matrix_leg() {
+            printf '{"node_version":"%s","name":"%s","artifact":"%s"}' \
+              "$1" "$2" "$3"
+          }
+          test_matrix=''
+          declare -A slug_owner=()
+          for version in "${versions[@]}"; do
+            if [[ ! "${version}" =~ ^[A-Za-z0-9./*_-]+$ ]]; then
+              echo "::error::Invalid test_node_versions entry:" \
+                "'$(printf '%s' "${version}" | tr -d '\r\n')'"
+              exit 1
+            fi
+            # Artefact names reject / and *, so lts/* uploads as lts__
+            slug="${version//[^A-Za-z0-9._-]/_}"
+            owner="${slug_owner[${slug}]:-}"
+            if [ "${owner}" = "${version}" ]; then
+              echo "::notice::Ignoring duplicate test_node_versions" \
+                "entry ${version}"
+              continue
+            elif [ -n "${owner}" ]; then
+              echo "::error::test_node_versions entries ${owner} and" \
+                "${version} would share an artefact name"
+              exit 1
+            fi
+            slug_owner[${slug}]="${version}"
+            # Suffixed per leg: two uploads of one name in a run fail
+            test_matrix+="${test_matrix:+,}$(matrix_leg "${version}" \
+              "Tests (Node ${version})" "node-test-results-node-${slug}")"
+          done
+          if [ -z "${versions_input}" ]; then
+            # One leg keeps the job and artefact names callers already
+            # depend on, such as required checks and downloads by name
+            test_matrix="$(matrix_leg "${test_node_version}" 'Tests' \
+              'node-test-results')"
+          elif [ "${#slug_owner[@]}" -eq 0 ]; then
+            echo "::error::test_node_versions lists no versions"
+            exit 1
+          elif [ "${#slug_owner[@]}" -gt 10 ]; then
+            echo "::error::test_node_versions lists" \
+              "${#slug_owner[@]} versions; the limit is 10"
+            exit 1
+          fi
+          test_matrix="[${test_matrix}]"
           echo "Resolved Node.js version: ${node_version}"
           echo "Resolved build tool: ${build_tool}"
           echo "Build toolchain Node.js version: ${build_node_version}"
           echo "Test Node.js version: ${test_node_version}"
+          echo "Test matrix: ${test_matrix}"
           {
             echo "node_version=${node_version}"
             echo "build_tool=${build_tool}"
             echo "build_node_version=${build_node_version}"
             echo "test_node_version=${test_node_version}"
+            echo "test_matrix=${test_matrix}"
           } >> "$GITHUB_OUTPUT"
 
   tag-validate:
@@ -1126,7 +1218,10 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   tests:
-    name: 'Tests'
+    # One leg per resolved test version. Without test_node_versions
+    # the single leg keeps the 'Tests' name. A skipped job never
+    # expands its matrix, hence the fallback.
+    name: ${{ matrix.name || 'Tests' }}
     runs-on: 'ubuntu-latest'
     # Deferred until the audit operations (audit and Grype) pass, so
     # the expensive test suite is skipped when either audit step fails
@@ -1142,6 +1237,12 @@ jobs:
       - 'grype'
     # yamllint disable-line rule:line-length
     if: ${{ !cancelled() && needs.build.result == 'success' && (needs.audit.result == 'success' || (needs.audit.result == 'skipped' && !inputs.audit_enabled)) && (needs.sbom.result == 'success' || (needs.sbom.result == 'skipped' && !inputs.sbom_enabled)) && (needs.grype.result == 'success' || (needs.grype.result == 'skipped' && (!inputs.grype_enabled || !inputs.sbom_enabled))) && inputs.tests_enabled }}
+    # Every leg runs to completion; any failing leg fails the job,
+    # and with it the release gate in attach-artefacts
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.node-metadata.outputs.test_matrix) }}
     permissions:
       contents: read
     timeout-minutes: ${{ inputs.test_timeout_minutes }}
@@ -1193,8 +1294,9 @@ jobs:
         # false), disables failure propagation.
         # yamllint disable-line rule:line-length
         continue-on-error: ${{ inputs.test_permit_fail || vars.NO_BLOCK_AUDIT_FAIL == 'true' }}
+        # Each leg installs dependencies afresh under its own Node.js
         with:
-          node_version: ${{ needs.node-metadata.outputs.test_node_version }}
+          node_version: ${{ matrix.node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
           path_prefix: ${{ inputs.path_prefix }}
           scripts: ${{ inputs.test_script }}
@@ -1218,7 +1320,7 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: node-test-results
+          name: ${{ matrix.artifact }}
           path: ${{ inputs.path_prefix }}/${{ inputs.test_artifact_path }}
           retention-days: 7
           if-no-files-found: warn

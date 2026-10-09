@@ -140,6 +140,8 @@ jobs:
             # the fixture rather than reaching for a permit flag.
             audit_permit_fail: false
             grype_permit_fail: false
+            # Fans the tests job out, one leg per version
+            test_node_versions: '["22", "24"]'
           - name: 'sdc-onap-ui-common'
             repository: 'onap/sdc-onap-ui-common'
             ref: 'c305ee4240e368dd0b2238a4f39881a97bad6746'
@@ -154,6 +156,7 @@ jobs:
             audit_permit_fail: true
             # 2020-era dependencies trip the Grype severity gate
             grype_permit_fail: true
+            test_node_versions: ''
     permissions:
       contents: read
       pull-requests: read  # repository-metadata-action queries PR data
@@ -165,6 +168,7 @@ jobs:
       test_permit_fail: ${{ matrix.test_permit_fail }}
       audit_permit_fail: ${{ matrix.audit_permit_fail }}
       grype_permit_fail: ${{ matrix.grype_permit_fail }}
+      test_node_versions: ${{ matrix.test_node_versions }}
 
   # The publish-targets resolver is the one part of the merge and
   # build-test-release publish paths that CI can exercise: it reads
@@ -1653,11 +1657,12 @@ jobs:
           # Single-line metacharacters above cannot catch that.
           forged_version="$(printf '10\n::warning::forged')"
           for var in NODE_VERSION_INPUT BUILD_NODE_VERSION_INPUT \
-            TEST_NODE_VERSION_INPUT; do
+            TEST_NODE_VERSION_INPUT TEST_NODE_VERSIONS_INPUT; do
             set +e
             out="$(env \
               NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
-              TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
+              TEST_NODE_VERSION_INPUT='' TEST_NODE_VERSIONS_INPUT='' \
+              BUILD_TOOL_INPUT='' \
               DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE='' \
               "${var}=${forged_version}" \
               GITHUB_OUTPUT="${RUNNER_TEMP}/vout.txt" \
@@ -1679,6 +1684,96 @@ jobs:
             NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='lts/*' \
             TEST_NODE_VERSION_INPUT='' BUILD_TOOL_INPUT='' \
             DETECTED_PACKAGE_MANAGER='' DETECTED_REQUIRES_NODE=''
+
+          # The tests job fans out over test_matrix. $1 case, $2 the
+          # expected legs as node|name|artefact joined by commas, or
+          # 'reject'; then the inputs that differ from all-empty
+          check_matrix() {
+            local name="$1" want="$2"
+            shift 2
+            : > "${RUNNER_TEMP}/vout.txt"
+            set +e
+            out="$(env NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+              TEST_NODE_VERSION_INPUT='' TEST_NODE_VERSIONS_INPUT='' \
+              BUILD_TOOL_INPUT='' DETECTED_PACKAGE_MANAGER='' \
+              DETECTED_REQUIRES_NODE='' "$@" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/vout.txt" \
+              bash "${resolver}" 2>&1)"
+            rc=$?
+            set -e
+            if printf '%s' "${out}" | grep -q '^::warning::'; then
+              echo "${name}: input forged a workflow command ❌"
+              errors=1
+            fi
+            if [ "${want}" = 'reject' ]; then
+              if [ "${rc}" = "0" ] ||
+                ! printf '%s' "${out}" | grep -q '^::error::'; then
+                echo "${name}: expected a labelled rejection ❌"
+                errors=1
+              fi
+              return
+            fi
+            if [ "${rc}" != "0" ]; then
+              echo "${name}: resolver failed unexpectedly ❌"
+              printf '%s\n' "${out}" | tail -2
+              errors=1
+              return
+            fi
+            got="$(grep '^test_matrix=' "${RUNNER_TEMP}/vout.txt" \
+              | cut -d= -f2- | jq -r \
+              'map("\(.node_version)|\(.name)|\(.artifact)") | join(",")')"
+            if [ "${got}" != "${want}" ]; then
+              echo "${name}: got '${got}', expected '${want}' ❌"
+              errors=1
+            fi
+          }
+          # One fanned-out leg; $2 is the artefact suffix when the
+          # version holds characters artefact names reject
+          leg() {
+            printf '%s|Tests (Node %s)|node-test-results-node-%s' \
+              "$1" "$1" "${2:-$1}"
+          }
+          # Unset keeps the single leg, and the names callers know
+          check_matrix 'single leg by default' '22|Tests|node-test-results'
+          check_matrix 'single leg on test_node_version' \
+            '18|Tests|node-test-results' TEST_NODE_VERSION_INPUT='18'
+          check_matrix 'blank means unset' '22|Tests|node-test-results' \
+            TEST_NODE_VERSIONS_INPUT='  '
+          check_matrix 'JSON array' "$(leg 20),$(leg 22),$(leg 24)" \
+            TEST_NODE_VERSIONS_INPUT='["20", "22", "24"]'
+          check_matrix 'separated list' "$(leg 20),$(leg 22),$(leg 24)" \
+            TEST_NODE_VERSIONS_INPUT="$(printf '20, 22\n24')"
+          check_matrix 'whole numbers' "$(leg 20),$(leg 22)" \
+            TEST_NODE_VERSIONS_INPUT='[20, 22]'
+          check_matrix 'duplicates collapse' \
+            "$(leg 22),$(leg 'lts/*' lts__)" \
+            TEST_NODE_VERSIONS_INPUT='["22", "22", "lts/*"]'
+          check_matrix 'both version inputs' reject \
+            TEST_NODE_VERSION_INPUT='18' TEST_NODE_VERSIONS_INPUT='20'
+          check_matrix 'empty entry' reject \
+            TEST_NODE_VERSIONS_INPUT='["22", ""]'
+          check_matrix 'empty list field' reject \
+            TEST_NODE_VERSIONS_INPUT='20,,22'
+          check_matrix 'trailing comma' reject \
+            TEST_NODE_VERSIONS_INPUT='20, 22,'
+          check_matrix 'empty array' reject TEST_NODE_VERSIONS_INPUT='[]'
+          check_matrix 'separators only' reject \
+            TEST_NODE_VERSIONS_INPUT=' , '
+          check_matrix 'fractional number' reject \
+            TEST_NODE_VERSIONS_INPUT='[22.5]'
+          check_matrix 'malformed JSON' reject \
+            TEST_NODE_VERSIONS_INPUT='["22"'
+          check_matrix 'object entry' reject \
+            TEST_NODE_VERSIONS_INPUT='[{"v": 22}]'
+          check_matrix 'unsafe entry' reject \
+            TEST_NODE_VERSIONS_INPUT='["22; whoami"]'
+          # A JSON escape carries a newline past the list splitting
+          check_matrix 'escaped newline' reject \
+            TEST_NODE_VERSIONS_INPUT='["10\n::warning::forged"]'
+          check_matrix 'artefact name clash' reject \
+            TEST_NODE_VERSIONS_INPUT='["lts/*", "lts_*"]'
+          check_matrix 'over the cap' reject \
+            TEST_NODE_VERSIONS_INPUT='1 2 3 4 5 6 7 8 9 10 11'
 
           if [ "${errors}" != "0" ]; then
             echo "Node.js version resolution tests failed ❌" \
@@ -1710,7 +1805,7 @@ jobs:
               ('build-test.yaml', 'build', 'Build project'):
                   'build_node_version',
               ('build-test.yaml', 'tests', 'Run tests'):
-                  'test_node_version',
+                  'matrix.node_version',
               ('build-test.yaml', 'audit', 'Audit dependencies'):
                   'node_version',
               ('merge.yaml', 'build', 'Build project'):
@@ -1728,7 +1823,7 @@ jobs:
               ('build-test-release.yaml', 'build',
                'Restore the publish Node.js'): 'node_version',
               ('build-test-release.yaml', 'tests', 'Run tests'):
-                  'test_node_version',
+                  'matrix.node_version',
               ('build-test-release.yaml', 'audit', 'Audit dependencies'):
                   'node_version',
               ('build-test-release.yaml', 'nexus-publish',
@@ -1738,6 +1833,7 @@ jobs:
           PATTERN = re.compile(
               r'needs\.node-metadata\.outputs\.'
               r'((?:build_|test_)?node_version)'
+              r'|(matrix\.node_version)'
           )
 
           found = {}
@@ -1753,7 +1849,10 @@ jobs:
               for job_id, job in doc['jobs'].items():
                   for step in job.get('steps') or []:
                       blob = yaml.safe_dump(step)
-                      used = sorted(set(PATTERN.findall(blob)))
+                      used = sorted({
+                          output or leg
+                          for output, leg in PATTERN.findall(blob)
+                      })
                       if not used:
                           continue
                       key = (name, job_id, step.get('name'))
@@ -1782,6 +1881,19 @@ jobs:
                   )
               else:
                   errors.append(f'{where} reads {got}, expected {want}')
+
+          # The tests legs read matrix.node_version, so the matrix
+          # itself has to come from the resolver, and one failing leg
+          # must not cancel the others.
+          for name in ('build-test.yaml', 'build-test-release.yaml'):
+              strategy = jobs[name]['tests'].get('strategy') or {}
+              include = str((strategy.get('matrix') or {}).get('include'))
+              if 'needs.node-metadata.outputs.test_matrix' not in include:
+                  errors.append(
+                      f'{name} tests matrix does not read test_matrix'
+                  )
+              if strategy.get('fail-fast') is not False:
+                  errors.append(f'{name} tests job lacks fail-fast: false')
 
           # The build job in build-test-release.yaml packs the tarball
           # itself, and node-build-action runs setup-node internally --

@@ -182,6 +182,7 @@ yields registry-native provenance too.
 | `node_version`            | string  | `''`       | Node.js version; empty auto-detects `engines.node`, then 22                    |
 | `build_node_version`      | string  | `''`       | Node.js for jobs running the project's toolchain; empty follows `node_version` |
 | `test_node_version`       | string  | `''`       | Node.js for the tests job; empty follows `node_version`                        |
+| `test_node_versions`      | string  | `''`       | Node.js versions to test on, one leg each; JSON array or list, at most 10      |
 | `build_tool`              | string  | `''`       | `npm` or `yarn`; empty auto-detects from project metadata                      |
 | `build_scripts`           | string  | `'build'`  | package.json script(s) the build job runs                                      |
 | `tests_enabled`           | boolean | `true`     | Run the tests job (set false to skip tests)                                    |
@@ -309,6 +310,7 @@ own toolchain**, leaving everything else on `node_version`:
 | -------------------- | --------------------------------------- | ---------------------- |
 | `build_node_version` | the `build` job                         | follow `node_version`  |
 | `test_node_version`  | the `tests` job (not in `merge.yaml`)   | follow `node_version`  |
+| `test_node_versions` | one `tests` leg per version (likewise)  | one leg, as above      |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -355,6 +357,38 @@ Splitting the two lets such a project adopt these workflows:
 The overrides accept the same forms as `node_version`, including
 aliases such as `lts/*`, and share its character set — these values
 reach `actions/setup-node` and the job summary.
+
+### Testing across Node.js versions
+
+A library supporting more than one Node.js major can test on each.
+`test_node_versions` fans the `tests` job out, one leg per version:
+
+```yaml
+    with:
+      test_node_versions: '["20", "22", "24"]'
+```
+
+- It takes a JSON array or a comma, space or newline separated list of
+  up to 10 versions. Entries share the forms and character set of
+  `node_version`, and the workflow drops duplicates. It rejects an
+  empty entry, such as `""` or the field in `20,,22`.
+- Set `test_node_version` or `test_node_versions`, not both: the
+  workflow rejects the pair rather than pick one.
+- Each leg checks out the source and installs dependencies afresh
+  under its own Node.js before running `test_script`. It does not
+  reuse the `build` job's toolchain (`build_node_version`).
+- Legs run with `fail-fast: false`, so every version reports. Any
+  failing leg fails the `tests` job, and with it the workflow (and, in
+  `build-test-release.yaml`, the release). `test_permit_fail` applies
+  to each leg.
+- Build, audit, SBOM, pack and publish stay on a single version.
+- Legs carry the version in their names, such as `Tests (Node 22)`:
+  update any required status checks naming `Tests`. Likewise
+  `test_artifact_path` uploads `node-test-results-node-<version>` per
+  leg, with `/` and `*` replaced by `_`.
+
+Left empty, the job runs once as before, keeping the `Tests` name and
+the `node-test-results` artefact.
 
 ## Publish Targets
 
