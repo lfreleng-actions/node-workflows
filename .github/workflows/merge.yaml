@@ -173,6 +173,15 @@ on:
         required: false
         type: boolean
         default: false
+      release_only:
+        description: >-
+          Recovery mode: publish the release and skip the snapshot
+          lane. Dispatch it at a release commit (ref, or the release
+          change's gerrit_refspec) to publish a release a merge run
+          missed; the run fails if that commit adds no release file.
+        required: false
+        type: boolean
+        default: false
 
       # --- Runner hardening ---
       harden_runner_egress:
@@ -891,6 +900,10 @@ jobs:
   resolve-snapshot-targets:
     name: 'Resolve Snapshot Targets'
     needs: gerrit-validate
+    # A release_only recovery run publishes no snapshot. Skipping the
+    # resolver skips snapshot-publish, which requires its success, and
+    # spares the recovery a snapshot configuration it never uses.
+    if: ${{ !inputs.release_only }}
     permissions:
       contents: read
     uses: $/.github/workflows/publish-targets.yaml
@@ -1236,6 +1249,20 @@ jobs:
           fi
           echo "Release version verified: ${RELEASE_VERSION}"
 
+      # release_only exists to publish a release, so a recovery run at
+      # a commit that adds no release file is a wrong commit, not a
+      # quiet success: it would skip the snapshot, publish nothing and
+      # still go green.
+      - name: 'Require a release file in recovery mode'
+        if: inputs.release_only && steps.detect.outputs.has_release != 'true'
+        shell: bash
+        run: |
+          # Refuse a release_only run with nothing to release
+          echo "::error::release_only is set, but the commit adds no" \
+            "release file under releases/. Dispatch the recovery at" \
+            "the commit that added it."
+          exit 1
+
   release-publish:
     # The leg name comes from the target, so a failed check names the
     # registry that failed rather than leaving the reader to open it.
@@ -1430,6 +1457,292 @@ jobs:
           credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
           export_env: 'false'
 
+      # The registry check below reads with the leg's own credential:
+      # Nexus repositories often refuse anonymous reads, and a refused
+      # read has to fail the leg rather than pass for an absent version.
+      # The file lands in RUNNER_TEMP, outside the project tree, so it
+      # neither replaces the project's .npmrc (node-publish-action
+      # resolves the registry from it) nor sits where npm packs; the
+      # action scrubs it after the job. A dry run has no credential and
+      # reads anonymously.
+      - name: 'Configure registry read access'
+        id: read-npmrc
+        if: steps.creds.outputs.available == 'true'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/node-create-npmrc-action@e0ff8adfc0591c86d8d07828bffab10f43096155  # v0.2.0
+        with:
+          registry_url: ${{ matrix.target.registry_url }}
+          nexus_user: ${{ steps.publish-params.outputs.nexus_user }}
+          # yamllint disable-line rule:line-length
+          nexus_password: ${{ matrix.target.auth == 'nexus' && steps.load-credential.outputs.credential || '' }}
+          # yamllint disable-line rule:line-length
+          auth_token: ${{ matrix.target.auth == 'token' && steps.load-credential.outputs.credential || '' }}
+          path: ${{ runner.temp }}/registry-check
+
+      # The check asks npm where the package publishes, and npm's
+      # answer depends on its release (npm 8 honours settings later
+      # releases discard), so it runs under the Node.js the publish
+      # uses rather than whichever one the runner image carries.
+      - name: 'Set up Node.js'
+        if: steps.creds.outputs.available == 'true' || inputs.dry_run
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ needs.node-metadata.outputs.node_version }}
+          # setup-node v5+ caches npm unasked when package.json names
+          # it as packageManager; a release lane must not (CWE-349)
+          package-manager-cache: false
+
+      # npm never overwrites a version (EPUBLISHCONFLICT), so without
+      # this a re-run fails on every target that already took the
+      # release, and cannot finish the ones that did not. The check
+      # makes the leg re-runnable: the registry holding identical bytes
+      # means this leg's work is done; different bytes fail the leg;
+      # only a definite absence (E404) publishes. Any other read error
+      # fails a live run rather than publishing blind.
+      #
+      # Identical means the integrity of the staged tarball, the exact
+      # archive the publish step hands npm. "Re-run failed jobs" reuses
+      # it; re-running every job repacks it, and a build that is not
+      # byte-reproducible then fails on targets holding the first pack.
+      #
+      # This lives in the workflow until node-publish-action can do it
+      # itself (lfreleng-actions/node-publish-action#80); the step is
+      # self-contained so that an action input can replace it. The
+      # script is extracted and exercised by testing.yaml's
+      # release-registry-check job.
+      - name: 'Check the registry for this release'
+        id: registry-check
+        # yamllint disable-line rule:line-length
+        if: steps.creds.outputs.available == 'true' || inputs.dry_run
+        shell: bash
+        env:
+          # yamllint disable-line rule:line-length
+          TARBALL: pack-dist/${{ needs.pack-release.outputs.tarball_name }}
+          PUBLISH_VERSION: ${{ needs.resolve-version.outputs.version }}
+          REGISTRY_URL: ${{ matrix.target.registry_url }}
+          TARGET_NAME: ${{ matrix.target.name }}
+          PROJECT_DIR: ${{ inputs.path_prefix }}
+          NPMRC_PATH: ${{ steps.read-npmrc.outputs.npmrc_path }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # Check whether the registry already holds this release
+          if [ ! -f "${TARBALL}" ]; then
+            echo "::error::Release tarball not found: ${TARBALL}"
+            exit 1
+          fi
+          # npm trims whitespace around the name before publishing, so
+          # the check reads the name npm sends. The version is compared
+          # raw, as node-publish-action compares it.
+          if ! manifest="$(tar -xzOf "${TARBALL}" package/package.json)" \
+            || ! name="$(jq -r '.name // empty | if type == "string"
+                then gsub("^\\s+|\\s+$"; "") else . end' \
+                <<< "${manifest}")" \
+            || ! version="$(jq -r '.version // empty' <<< "${manifest}")"; then
+            echo "::error::Cannot read package.json from ${TARBALL}"
+            exit 1
+          fi
+          name_re='^(@[A-Za-z0-9~][A-Za-z0-9._~-]*/)?'
+          name_re+='[A-Za-z0-9~][A-Za-z0-9._~-]*$'
+          if [[ ! "${name}" =~ ${name_re} ]]; then
+            echo "::error::Unusable package name in ${TARBALL}"
+            exit 1
+          fi
+          if [ "${version}" != "${PUBLISH_VERSION}" ]; then
+            echo "::error::${TARBALL} holds version ${version}, not" \
+              "${PUBLISH_VERSION}"
+            exit 1
+          fi
+          spec="${name}@${version}"
+
+          # node-publish-action publishes wherever npm would, and this
+          # check reads registry_url, so it can vouch only for a publish
+          # landing there. This mirrors npm's pickRegistry: the
+          # package's own scope, then the configured scope, then
+          # --registry, with publishConfig flattened over the project's
+          # npm configuration (a present but empty key masks it). Any
+          # other destination publishes unchecked, as before the check
+          # existed. The destination is not printed: it is project
+          # configuration, and could carry a credential.
+          target="${REGISTRY_URL%/}"
+          # $1 key: publishConfig's value if present, else the project
+          # configuration's; empty when neither sets it. npm treats a
+          # null or false value as unset, so they read as empty too.
+          # The project's comes from config list --json, not config
+          # get: from npm 9, config get prints a scope=null publish
+          # ignores as the scope 'null'. --no-workspaces as the publish
+          # passes it: inside a workspace, npm otherwise reads another
+          # project's configuration.
+          setting() {
+            local found
+            found="$(jq -r --arg k "$1" '(.publishConfig // {})
+              | if type == "object" and has($k)
+                then "=" + (.[$k] | if . == null or . == false
+                  then "" else tostring end)
+                else "" end' \
+              <<< "${manifest}")" || return 1
+            if [ -n "${found}" ]; then
+              printf '%s\n' "${found#=}"
+              return 0
+            fi
+            jq -r --arg k "$1" '.[$k] | if . == null or . == false
+              then "" else tostring end' <<< "${npm_config}"
+          }
+          effective_registry() {
+            local registry='' scope=''
+            if [[ "${name}" == @*/* ]]; then
+              registry="$(setting "${name%%/*}:registry")" || return 1
+            fi
+            if [ -z "${registry}" ]; then
+              scope="$(setting scope)" || return 1
+            fi
+            if [ -z "${registry}" ] && [ -n "${scope}" ]; then
+              registry="$(setting "@${scope#@}:registry")" || return 1
+            fi
+            if [ -z "${registry}" ]; then
+              # From npm 10.5.2 the --registry node-publish-action
+              # passes beats publishConfig.registry; before it the
+              # latter wins, and empty means npm's default. Only a
+              # value naming the target is right on both sides.
+              registry="$(jq -r '(.publishConfig // {})
+                | if type == "object" and has("registry")
+                  then (.registry | tostring) else env.REGISTRY_URL end
+                | if . == "" then "npm-default" else . end' \
+                <<< "${manifest}")" || return 1
+            fi
+            printf '%s\n' "${registry}"
+          }
+          if ! npm_config="$(cd "${PROJECT_DIR}" \
+              && npm config list --json --no-workspaces)" \
+            || ! effective="$(effective_registry)"; then
+            echo "::error::Cannot read the registry settings for ${spec}"
+            exit 1
+          fi
+          if [ "${effective%/}" != "${target}" ]; then
+            echo "::warning::${spec}'s npm configuration publishes it" \
+              "somewhere other than ${TARGET_NAME}'s registry_url;" \
+              "publishing without checking for an existing copy"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A neutral directory and an explicit userconfig, so no
+          # project or runner .npmrc redirects the read. The package's
+          # own scope is pinned too: npm prefers a scoped registry
+          # setting over --registry.
+          userconfig="${NPMRC_PATH:-/dev/null}"
+          workdir="$(mktemp -d)"
+          trap 'rm -rf -- "${workdir}"' EXIT
+          set -- "${spec}" dist --json --prefer-online \
+            --registry "${REGISTRY_URL}" --userconfig "${userconfig}"
+          if [[ "${name}" == @*/* ]]; then
+            set -- "$@" "--${name%%/*}:registry=${REGISTRY_URL}"
+          fi
+          set +e
+          (cd "${workdir}" && npm view "$@") \
+            > "${workdir}/view.out" 2> "${workdir}/view.err"
+          rc=$?
+          set -e
+
+          if [ "${rc}" = '0' ]; then
+            # npm before 7 reports a missing version as empty output
+            if grep -q '[^[:space:]]' "${workdir}/view.out"; then
+              state='present'
+            else
+              state='absent'
+            fi
+          else
+            code="$(jq -r '(.error.code)? // empty' "${workdir}/view.out" \
+              2> /dev/null || true)"
+            if [ -z "${code}" ]; then
+              code="$(grep -oE '^npm (ERR!|error) code [A-Z0-9_]+' \
+                "${workdir}/view.err" | head -n 1 || true)"
+              code="${code##* }"
+            fi
+            if [ "${code}" = 'E404' ]; then
+              state='absent'
+            else
+              head -n 20 "${workdir}/view.err" >&2
+              if [ "${DRY_RUN}" = 'true' ]; then
+                echo "::warning::Could not read ${spec} from" \
+                  "${TARGET_NAME} (${code:-exit ${rc}}); a dry run" \
+                  "publishes nothing, so rehearsing anyway"
+                echo "publish=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::error::Could not read ${spec} from" \
+                "${TARGET_NAME} (${code:-exit ${rc}}); refusing to" \
+                "publish without knowing whether it is already there"
+              exit 1
+            fi
+          fi
+
+          if [ "${state}" = 'absent' ]; then
+            echo "${spec} is not on ${TARGET_NAME}; publishing"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! remote_integrity="$(jq -r '.integrity // empty' \
+              "${workdir}/view.out")" \
+            || ! remote_shasum="$(jq -r '.shasum // empty' \
+              "${workdir}/view.out")"; then
+            echo "::error::Unreadable registry metadata for ${spec}"
+            exit 1
+          fi
+          local_sha512="sha512-$(openssl dgst -sha512 -binary "${TARBALL}" \
+            | openssl base64 -A)"
+          local_sha1="$(openssl dgst -sha1 -r "${TARBALL}")"
+          local_sha1="${local_sha1%% *}"
+
+          # SRI integrity may list several digests; sha512 decides
+          # when present, and the legacy sha1 shasum otherwise. The
+          # pair that decided is the pair a mismatch reports.
+          verdict=''
+          remote_digest=''
+          local_digest="${local_sha512}"
+          read -ra digests <<< "${remote_integrity}"
+          for digest in "${digests[@]}"; do
+            case "${digest}" in
+              sha512-*)
+                [ -n "${verdict}" ] || verdict='different'
+                remote_digest="${digest%%\?*}"
+                if [ "${digest%%\?*}" = "${local_sha512}" ]; then
+                  verdict='identical'
+                fi
+                ;;
+            esac
+          done
+          if [ -z "${verdict}" ] && [ -n "${remote_shasum}" ]; then
+            verdict='different'
+            remote_digest="sha1 ${remote_shasum,,}"
+            local_digest="sha1 ${local_sha1}"
+            if [ "${remote_shasum,,}" = "${local_sha1}" ]; then
+              verdict='identical'
+            fi
+          fi
+
+          case "${verdict}" in
+            identical)
+              msg="${spec} is already on ${TARGET_NAME} with identical"
+              msg="${msg} content; not publishing it again"
+              echo "::notice::${msg}"
+              echo "${msg} ✅" >> "$GITHUB_STEP_SUMMARY"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            different)
+              echo "::error::${TARGET_NAME} already holds ${spec} with" \
+                "different content, and npm cannot overwrite a version." \
+                "Registry: ${remote_digest}; this run: ${local_digest}"
+              exit 1
+              ;;
+            *)
+              echo "::error::${TARGET_NAME} holds ${spec} but reports no" \
+                "sha512 integrity or shasum to compare against"
+              exit 1
+              ;;
+          esac
+
       # provenance stays false because Nexus npm repositories have no
       # registry-native provenance support. Release-grade provenance
       # comes from the attest and sign-artefacts jobs instead, which
@@ -1445,9 +1758,9 @@ jobs:
       - name: 'Publish release'
         # A dry run publishes nothing and needs no credential, so it
         # runs node-publish-action's dry run even without secrets
-        # (#121).
+        # (#121). A target already holding this release is skipped.
         # yamllint disable-line rule:line-length
-        if: steps.creds.outputs.available == 'true' || inputs.dry_run
+        if: (steps.creds.outputs.available == 'true' || inputs.dry_run) && steps.registry-check.outputs.publish == 'true'
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/node-publish-action@f16a8028741af0092c72f4a24f6626d9c2afb54b  # v0.2.1
         with:
