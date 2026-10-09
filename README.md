@@ -196,6 +196,7 @@ yields registry-native provenance too.
 | `grype_enabled`           | boolean | `true`     | Run the Grype scan (set false to keep the SBOM but skip the scan)              |
 | `grype_fail_on`           | string  | `'medium'` | Severity threshold that fails the Grype scan                                   |
 | `grype_permit_fail`       | boolean | `false`    | Permit Grype findings without failing the job                                  |
+| `grype_gate_when`         | string  | `'always'` | `always`, or `dependencies-changed`; see [Grype gating](#grype-gating)         |
 | `build_timeout_minutes`   | number  | `15`       | Timeout (minutes) for the build job                                            |
 | `test_timeout_minutes`    | number  | `10`       | Timeout (minutes) for the tests job                                            |
 | `audit_timeout_minutes`   | number  | `10`       | Timeout (minutes) for the audit, SBOM and Grype jobs                           |
@@ -210,10 +211,41 @@ yields registry-native provenance too.
 
 The workflow takes no secrets and exposes no outputs.
 
+#### Grype gating
+
+With `grype_gate_when: dependencies-changed`, Grype still scans and
+reports every finding. Findings at or above `grype_fail_on` block the
+job when the change touched the dependency chain, and otherwise appear
+as warnings. The `sbom` job decides this by comparing the
+change with its base for any of `package.json`, `package-lock.json`,
+`npm-shrinkwrap.json`, `yarn.lock`, `.yarnrc.yml`, `pnpm-lock.yaml`,
+`pnpm-workspace.yaml`, `bun.lock` or `bun.lockb`, at any depth inside
+`path_prefix` or directly in a directory above it, where a workspace
+root keeps its lockfile.
+
+The base is the first parent of GitHub's merge commit on
+`pull_request`, the parent of the change on Gerrit, and
+`github.event.before` on `push` when the checkout holds it: a push of
+one commit, such as a merged pull request. Anything else leaves the
+answer unresolved and the gate on. That covers scheduled and manual
+runs, other events, a `repository` or `ref` naming something other
+than the triggering commit, a push of commits the shallow checkout
+did not fetch, and a `path_prefix` that is missing or passes through a
+symlink, which a change could retarget.
+
+`grype_permit_fail` and the `NO_BLOCK_AUDIT_FAIL` variable apply on top
+of the gate: either passes the job even when the gate blocks. A
+repository that sets `grype_permit_fail: true` to tolerate inherited
+advisories can instead set `grype_gate_when: dependencies-changed`, and
+still block a change that adds a vulnerable dependency.
+`build-test-release.yaml` does not take this input: a release always
+gates.
+
 ### build-test-release.yaml
 
-All `build-test.yaml` inputs above (with `build_timeout_minutes` and
-`test_timeout_minutes` both defaulting to `12`), plus:
+All `build-test.yaml` inputs above except `grype_gate_when` (with
+`build_timeout_minutes` and `test_timeout_minutes` both defaulting to
+`12`), plus:
 
 <!-- markdownlint-disable MD013 -->
 
