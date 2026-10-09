@@ -666,6 +666,187 @@ jobs:
           echo "Publish target wiring correct ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
+      # merge.yaml's workflow_call outputs (#123) are read only by
+      # callers, so nothing in this repository fails when one points at
+      # a job or job output that no longer exists: the caller just
+      # receives ''. Read the wiring instead, through to the step that
+      # writes each value, and hold the gating rules the README
+      # documents for skipped and failed jobs.
+      - name: 'Assert merge outputs map to job outputs'
+        shell: bash
+        run: |
+          # Assert merge outputs map to job outputs
+          python3 - <<'PY'
+          import re
+          import sys
+
+          import yaml
+
+          WANTED = {
+              'commit', 'snapshot_version', 'snapshot_published',
+              'snapshot_target_names', 'has_release', 'release_version',
+              'release_published', 'release_target_names',
+              'release_tarball_sha256', 'attestation_url',
+          }
+          # Derived from a matrix job's aggregate result; a dry run
+          # uploads nothing, so it must never report a publish.
+          PUBLISHED = {
+              'snapshot_published': 'snapshot-publish',
+              'release_published': 'release-publish',
+          }
+          JOB_OUT = re.compile(
+              r'jobs\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)'
+          )
+          JOB_RESULT = re.compile(
+              r'fromJSON\(toJSON\(jobs\.([A-Za-z0-9_-]+)\)\)\.result'
+          )
+          # actions/runner#3087: a direct jobs.<id>.result can read ''
+          # in workflow_call outputs, which would silently zero every
+          # gate; the toJSON/fromJSON round trip reads it reliably.
+          DIRECT_RESULT = re.compile(r'jobs\.[A-Za-z0-9_-]+\.result')
+          STEP_REF = re.compile(r'steps\.([A-Za-z0-9_-]+)\.outputs\.')
+
+          def gate(job_id):
+              return (f'fromJSON(toJSON(jobs.{job_id})).result'
+                      " == 'success'")
+
+          def load(path):
+              with open(path) as handle:
+                  doc = yaml.safe_load(handle)
+              # PyYAML reads a bare 'on' key as the boolean True
+              return doc, doc.get('on', doc.get(True)) or {}
+
+          def call_outputs(on):
+              return (on.get('workflow_call') or {}).get('outputs') or {}
+
+          errors = []
+
+          def trace(wf, jobs, job_id, field, where):
+              # Follow jobs.<job_id>.outputs.<field> down to the step
+              # that writes it, through called reusable workflows.
+              job = jobs.get(job_id)
+              if job is None:
+                  errors.append(f'{where}: {wf} has no job {job_id}')
+                  return
+              # Matrix legs overwrite each other's outputs, so a
+              # matrix job's outputs describe one arbitrary leg.
+              if (job.get('strategy') or {}).get('matrix'):
+                  errors.append(
+                      f'{where} reads outputs of matrix job '
+                      f'{wf}/{job_id}; use its result instead'
+                  )
+              if 'uses' in job:
+                  # Local reusable workflow: './' or '$/' prefix
+                  path = re.sub(r'^[.$]/', '', str(job['uses']))
+                  called, called_on = load(path)
+                  declared = call_outputs(called_on)
+                  if field not in declared:
+                      errors.append(
+                          f'{where} reads {wf}/{job_id}.outputs.{field}, '
+                          f'which {path} does not declare'
+                      )
+                      return
+                  value = str((declared[field] or {}).get('value', ''))
+                  refs = JOB_OUT.findall(value)
+                  if not refs:
+                      errors.append(
+                          f'{where}: {path} output {field} reads no '
+                          'job output'
+                      )
+                  for inner_job, inner_field in refs:
+                      trace(path, called.get('jobs') or {}, inner_job,
+                            inner_field, where)
+                  return
+              declared = job.get('outputs') or {}
+              if field not in declared:
+                  errors.append(
+                      f'{where} reads {wf}/{job_id}.outputs.{field}, '
+                      'which that job does not declare'
+                  )
+                  return
+              step_ids = {s.get('id') for s in job.get('steps') or []}
+              step_refs = STEP_REF.findall(str(declared[field]))
+              if not step_refs:
+                  errors.append(
+                      f'{where}: {wf}/{job_id} output {field} reads '
+                      'no step output'
+                  )
+              for step_id in step_refs:
+                  if step_id not in step_ids:
+                      errors.append(
+                          f'{where}: {wf}/{job_id} output {field} reads '
+                          f'missing step {step_id}'
+                      )
+
+          doc, triggers = load('.github/workflows/merge.yaml')
+          jobs = doc['jobs']
+          outputs = call_outputs(triggers)
+          missing = WANTED - set(outputs)
+          if missing:
+              errors.append(f'merge.yaml lacks outputs {sorted(missing)}')
+
+          for name, spec in outputs.items():
+              where = f'merge.yaml output {name}'
+              spec = spec or {}
+              if not str(spec.get('description', '')).strip():
+                  errors.append(f'{where} has no description')
+              value = str(spec.get('value', ''))
+              if DIRECT_RESULT.search(value):
+                  errors.append(
+                      f'{where} reads jobs.<id>.result directly, which '
+                      'can read empty (actions/runner#3087); use '
+                      'fromJSON(toJSON(jobs.<id>)).result'
+                  )
+              out_refs = JOB_OUT.findall(value)
+              result_refs = JOB_RESULT.findall(value)
+              if not out_refs and not result_refs:
+                  errors.append(f'{where} reads no job')
+              for job_id in result_refs:
+                  if job_id not in jobs:
+                      errors.append(f'{where} reads missing job {job_id}')
+              for job_id, field in out_refs:
+                  # A failed job keeps the outputs it wrote, so each
+                  # value must be gated on its job succeeding.
+                  if gate(job_id) not in value:
+                      errors.append(
+                          f'{where} is not gated on {gate(job_id)}'
+                      )
+                  trace('merge.yaml', jobs, job_id, field, where)
+
+          for name, job_id in PUBLISHED.items():
+              value = str((outputs.get(name) or {}).get('value', ''))
+              if gate(job_id) not in value:
+                  errors.append(
+                      f'merge.yaml output {name} does not derive from '
+                      f'the {job_id} result'
+                  )
+              if '!inputs.dry_run' not in value:
+                  errors.append(
+                      f'merge.yaml output {name} reports a dry run '
+                      'as published'
+                  )
+
+          # The Gerrit example reports these outputs on the change; a
+          # name it reads that merge.yaml does not declare reports ''.
+          with open('examples/merge/gerrit.yaml') as handle:
+              example = handle.read()
+          for name in sorted(set(re.findall(
+                  r'needs\.merge\.outputs\.([A-Za-z0-9_-]+)', example))):
+              if name not in outputs:
+                  errors.append(
+                      f'examples/merge/gerrit.yaml reads undeclared '
+                      f'merge output {name}'
+                  )
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('Merge output wiring incorrect \u274c')
+
+          print('Merge output wiring correct \u2705')
+          PY
+          echo "Merge output wiring correct ✅" >> "$GITHUB_STEP_SUMMARY"
+
 
   publish-targets-rejections:
     name: 'Test: publish targets (rejections)'

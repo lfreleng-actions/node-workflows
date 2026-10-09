@@ -30,6 +30,9 @@
 #     replication: a mirror that has not caught up yet cannot change
 #     what the run builds. An older release builds the mirror's branch
 #     tip, and the run can build the commit before this change.
+#   * The report comment reads merge.yaml's outputs, which releases
+#     after v0.7.4 provide. Against an older release every output is
+#     empty and the comment reports nothing published.
 #   * Set the repository variables GERRIT_SERVER, GERRIT_SSH_USER,
 #     GERRIT_KNOWN_HOSTS, GERRIT_URL, the secret GERRIT_SSH_PRIVKEY, and
 #     (for Nexus publishing) the secrets OP_SERVICE_ACCOUNT_TOKEN and
@@ -116,6 +119,7 @@ jobs:
   # Comment on the merged change so the merge pipeline start is visible
   # in Gerrit (comment-only: the change already merged, so no vote).
   notify:
+    name: 'Notify Gerrit'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -220,16 +224,23 @@ jobs:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
       VAULT_MAPPING_JSON: ${{ secrets.VAULT_MAPPING_JSON }}
 
-  # Report the overall workflow conclusion back to Gerrit as a comment
-  # (comment-only: merge pipelines never vote).
+  # Report the outcome back to Gerrit as a comment (comment-only: merge
+  # pipelines never vote). The comment names what the run published,
+  # read from merge.yaml's outputs, so a release change that published
+  # nothing is plain on the change itself rather than hidden behind a
+  # green run. gerrit-review-action posts a fixed status line and takes
+  # no message, so this job posts its own comment over SSH.
+  #
+  # Every value the comment interpolates is held to a character set
+  # that cannot close the quoted --message argument, and an output
+  # that fails the check is reported as unavailable rather than sent.
   report:
+    name: 'Report to Gerrit'
     if: always()
     needs: [notify, merge]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # workflow-conclusion queries the Actions API to list run jobs
-      actions: read
     timeout-minutes: 5
     steps:
       - name: 'Harden runner'
@@ -237,18 +248,123 @@ jobs:
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
-      - name: 'Get conclusion'
+      - name: 'Install Gerrit SSH key'
         # yamllint disable-line rule:line-length
-        uses: im-open/workflow-conclusion@8eac7f17381a6917bc04fec3e2c92e70ebc37526  # v3.0.0
-      - name: 'Report conclusion'
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/gerrit-review-action@1e3eae766b3de755a2e87aa216cedebbaf9c8292  # v1.1.3
+        uses: shimataro/ssh-key-action@87a8f067114a8ce263df83e9ed5c849953548bc3  # v2.8.1
         with:
-          host: ${{ vars.GERRIT_SERVER }}
-          username: ${{ vars.GERRIT_SSH_USER }}
           key: ${{ secrets.GERRIT_SSH_PRIVKEY }}
+          name: 'gerrit_report'
           known_hosts: ${{ vars.GERRIT_KNOWN_HOSTS }}
-          gerrit-change-number: ${{ inputs.GERRIT_CHANGE_NUMBER }}
-          gerrit-patchset-number: ${{ inputs.GERRIT_PATCHSET_NUMBER }}
-          vote-type: ${{ env.WORKFLOW_CONCLUSION }}
-          comment-only: 'true'
+      - name: 'Report outcome'
+        shell: bash
+        env:
+          RESULT: ${{ needs.merge.result }}
+          SNAPSHOT_VERSION: ${{ needs.merge.outputs.snapshot_version }}
+          # yamllint disable-line rule:line-length
+          SNAPSHOT_PUBLISHED: ${{ needs.merge.outputs.snapshot_published }}
+          # yamllint disable-line rule:line-length
+          SNAPSHOT_TARGETS: ${{ needs.merge.outputs.snapshot_target_names }}
+          HAS_RELEASE: ${{ needs.merge.outputs.has_release }}
+          RELEASE_VERSION: ${{ needs.merge.outputs.release_version }}
+          RELEASE_PUBLISHED: ${{ needs.merge.outputs.release_published }}
+          # yamllint disable-line rule:line-length
+          RELEASE_TARGETS: ${{ needs.merge.outputs.release_target_names }}
+          GERRIT_SERVER: ${{ vars.GERRIT_SERVER }}
+          GERRIT_SSH_USER: ${{ vars.GERRIT_SSH_USER }}
+          CHANGE: ${{ inputs.GERRIT_CHANGE_NUMBER }}
+          PATCHSET: ${{ inputs.GERRIT_PATCHSET_NUMBER }}
+          # yamllint disable-line rule:line-length
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Compose the outcome comment and post it to the change
+          safe() {
+            if [[ "${1}" =~ ^[A-Za-z0-9.,_\ -]*$ ]]; then
+              printf '%s' "${1}"
+            else
+              printf 'UNAVAILABLE'
+            fi
+          }
+          snapshot_version=$(safe "${SNAPSHOT_VERSION}")
+          snapshot_targets=$(safe "${SNAPSHOT_TARGETS}")
+          release_version=$(safe "${RELEASE_VERSION}")
+          release_targets=$(safe "${RELEASE_TARGETS}")
+          case "${RESULT}" in
+            success|failure|cancelled|skipped)
+              status="${RESULT^^}" ;;
+            *) status='UNKNOWN' ;;
+          esac
+          # A 'false' published output means not every target accepted
+          # the version. The legs run independently (fail-fast off), so
+          # some targets may still hold it: say so rather than claim
+          # nothing published.
+          if [ "${SNAPSHOT_PUBLISHED}" = 'true' ]; then
+            snapshot="Snapshot ${snapshot_version} published to"
+            snapshot="${snapshot} ${snapshot_targets}."
+          elif [ -n "${snapshot_version}" ]; then
+            snapshot="Snapshot ${snapshot_version} NOT confirmed on all"
+            snapshot="${snapshot} of ${snapshot_targets:-its targets}."
+          else
+            snapshot='No snapshot version resolved.'
+          fi
+          case "${HAS_RELEASE}" in
+            true)
+              if [ "${RELEASE_PUBLISHED}" = 'true' ]; then
+                release="Released ${release_version} to"
+                release="${release} ${release_targets}."
+              else
+                release="Release ${release_version} NOT confirmed on all"
+                release="${release} of ${release_targets:-its targets}."
+              fi
+              ;;
+            false) release='No release file, nothing released.' ;;
+            *) release='Release check incomplete, nothing released.' ;;
+          esac
+          message="${status}: ${snapshot} ${release} ${RUN_URL}"
+          echo "${message}"
+          if [[ ! "${message}" =~ ^[A-Za-z0-9.,:/_\ -]+$ ]]; then
+            echo "::error::Refusing to send a comment with unexpected" \
+              "characters"
+            exit 1
+          fi
+          if [[ ! "${CHANGE}" =~ ^[1-9][0-9]*$ ]] \
+            || [[ ! "${PATCHSET}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Invalid change or patchset number"
+            exit 1
+          fi
+          if [[ ! "${GERRIT_SSH_USER}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid GERRIT_SSH_USER"
+            exit 1
+          fi
+          # GERRIT_SERVER takes the forms the notify job's
+          # gerrit-review-action accepts: a hostname, 'host:port', or
+          # a bare IPv6 literal (several colons, never split)
+          host="${GERRIT_SERVER}"
+          port='29418'
+          case "${host}" in
+            *:*:*) ;;
+            *:*)
+              if [[ ! "${host}" =~ ^([^:]+):([0-9]+)$ ]]; then
+                echo "::error::GERRIT_SERVER port is not numeric"
+                exit 1
+              fi
+              host="${BASH_REMATCH[1]}"
+              port="${BASH_REMATCH[2]}"
+              ;;
+          esac
+          if [[ ! "${host}" =~ ^[A-Za-z0-9._:-]+$ ]] \
+            || [[ "${host}" == -* ]]; then
+            echo "::error::Invalid GERRIT_SERVER"
+            exit 1
+          fi
+          if [ "${#port}" -gt 5 ] || [ "${port}" -lt 1 ] \
+            || [ "${port}" -gt 65535 ]; then
+            echo "::error::GERRIT_SERVER port is outside 1-65535"
+            exit 1
+          fi
+          # ssh joins its arguments into one command line that Gerrit
+          # splits again, so the message travels single-quoted; the
+          # check above keeps quotes out of it
+          ssh -i ~/.ssh/gerrit_report -p "${port}" -l "${GERRIT_SSH_USER}" \
+            -o PubkeyAcceptedKeyTypes=+ssh-rsa -- "${host}" \
+            gerrit review "${CHANGE},${PATCHSET}" \
+            --message "'${message}'" --tag autogenerated:github
