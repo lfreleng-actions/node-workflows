@@ -140,6 +140,10 @@ jobs:
             # the fixture rather than reaching for a permit flag.
             audit_permit_fail: false
             grype_permit_fail: false
+            # The fixture is another repository at a pinned commit, so
+            # the change cannot be resolved and the gate must stay on:
+            # this exercises the fail-closed path end to end
+            grype_gate_when: 'dependencies-changed'
           - name: 'sdc-onap-ui-common'
             repository: 'onap/sdc-onap-ui-common'
             ref: 'c305ee4240e368dd0b2238a4f39881a97bad6746'
@@ -154,6 +158,7 @@ jobs:
             audit_permit_fail: true
             # 2020-era dependencies trip the Grype severity gate
             grype_permit_fail: true
+            grype_gate_when: 'always'
     permissions:
       contents: read
       pull-requests: read  # repository-metadata-action queries PR data
@@ -165,6 +170,7 @@ jobs:
       test_permit_fail: ${{ matrix.test_permit_fail }}
       audit_permit_fail: ${{ matrix.audit_permit_fail }}
       grype_permit_fail: ${{ matrix.grype_permit_fail }}
+      grype_gate_when: ${{ matrix.grype_gate_when }}
 
   # The publish-targets resolver is the one part of the merge and
   # build-test-release publish paths that CI can exercise: it reads
@@ -1111,6 +1117,236 @@ jobs:
             exit 1
           fi
           echo "Release detection correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # build-test's dependencies-changed Grype gate trusts a manifest the
+  # sbom job writes from git history. Extract the shipped step and
+  # drive it against local repositories: a wrong 'false' downgrades
+  # real findings to warnings, so every unresolvable shape must write
+  # no manifest and leave the gate on.
+  dependency-change-detection:
+    name: 'Test: dependency change detection'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise dependency change detection'
+        shell: bash
+        run: |
+          # Exercise dependency change detection
+          detect="${RUNNER_TEMP}/dependency-change.sh"
+          python3 - <<'EXTRACT'
+          import os
+
+          import yaml
+
+          with open('.github/workflows/build-test.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['jobs']['sbom']['steps']
+          run = [s for s in steps if s.get('id') == 'dependency-change']
+          with open(os.path.join(os.environ['RUNNER_TEMP'],
+                                 'dependency-change.sh'), 'w') as handle:
+              handle.write(run[0]['run'])
+          EXTRACT
+          # Fail loudly rather than silently testing nothing if the
+          # step is renamed or loses its manifest
+          if ! grep -q 'dependency-change.json' "${detect}" \
+            || ! grep -q 'EVENT_BEFORE' "${detect}"; then
+            echo "Could not extract dependency change detection ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          # Local repositories only: an identity, no signing, and none
+          # of the runner's own git settings
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+          export GIT_AUTHOR_NAME='Dependency Change'
+          export GIT_AUTHOR_EMAIL='dependency-change@example.org'
+          export GIT_COMMITTER_NAME="${GIT_AUTHOR_NAME}"
+          export GIT_COMMITTER_EMAIL="${GIT_AUTHOR_EMAIL}"
+
+          src="${RUNNER_TEMP}/src"
+          git init -q -b main "${src}"
+          echo '{}' > "${src}/package.json"
+          echo 'fixture' > "${src}/README.md"
+          # Projects for path_prefix to name; it must exist to match
+          for project in app web packages/app packages/web; do
+            mkdir -p "${src}/${project}"
+            echo 'project' > "${src}/${project}/README.md"
+          done
+          ln -s packages/app "${src}/linked"
+          git -C "${src}" add .
+          git -C "${src}" commit -q -m 'Initial commit'
+          base=$(git -C "${src}" rev-parse HEAD)
+
+          # $1 branch, $2 base revision, then path=content pairs to
+          # write and commit as one commit
+          commit_on() {
+            local branch="$1" from="$2"
+            shift 2
+            git -C "${src}" switch -q -c "${branch}" "${from}"
+            for pair in "$@"; do
+              mkdir -p "$(dirname "${src}/${pair%%=*}")"
+              printf '%s\n' "${pair#*=}" > "${src}/${pair%%=*}"
+              git -C "${src}" add "${pair%%=*}"
+            done
+            git -C "${src}" commit -q -m "${branch}"
+          }
+          # $1 branch, $2 first parent, $3 merged branch: the shape
+          # of GitHub's pull request merge commit
+          merge_on() {
+            git -C "${src}" switch -q -c "$1" "$2"
+            git -C "${src}" merge -q --no-ff -m "$1" "$3"
+          }
+          commit_on lock "${base}" 'package-lock.json={}'
+          commit_on docs "${base}" 'README.md=docs only'
+          commit_on lookalike "${base}" 'notes/package.json.orig=x' \
+            'yarn.lock.md=x'
+          commit_on sibling "${base}" 'web/package.json={}'
+          commit_on inner "${base}" 'app/lib/pnpm-lock.yaml=x'
+          commit_on planted "${base}" 'package.json={"a": 1}' \
+            'dependency-change.json={"changed": false}'
+          # The base branch moved on with its own dependency change
+          commit_on moved "${base}" 'package.json={"b": 1}'
+          merge_on pr-docs moved docs
+          merge_on pr-lock moved lock
+          # A two-commit push whose last commit is unrelated
+          commit_on push-deps "${base}" 'yarn.lock=x'
+          commit_on push-docs push-deps 'README.md=after the bump'
+          # Git permits a newline in a path
+          commit_on newline "${base}" $'x\n::warning::forged/package.json=x'
+          # Retarget the symlinked project at a different project
+          git -C "${src}" switch -q -c retarget "${base}"
+          ln -sfn packages/web "${src}/linked"
+          git -C "${src}" add linked
+          git -C "${src}" commit -q -m retarget
+
+          errors=0
+          # $1 case, $2 branch, $3 depth (0 = full history), $4 want
+          # (true, false, or none for no manifest). EVENT, SHA, BEFORE,
+          # PREFIX and REFSPEC override the run context.
+          check() {
+            local work out rc head got depth=()
+            work=$(mktemp -d)
+            git init -q "${work}"
+            if [ "$3" != '0' ]; then
+              depth=(--depth="$3")
+            fi
+            git -C "${work}" fetch -q "${depth[@]}" \
+              "file://${src}" "refs/heads/$2"
+            git -C "${work}" checkout -q FETCH_HEAD
+            head=$(git -C "${work}" rev-parse HEAD)
+            : > "${work}.out"
+            set +e
+            out="$(cd "${work}" && GITHUB_OUTPUT="${work}.out" \
+              GITHUB_EVENT_NAME="${EVENT:-pull_request}" \
+              GITHUB_SHA="${SHA:-${head}}" EVENT_BEFORE="${BEFORE:-}" \
+              PATH_PREFIX="${PREFIX:-.}" GERRIT_REFSPEC="${REFSPEC:-}" \
+              bash -eo pipefail "${detect}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${rc}" != '0' ]; then
+              echo "$1: detection failed (${rc}) ❌"
+              printf '%s\n' "${out}" | tail -n 3
+              errors=1
+              return
+            fi
+            if printf '%s\n' "${out}" | grep -q '^::'; then
+              echo "$1: output carries a workflow command ❌"
+              errors=1
+            fi
+            got=none
+            if [ -e "${work}/dependency-change.json" ]; then
+              got=$(cat "${work}/dependency-change.json")
+            fi
+            want=none
+            if [ "$4" != 'none' ]; then
+              want="{\"changed\": $4}"
+            fi
+            if [ "${got}" != "${want}" ]; then
+              echo "$1: manifest '${got}', expected '${want}' ❌"
+              printf '%s\n' "${out}"
+              errors=1
+            elif ! grep -q '^result=' "${work}.out"; then
+              echo "$1: no result output ❌"
+              errors=1
+            fi
+          }
+
+          check 'lockfile changed' lock 2 true
+          check 'unrelated change' docs 2 false
+          check 'lookalike names' lookalike 2 false
+          check 'no parent fetched' lock 1 none
+          EVENT=workflow_dispatch check 'other event' docs 2 none
+          SHA="${base}" check 'not the triggering commit' lock 2 none
+          # A committed manifest must not survive an unresolved run
+          check 'planted manifest' planted 1 none
+          # The merge commit's first parent is the base branch, so its
+          # own dependency change is not the PR's
+          check 'merge, PR touches docs' pr-docs 2 false
+          check 'merge, PR touches lockfile' pr-lock 2 true
+          # Every recognised name counts at any depth
+          i=0
+          for name in package.json package-lock.json \
+            npm-shrinkwrap.json yarn.lock .yarnrc.yml pnpm-lock.yaml \
+            pnpm-workspace.yaml bun.lock bun.lockb; do
+            i=$((i + 1))
+            commit_on "nested-${i}" "${base}" "packages/app/${name}=x"
+            check "nested ${name}" "nested-${i}" 2 true
+          done
+          # path_prefix scopes the match to the project and the
+          # directories above it, where a workspace root lockfile lives
+          PREFIX=app check 'prefix, root lockfile' lock 2 true
+          PREFIX=app check 'prefix, nested in project' inner 2 true
+          PREFIX=app check 'prefix, sibling project' sibling 2 false
+          PREFIX=./packages/app/ check 'prefix, normalised' nested-1 2 \
+            true
+          PREFIX=packages/./app check 'prefix, interior dot' nested-1 2 \
+            true
+          # A symlink on the way to the project can be retargeted by
+          # the change itself, so the answer is left unresolved
+          PREFIX=linked check 'prefix, symlink' nested-1 2 none
+          PREFIX=linked check 'prefix, retargeted symlink' retarget 2 \
+            none
+          PREFIX=missing check 'prefix, missing' nested-1 2 none
+          PREFIX=packages/web check 'prefix, sibling in workspace' \
+            nested-1 2 false
+          check 'path with a newline' newline 2 true
+          # A push compares against 'before', not the last commit
+          EVENT=push BEFORE="${base}" check 'push, full history' \
+            push-docs 0 true
+          EVENT=push BEFORE="${base}" check 'push, before not fetched' \
+            push-docs 2 none
+          EVENT=push BEFORE=0000000000000000000000000000000000000000 \
+            check 'push, new branch' push-docs 0 none
+          # A Gerrit change is its own commit, whatever GITHUB_SHA says
+          REFSPEC=refs/changes/01/1/1 SHA="${base}" \
+            check 'Gerrit change' lock 2 true
+
+          if [ "${errors}" != '0' ]; then
+            echo "Dependency change detection incorrect ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Dependency change detection correct ✅" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
   # resolve-commit picks the one commit a Gerrit merge run builds, and
   # refuses one that is not on the target branch (#119). Its resolve

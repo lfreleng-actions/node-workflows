@@ -165,6 +165,16 @@ on:
         required: false
         type: boolean
         default: false
+      grype_gate_when:
+        description: >-
+          When Grype findings block the job: 'always', or
+          'dependencies-changed' to report them as warnings unless the
+          change under review touched package.json or a lockfile. A
+          change the workflow cannot compare against its base keeps
+          the gate on.
+        required: false
+        type: string
+        default: 'always'
 
       # --- Job timeouts ---
       build_timeout_minutes:
@@ -236,7 +246,8 @@ jobs:
   gerrit-validate:
     name: 'Validate Workflow Inputs'
     # Fails fast with a clear message on invalid workflow inputs: the
-    # test artefact path, job timeouts, and the Gerrit parameters (when
+    # test artefact path, job timeouts, the Grype gate mode, and the
+    # Gerrit parameters (when
     # gerrit_refspec is set without the project/branch the Gerrit
     # checkout path also requires). The build-chain root job depends on
     # this, so invalid inputs stop the pipeline early and cleanly. This
@@ -315,6 +326,22 @@ jobs:
             fi
           done
           exit "${error}"
+
+      - name: 'Validate grype_gate_when input'
+        shell: bash
+        env:
+          GRYPE_GATE_WHEN: ${{ inputs.grype_gate_when }}
+        run: |
+          # grype-scan-action rejects other values too, but only after
+          # the build and SBOM jobs have run
+          case "${GRYPE_GATE_WHEN}" in
+            always|dependencies-changed) ;;
+            *)
+              echo "::error::Invalid grype_gate_when input:" \
+                "${GRYPE_GATE_WHEN}"
+              exit 1
+              ;;
+          esac
 
       - name: 'Require Gerrit project, branch and URL'
         if: inputs.gerrit_refspec != ''
@@ -840,6 +867,9 @@ jobs:
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref }}
+          # The parent lets dependency-change detection compare HEAD
+          # with its base; the Gerrit checkout fetches it by default
+          fetch-depth: 2
           persist-credentials: false
 
       # Emits sbom-cyclonedx.json at the workspace root (the Grype
@@ -854,13 +884,139 @@ jobs:
           output_directory: '.'
           include_dev: 'false'
 
+      # Writes dependency-change.json beside the SBOM for the Grype
+      # job's dependencies-changed gate. Every path that cannot show
+      # what the change touched writes no file, which grype-scan-action
+      # reads as unresolved and keeps the gate on.
+      - name: 'Detect dependency changes'
+        id: dependency-change
+        # yamllint disable-line rule:line-length
+        if: inputs.grype_enabled && inputs.grype_gate_when == 'dependencies-changed'
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          GERRIT_REFSPEC: ${{ inputs.gerrit_refspec }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          # Detect dependency changes
+          set -euo pipefail
+          manifest='dependency-change.json'
+          # The checkout may carry a file of this name; the change
+          # under review must never vouch for itself
+          rm -f -- "${manifest}"
+
+          unresolved() {
+            echo "Dependency change unresolved: $1; Grype gates as usual"
+            echo "result=unresolved ($1)" >> "${GITHUB_OUTPUT}"
+            exit 0
+          }
+
+          if ! head=$(git rev-parse -q --verify 'HEAD^{commit}'); then
+            unresolved 'no commit is checked out'
+          fi
+          if [ -n "${GERRIT_REFSPEC}" ]; then
+            # The Gerrit checkout is the change itself
+            base_ref='HEAD^1'
+          elif [ "${head}" != "${GITHUB_SHA}" ]; then
+            # An explicit ref or another repository is not the change
+            # that triggered this run, so its history says nothing
+            unresolved 'the checkout is not the triggering commit'
+          else
+            case "${GITHUB_EVENT_NAME}" in
+              # HEAD is GitHub's merge commit, so its first parent is
+              # the base branch and the diff spans the whole PR
+              pull_request) base_ref='HEAD^1' ;;
+              # HEAD^1 would see only the last commit of a multi-commit
+              # push; 'before' covers them all when it was fetched
+              push)
+                before="${EVENT_BEFORE}"
+                if [[ ! "${before}" =~ ^[0-9a-f]+$ ]] \
+                  || [[ "${before}" =~ ^0+$ ]]; then
+                  unresolved 'the push names no previous commit'
+                fi
+                base_ref="${before}"
+                ;;
+              *) unresolved "${GITHUB_EVENT_NAME} runs have no base" ;;
+            esac
+          fi
+          # A shallow clone grafts the oldest fetched commit as a root,
+          # so a parent that was not fetched does not resolve
+          if ! base=$(git rev-parse -q --verify "${base_ref}^{commit}"); then
+            unresolved "${base_ref} is not in the checkout"
+          fi
+
+          list=$(mktemp)
+          if ! git diff --name-only --no-renames -z "${base}" "${head}" \
+            > "${list}"; then
+            unresolved 'git diff failed'
+          fi
+
+          # Compare in git's terms: canonical, relative to the checkout
+          # top, with '.' segments and symlinks resolved
+          if ! top=$(cd -- "$(git rev-parse --show-toplevel)" && pwd -P) \
+            || ! project=$(cd -- "${PATH_PREFIX}" && pwd -P); then
+            unresolved "path_prefix ${PATH_PREFIX} is not a directory"
+          fi
+          if [ "${project}" = "${top}" ]; then
+            prefix='.'
+          elif [[ "${project}" == "${top}/"* ]]; then
+            prefix="${project#"${top}/"}"
+          else
+            unresolved "path_prefix ${PATH_PREFIX} leaves the checkout"
+          fi
+          # A change can retarget a symlink on the way to the project,
+          # swapping its whole dependency tree without touching a file
+          # matched below, so a prefix through one cannot be judged
+          lexical=''
+          IFS='/' read -r -a parts <<< "${PATH_PREFIX}"
+          for part in "${parts[@]}"; do
+            case "${part}" in
+              ''|.) ;;
+              *) lexical="${lexical:+${lexical}/}${part}" ;;
+            esac
+          done
+          if [ "${prefix}" != "${lexical:-.}" ]; then
+            unresolved "path_prefix ${PATH_PREFIX} passes through a symlink"
+          fi
+          changed=false
+          while IFS= read -r -d '' path; do
+            case "${path##*/}" in
+              package.json|package-lock.json|npm-shrinkwrap.json) ;;
+              yarn.lock|.yarnrc.yml|pnpm-lock.yaml) ;;
+              pnpm-workspace.yaml|bun.lock|bun.lockb) ;;
+              *) continue ;;
+            esac
+            dir=''
+            if [[ "${path}" == */* ]]; then
+              dir="${path%/*}"
+            fi
+            # Inside the project at any depth, or directly in a
+            # directory above it, where a workspace root keeps the
+            # lockfile and overrides that resolve the project
+            if [ "${prefix}" = '.' ] || [ -z "${dir}" ] \
+              || [[ "${path}" == "${prefix}/"* ]] \
+              || [[ "${prefix}/" == "${dir}/"* ]]; then
+              # %q keeps a path with a newline on one line, so it
+              # cannot forge a workflow command
+              printf 'Dependency file changed: %q\n' "${path}"
+              changed=true
+            fi
+          done < "${list}"
+
+          printf '{"changed": %s}\n' "${changed}" > "${manifest}"
+          echo "Dependency change since ${base:0:12}: ${changed}"
+          echo "result=${changed} (since ${base:0:12})" >> "${GITHUB_OUTPUT}"
+
       - name: 'Upload SBOM artifacts'
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: sbom-files
-          # Glob matches whichever SBOM formats the generator produced
-          path: sbom-cyclonedx.*
+          # Glob matches whichever SBOM formats the generator produced;
+          # the dependency-change manifest exists only when resolved
+          path: |
+            sbom-cyclonedx.*
+            dependency-change.json
           retention-days: 45
           # Fail fast: the downstream Grype job requires this artifact,
           # so a missing/misnamed SBOM must surface here, not later
@@ -870,11 +1026,16 @@ jobs:
         shell: bash
         env:
           COMPONENT_COUNT: ${{ steps.sbom.outputs.component_count }}
+          DEPENDENCY_CHANGE: ${{ steps.dependency-change.outputs.result }}
         run: |
           # SBOM summary
           {
             echo "## SBOM Summary"
             echo "CycloneDX SBOM with ${COMPONENT_COUNT} components"
+            if [ -n "${DEPENDENCY_CHANGE}" ]; then
+              echo ""
+              echo "Dependency change: ${DEPENDENCY_CHANGE}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   grype:
@@ -913,7 +1074,8 @@ jobs:
       # this check even when the caller passes false), disables failure
       # propagation so pull requests
       # can proceed when blocked by newly discovered CVEs in transitive
-      # dependencies.
+      # dependencies. grype_gate_when narrows when findings block in
+      # the first place; permit-fail still passes an armed gate.
       - name: 'Grype audit SBOM'
         id: grype-audit
         # yamllint disable-line rule:line-length
@@ -921,6 +1083,32 @@ jobs:
         with:
           sbom: 'sbom-cyclonedx.json'
           fail-on: ${{ inputs.grype_fail_on }}
+          gate-when: ${{ inputs.grype_gate_when }}
+          # Absent unless the sbom job resolved the change; an absent
+          # manifest keeps the gate on
+          dependency-change-manifest: 'dependency-change.json'
           # yamllint disable-line rule:line-length
           permit-fail: ${{ inputs.grype_permit_fail || vars.NO_BLOCK_AUDIT_FAIL == 'true' }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The action's summary gives the gate's reason only when it
+      # downgraded findings to warnings; record the decision on every
+      # dependency-aware run, including those that gate or find nothing
+      - name: 'Grype gate summary'
+        # yamllint disable-line rule:line-length
+        if: ${{ !cancelled() && inputs.grype_gate_when == 'dependencies-changed' && steps.grype-audit.outcome != 'skipped' }}
+        shell: bash
+        env:
+          GATE_ACTIVE: ${{ steps.grype-audit.outputs.gate-active }}
+          GATE_REASON: ${{ steps.grype-audit.outputs.gate-reason }}
+          ADVISORY: ${{ steps.grype-audit.outputs.advisory-matches }}
+        run: |
+          # Grype gate summary
+          {
+            echo "### Grype gate"
+            echo ""
+            echo "| Gate active | Reason | Advisory matches |"
+            echo "| ----------- | ------ | ---------------- |"
+            echo "| ${GATE_ACTIVE:-unknown} | ${GATE_REASON:-unknown}" \
+              "| ${ADVISORY:-unknown} |"
+          } >> "$GITHUB_STEP_SUMMARY"
