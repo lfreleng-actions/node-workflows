@@ -164,6 +164,22 @@ on:
         required: false
         type: string
         default: 'snapshot'
+      snapshot_environment:
+        description: >-
+          GitHub environment for the snapshot publish jobs, and those
+          alone, for credentials kept behind environment protection
+          rules. Empty runs them without an environment.
+        required: false
+        type: string
+        default: ''
+      release_environment:
+        description: >-
+          GitHub environment for the release publish jobs, and those
+          alone, e.g. one that requires a reviewer. Empty runs them
+          without an environment.
+        required: false
+        type: string
+        default: ''
       dry_run:
         description: >-
           Rehearse the publish steps without uploading. Needs no
@@ -915,6 +931,8 @@ jobs:
     # registry that failed rather than leaving the reader to open it.
     name: 'Publish Snapshot (${{ matrix.target.name }})'
     runs-on: ubuntu-latest
+    # Empty runs the job outside any environment.
+    environment: ${{ inputs.snapshot_environment }}
     needs:
       - 'resolve-version'
       - 'node-metadata'
@@ -1241,6 +1259,8 @@ jobs:
     # registry that failed rather than leaving the reader to open it.
     name: 'Publish Release (${{ matrix.target.name }})'
     runs-on: ubuntu-latest
+    # Empty runs the job outside any environment.
+    environment: ${{ inputs.release_environment }}
     needs:
       - 'check-release'
       - 'resolve-version'

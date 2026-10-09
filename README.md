@@ -217,17 +217,18 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 
 <!-- markdownlint-disable MD013 -->
 
-| Input             | Type    | Default    | Description                                                            |
-| ----------------- | ------- | ---------- | ---------------------------------------------------------------------- |
-| `attestations`    | boolean | `true`     | Generate SLSA build provenance attestations for the packed tarball     |
-| `sigstore_sign`   | boolean | `true`     | Sign the packed tarball with Sigstore (keyless/OIDC)                   |
-| `nexus_publish`   | boolean | `false`    | Publish the package to one or more npm registries after promotion      |
-| `publish_targets` | string  | `''`       | JSON array of publish targets; see [Publish Targets](#publish-targets) |
-| `registry_url`    | string  | `''`       | Single registry URL; deprecated, prefer `publish_targets`              |
-| `nexus_user`      | string  | `''`       | Nexus username override; empty derives it from the repository name     |
-| `npm_tag`         | string  | `'latest'` | npm dist-tag applied to the published version                          |
-| `npm_access`      | string  | `''`       | npm publish access: `public` or `restricted`; empty keeps the default  |
-| `dry_run`         | boolean | `false`    | Run the publish steps for every target without uploading               |
+| Input                 | Type    | Default    | Description                                                            |
+| --------------------- | ------- | ---------- | ---------------------------------------------------------------------- |
+| `attestations`        | boolean | `true`     | Generate SLSA build provenance attestations for the packed tarball     |
+| `sigstore_sign`       | boolean | `true`     | Sign the packed tarball with Sigstore (keyless/OIDC)                   |
+| `nexus_publish`       | boolean | `false`    | Publish the package to one or more npm registries after promotion      |
+| `publish_targets`     | string  | `''`       | JSON array of publish targets; see [Publish Targets](#publish-targets) |
+| `registry_url`        | string  | `''`       | Single registry URL; deprecated, prefer `publish_targets`              |
+| `nexus_user`          | string  | `''`       | Nexus username override; empty derives it from the repository name     |
+| `npm_tag`             | string  | `'latest'` | npm dist-tag applied to the published version                          |
+| `npm_access`          | string  | `''`       | npm publish access: `public` or `restricted`; empty keeps the default  |
+| `dry_run`             | boolean | `false`    | Run the publish steps for every target without uploading               |
+| `publish_environment` | string  | `''`       | GitHub environment gating the publish jobs; empty uses none            |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -267,6 +268,8 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 | `release_registry_url`     | string  | `''`         | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
 | `nexus_user`               | string  | `''`         | Nexus username override; empty derives it from the repository name                                                               |
 | `snapshot_dist_tag`        | string  | `'snapshot'` | npm dist-tag for snapshot publishes; never `latest`, which must name the newest release                                          |
+| `snapshot_environment`     | string  | `''`         | GitHub environment gating the snapshot publish jobs; empty uses none                                                             |
+| `release_environment`      | string  | `''`         | GitHub environment gating the release publish jobs, e.g. one requiring a reviewer; empty uses none                               |
 | `dry_run`                  | boolean | `false`      | Rehearse publishing without uploading; needs no secrets, and skips attestation and signing                                       |
 | `harden_runner_egress`     | string  | `'block'`    | Harden-runner egress policy: `block` or `audit`                                                                                  |
 | `harden_runner_allowlist`  | string  | (pinned)     | Out-of-band harden-runner allow-list configuration                                                                               |
@@ -455,6 +458,26 @@ Nexus publishing uses the 1Password credential model through
   name. For Gerrit projects the mapping replaces the path separator
   with a hyphen: Gerrit `ccsdk/app` maps to GitHub `ccsdk-app`.
   Use the `nexus_user` input to override the derived username.
+
+### Gating the publish jobs behind an environment
+
+The jobs that load these credentials can run behind a GitHub
+deployment environment, so a caller can require reviewers, restrict
+branches, or keep the secrets as environment secrets:
+
+- `build-test-release.yaml`: `publish_environment` gates
+  `nexus-publish`.
+- `merge.yaml`: `snapshot_environment` gates `snapshot-publish` and
+  `release_environment` gates `release-publish`. They are separate
+  because a reviewer suits a release, whereas on the snapshot, which
+  publishes on every merge, one would hold every run.
+
+The environment applies to the publish jobs and nothing else: the
+build, the checks, attestation and signing run as before. Empty, the
+default, runs the publish jobs without one. An environment secret
+takes precedence over a secret of the same name that the caller
+passes. GitHub creates a missing environment, unprotected, the first
+time a job names it, so configure the environment before naming it.
 
 ## Verifying Release Artefacts (Model A)
 

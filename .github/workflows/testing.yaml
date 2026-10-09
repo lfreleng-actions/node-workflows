@@ -306,6 +306,73 @@ jobs:
         with:
           persist-credentials: false
 
+      # A caller's environment has to gate the jobs that load registry
+      # credentials and nothing else (#142): one that requires a
+      # reviewer must hold the publish, not the build or the release
+      # checks. Each input defaults to '', which runs its job outside
+      # any environment.
+      - name: 'Assert only the publish jobs take an environment'
+        shell: bash
+        run: |
+          # Assert only the publish jobs take an environment
+          python3 - <<'PY'
+          import sys
+
+          import yaml
+
+          # workflow -> {publish job: input naming its environment}
+          EXPECTED = {
+              'merge.yaml': {
+                  'snapshot-publish': 'snapshot_environment',
+                  'release-publish': 'release_environment',
+              },
+              'build-test-release.yaml': {
+                  'nexus-publish': 'publish_environment',
+              },
+          }
+          # Assembled, as above, so it is not a workflow expression
+          OPEN = '${' + '{ '
+          CLOSE = ' }' + '}'
+
+          errors = []
+          for name, pairs in EXPECTED.items():
+              with open(f'.github/workflows/{name}') as handle:
+                  doc = yaml.safe_load(handle)
+              # PyYAML reads the bare 'on' key as True
+              inputs = doc[True]['workflow_call']['inputs']
+              for job_id, job in doc['jobs'].items():
+                  actual = job.get('environment')
+                  input_id = pairs.get(job_id)
+                  if input_id is None:
+                      if actual is not None:
+                          errors.append(f'{name}/{job_id} takes an environment')
+                      continue
+                  wanted = OPEN + f'inputs.{input_id}' + CLOSE
+                  if actual != wanted:
+                      errors.append(
+                          f'{name}/{job_id} environment is {actual!r}, '
+                          f'expected {wanted!r}'
+                      )
+                  spec = inputs.get(input_id) or {}
+                  if spec.get('type') != 'string' or spec.get('default') != '':
+                      errors.append(
+                          f"{name}: input {input_id} must be a string "
+                          "defaulting to ''"
+                      )
+              for job_id in pairs:
+                  if job_id not in doc['jobs']:
+                      errors.append(f'{name}: no job {job_id}')
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('Publish environment wiring incorrect \u274c')
+
+          print('Publish environment wiring correct \u2705')
+          PY
+          echo "Publish environment wiring correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       # merge.yaml and build-test-release.yaml cannot run in CI, so the
       # only way to keep their publish wiring honest is to read it. A
       # leg still pointing at the deprecated scalar input, or at a

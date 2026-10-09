@@ -97,6 +97,8 @@ jobs:
       # harden_runner_egress: 'block' # 'block' (default) or 'audit'
       # attestations: true            # SLSA provenance for releases
       # sigstore_sign: true           # Sigstore bundle for releases
+      # snapshot_environment: ''      # environment gating snapshots
+      # release_environment: ''       # e.g. one requiring a reviewer
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
       VAULT_MAPPING_JSON: ${{ secrets.VAULT_MAPPING_JSON }}

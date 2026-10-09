@@ -307,6 +307,15 @@ on:
         required: false
         type: boolean
         default: false
+      publish_environment:
+        description: >-
+          GitHub environment for the publish jobs, and those alone, for
+          credentials kept behind environment protection rules, e.g.
+          one that requires a reviewer. Empty runs them without an
+          environment.
+        required: false
+        type: string
+        default: ''
 
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
@@ -1543,6 +1552,8 @@ jobs:
     # registry that failed rather than leaving the reader to open it.
     name: 'Publish Release (${{ matrix.target.name }})'
     runs-on: ubuntu-latest
+    # Empty runs the job outside any environment.
+    environment: ${{ inputs.publish_environment }}
     needs:
       - 'tag-validate'
       - 'node-metadata'
