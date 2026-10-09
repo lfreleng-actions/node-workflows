@@ -12,7 +12,7 @@
 # This is Model A: the TAG-DRIVEN release model. The version comes from a
 # validated, signed semver tag; the reusable workflow builds, tests,
 # audits, attaches artefacts to a draft GitHub release and promotes it.
-# Optional Nexus publishing (nexus_publish: true) runs after promotion
+# Optional Nexus publishing (nexus_publish: true) runs before promotion
 # using the 1Password credential model (OP_SERVICE_ACCOUNT_TOKEN +
 # VAULT_MAPPING_JSON secrets).
 #

@@ -45,9 +45,12 @@ expensive test suite on releases):
 ```text
 gerrit-validate -> { repository-metadata | node-metadata | tag-validate }
 { tag-validate | node-metadata } -> build -> { audit | sbom -> grype }
-  -> tests -> attach-artefacts -> promote-release -> nexus-publish
+  -> tests -> attach-artefacts -> nexus-publish -> promote-release
 build -> sign-artefacts -> attach-artefacts
 ```
+
+`nexus-publish` skips when `nexus_publish` is `false`, and
+`promote-release` then follows `attach-artefacts` directly.
 
 `merge.yaml`:
 
@@ -76,9 +79,12 @@ then attests and signs it:
   (toggle with the `sigstore_sign` input)
 
 The tarball, Sigstore bundle and SBOM files attach to a draft GitHub
-release, which the workflow then promotes. With `nexus_publish: true`
-the workflow also publishes the package to every configured registry,
-in parallel, using the credential contract below.
+release. With `nexus_publish: true` the workflow then publishes the
+package to every configured registry, in parallel, using the
+credential contract below. The workflow promotes the release last,
+once every publish leg has succeeded: a registry that refuses the
+package leaves the release a draft, and re-running the failed jobs
+completes it (see [Re-running a Release](#re-running-a-release)).
 
 ### Model B: merge-driven (`merge.yaml`)
 
@@ -168,6 +174,67 @@ why the artefact-level records exist at all; publishing to a registry
 that does support it (such as npmjs.org under trusted publishing)
 yields registry-native provenance too.
 
+### Re-running a Release
+
+npm never overwrites a published version, and a release reaching
+more than one registry is not atomic. Before publishing, each release
+leg (`merge.yaml`'s `release-publish`, and `build-test-release.yaml`'s
+`nexus-publish`) asks its registry for the version
+(`npm view <package>@<version> dist`), reading with the leg's own
+credential, and compares what it finds with the tarball it would
+publish:
+
+<!-- markdownlint-disable MD013 -->
+
+| The registry holds the version | The leg                                                                        |
+| ------------------------------ | ------------------------------------------------------------------------------ |
+| No (`E404`)                    | Publishes                                                                      |
+| With identical content         | Succeeds without publishing, and says so in the job summary                    |
+| With different content         | Fails: npm cannot replace it, and two artefacts under one version need a human |
+| Cannot tell (any other error)  | Fails rather than publishing blind; a dry run warns and rehearses instead      |
+
+<!-- markdownlint-enable MD013 -->
+
+Identical means the registry's `sha512` integrity matches the staged
+tarball, falling back to the legacy `sha1` shasum where a registry
+reports no `sha512`. A leg that finds identical content succeeds, so a
+re-run reports the release as published on every target holding it.
+
+The comparison uses the tarball the run packed, so re-run in a way that
+reuses it: **Re-run failed jobs** after a partial publish, or, when
+every leg succeeded, re-run one `Publish Release (<target>)` job from
+the run's summary. *Re-run all jobs* packs again instead, and unless
+the build is byte-for-byte reproducible the new archive differs from
+the one already published, failing every target that took the first.
+
+When npm's configuration for the package (the tarball's
+`publishConfig`, or the project's `.npmrc`) sends the publish to a
+registry other than the leg's `registry_url`, the check would read the
+wrong registry. That leg warns and publishes as it did before the
+check existed.
+
+#### Recovering a missed or partial release
+
+- **Partly published.** Re-run the failed jobs of the original run.
+  Targets that already hold the release skip it; the rest publish.
+  In Model A the GitHub release stays a draft until every leg
+  succeeds, so the same re-run then promotes it; promotion leaves an
+  already published release untouched.
+- **Never published** (the merge run skipped or lost the release, or is
+  too old to re-run). Dispatch `merge.yaml` at the commit that added
+  the release file, with `release_only: true`. On a GitHub caller set
+  `ref` to that commit; on a Gerrit caller set `gerrit_refspec` to the
+  release change's ref (`refs/changes/...`), which the run resolves to
+  the commit that merged it. Your caller has to forward the input, for
+  example from a `workflow_dispatch` input.
+
+`release_only` skips the snapshot lane, which would otherwise republish
+`X.Y.Z-SNAPSHOT` from the old commit over a newer one. The run fails if
+the commit adds no release file, rather than skipping the snapshot and
+publishing nothing. A recovery rebuilds and repacks, so any target that
+already holds the release must hold identical bytes, as above; combine
+it with `dry_run: true` to rehearse first.
+
 ## Inputs and Secrets
 
 ### build-test.yaml
@@ -221,7 +288,7 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 | ----------------- | ------- | ---------- | ---------------------------------------------------------------------- |
 | `attestations`    | boolean | `true`     | Generate SLSA build provenance attestations for the packed tarball     |
 | `sigstore_sign`   | boolean | `true`     | Sign the packed tarball with Sigstore (keyless/OIDC)                   |
-| `nexus_publish`   | boolean | `false`    | Publish the package to one or more npm registries after promotion      |
+| `nexus_publish`   | boolean | `false`    | Publish the package to one or more npm registries before promotion     |
 | `publish_targets` | string  | `''`       | JSON array of publish targets; see [Publish Targets](#publish-targets) |
 | `registry_url`    | string  | `''`       | Single registry URL; deprecated, prefer `publish_targets`              |
 | `nexus_user`      | string  | `''`       | Nexus username override; empty derives it from the repository name     |
@@ -268,6 +335,7 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 | `nexus_user`               | string  | `''`         | Nexus username override; empty derives it from the repository name                                                               |
 | `snapshot_dist_tag`        | string  | `'snapshot'` | npm dist-tag for snapshot publishes; never `latest`, which must name the newest release                                          |
 | `dry_run`                  | boolean | `false`      | Rehearse publishing without uploading; needs no secrets, and skips attestation and signing                                       |
+| `release_only`             | boolean | `false`      | Recovery: publish the release and skip the snapshot; see [Re-running a Release](#re-running-a-release)                           |
 | `harden_runner_egress`     | string  | `'block'`    | Harden-runner egress policy: `block` or `audit`                                                                                  |
 | `harden_runner_allowlist`  | string  | (pinned)     | Out-of-band harden-runner allow-list configuration                                                                               |
 | `gerrit_refspec`           | string  | `''`         | Gerrit refspec: the branch ref, or a merged change's ref to re-run it; resolved once for every job                               |
