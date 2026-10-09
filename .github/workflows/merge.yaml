@@ -252,6 +252,91 @@ on:
           credential, set or not, and still rehearses each publish.
         required: false
 
+    # The merge outcome, for callers that report it (#123). Each value
+    # is gated on its source job succeeding, so a job that failed,
+    # was skipped or was cancelled yields '' rather than whatever it
+    # wrote before stopping. The publish jobs are matrices, whose
+    # outputs are last-writer-wins across legs, so their outcome comes
+    # from the aggregate job result and never from a leg's outputs.
+    #
+    # Results are read as fromJSON(toJSON(jobs.<id>)).result: a direct
+    # jobs.<id>.result has been reported to read '' here
+    # (actions/runner#3087), which would turn every gate below false.
+    outputs:
+      commit:
+        description: >-
+          Commit resolve-commit chose for the run (Gerrit path only).
+          '' on the GitHub-native path, which builds inputs.ref.
+        # yamllint disable-line rule:line-length
+        value: ${{ fromJSON(toJSON(jobs.resolve-commit)).result == 'success' && jobs.resolve-commit.outputs.commit || '' }}
+      snapshot_version:
+        description: >-
+          X.Y.Z-SNAPSHOT version the snapshot lane publishes. '' when
+          resolve-version did not succeed.
+        # yamllint disable-line rule:line-length
+        value: ${{ fromJSON(toJSON(jobs.resolve-version)).result == 'success' && jobs.resolve-version.outputs.snapshot_version || '' }}
+      snapshot_published:
+        description: >-
+          'true' when every snapshot target accepted the snapshot.
+          'false' when any leg failed, the lane was skipped or
+          cancelled, or on a dry run, which uploads nothing. The legs
+          run independently, so after a failed leg other targets may
+          still hold the snapshot.
+        # yamllint disable-line rule:line-length
+        value: ${{ fromJSON(toJSON(jobs.snapshot-publish)).result == 'success' && !inputs.dry_run }}
+      snapshot_target_names:
+        description: >-
+          Comma-separated names of the resolved snapshot targets. ''
+          when resolve-snapshot-targets did not succeed.
+        # yamllint disable-line rule:line-length
+        value: ${{ join(fromJSON(fromJSON(toJSON(jobs.resolve-snapshot-targets)).result == 'success' && jobs.resolve-snapshot-targets.outputs.matrix || '[]').*.name, ', ') }}
+      has_release:
+        description: >-
+          'true' when the merged commit adds a release file whose
+          version matches version.properties; 'false' when it adds
+          none. '' when check-release did not succeed, including a
+          version mismatch or more than one release file.
+        # yamllint disable-line rule:line-length
+        value: ${{ fromJSON(toJSON(jobs.check-release)).result == 'success' && jobs.check-release.outputs.has_release || '' }}
+      release_version:
+        description: >-
+          Version the release file requests. '' when has_release is
+          not 'true'.
+        # yamllint disable-line rule:line-length
+        value: ${{ fromJSON(toJSON(jobs.check-release)).result == 'success' && jobs.check-release.outputs.version || '' }}
+      release_published:
+        description: >-
+          'true' when every release target accepted the release.
+          'false' when no release was requested, any leg failed, the
+          lane was skipped or cancelled, or on a dry run. The legs
+          run independently, so after a failed leg other targets may
+          still hold the release.
+        # yamllint disable-line rule:line-length
+        value: ${{ fromJSON(toJSON(jobs.release-publish)).result == 'success' && !inputs.dry_run }}
+      release_target_names:
+        description: >-
+          Comma-separated names of the resolved release targets,
+          resolved whether or not a release was requested. '' when
+          resolve-release-targets did not succeed.
+        # yamllint disable-line rule:line-length
+        value: ${{ join(fromJSON(fromJSON(toJSON(jobs.resolve-release-targets)).result == 'success' && jobs.resolve-release-targets.outputs.matrix || '[]').*.name, ', ') }}
+      release_tarball_sha256:
+        description: >-
+          SHA-256 of the release tarball pack-release produced, the
+          archive release-publish hands to npm. Set whenever the pack
+          succeeds, dry runs included; '' when it did not run or
+          failed. release_published says whether it reached a
+          registry.
+        # yamllint disable-line rule:line-length
+        value: ${{ fromJSON(toJSON(jobs.pack-release)).result == 'success' && jobs.pack-release.outputs.tarball_sha256 || '' }}
+      attestation_url:
+        description: >-
+          URL of the release tarball's build provenance attestation.
+          '' when attest did not succeed: attestations off, a dry
+          run, no release, or a failure.
+        # yamllint disable-line rule:line-length
+        value: ${{ fromJSON(toJSON(jobs.attest)).result == 'success' && jobs.attest.outputs.attestation_url || '' }}
+
 permissions: {}
 
 jobs:
@@ -1510,6 +1595,7 @@ jobs:
     if: ${{ !cancelled() && needs.check-release.result == 'success' && needs.check-release.outputs.has_release == 'true' && needs.resolve-version.result == 'success' && needs.build.result == 'success' }}
     outputs:
       tarball_name: ${{ steps.pack.outputs.tarball_name }}
+      tarball_sha256: ${{ steps.pack.outputs.tarball_sha256 }}
     permissions:
       contents: read
     timeout-minutes: 10
@@ -1598,8 +1684,10 @@ jobs:
             echo "::error::npm pack produced no tarball"
             exit 1
           fi
-          echo "Packed release tarball: ${tarball}"
+          sha256=$(sha256sum "pack-dist/${tarball}" | cut -d' ' -f1)
+          echo "Packed release tarball: ${tarball} (sha256:${sha256})"
           echo "tarball_name=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "tarball_sha256=${sha256}" >> "$GITHUB_OUTPUT"
 
       - name: 'Upload release tarball'
         # yamllint disable-line rule:line-length
@@ -1624,6 +1712,8 @@ jobs:
     needs: 'pack-release'
     # yamllint disable-line rule:line-length
     if: ${{ !cancelled() && needs.pack-release.result == 'success' && inputs.attestations && !inputs.dry_run }}
+    outputs:
+      attestation_url: ${{ steps.attest.outputs.attestation-url }}
     permissions:
       contents: read
       id-token: write       # Needed for attestations
@@ -1666,6 +1756,7 @@ jobs:
       # header overflow when pushing attestations to an OCI registry.
       # This job sets no push-to-registry, so that has no bearing here.
       - name: 'Attest build provenance'
+        id: attest
         # yamllint disable-line rule:line-length
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
         with:

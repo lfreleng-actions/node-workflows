@@ -294,6 +294,36 @@ supplies both: it rehearses each publish without one, and skips
 attestation and signing, which would leave permanent public records
 for a version that never shipped.
 
+The outputs report the merge outcome, so a caller can tell a release
+that published from one that did not. `examples/merge/gerrit.yaml`
+posts them to the change, for example `Released 1.1.1 to nexus`.
+Each value comes from a job that has to succeed: a job that fails,
+skips or stops on cancellation yields `''`, never what it wrote
+before stopping. The two `*_published` outputs are the exception.
+They are always `'true'` or `'false'`, and they come from the publish
+job's combined result, because every matrix leg overwrites the
+others' job outputs. `'true'` means every target accepted the
+version. `'false'` does not mean none did: the legs run
+independently, so a failed leg can leave the version on the other
+targets.
+
+<!-- markdownlint-disable MD013 -->
+
+| Output                   | Description                                                                                                                        |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `commit`                 | Commit `resolve-commit` chose for the Gerrit path; `''` on the GitHub-native path, which builds `ref`                              |
+| `snapshot_version`       | The `X.Y.Z-SNAPSHOT` version from `version.properties`                                                                             |
+| `snapshot_published`     | `'true'` when every snapshot target accepted it; `'false'` on any failed leg, a skipped lane, or a dry run                         |
+| `snapshot_target_names`  | Comma-separated names of the resolved snapshot targets                                                                             |
+| `has_release`            | `'true'` when the merged commit adds a release file matching `version.properties`, `'false'` when it adds none; `''` on a mismatch |
+| `release_version`        | Version the release file requests; `''` unless `has_release` is `'true'`                                                           |
+| `release_published`      | `'true'` when every release target accepted it; `'false'` with no release, on any failed leg, or on a dry run                      |
+| `release_target_names`   | Comma-separated names of the resolved release targets, set even when no release ran                                                |
+| `release_tarball_sha256` | SHA-256 of the packed release tarball, the archive npm receives; set on dry runs too                                               |
+| `attestation_url`        | URL of the tarball's build provenance; `''` with `attestations` off, on a dry run, or with no release                              |
+
+<!-- markdownlint-enable MD013 -->
+
 ## Node.js Version Selection
 
 `node_version` sets the Node.js used across the pipeline. Empty (the

@@ -52,3 +52,13 @@ rules:
       - github.yaml:43
       - github.yaml:48
       - github.yaml:54
+  secrets-outside-env:
+    ignore:
+      # The merge example's Gerrit SSH key, read by the notify and
+      # report jobs. A dedicated environment would create a deployment
+      # environment in every repository that copies the example, and
+      # the key only comments on an already-merged change. Scoped to
+      # those two lines in the same way as the entries above; the
+      # build-test example's gerrit.yaml has no secret on either line.
+      - gerrit.yaml:139
+      - gerrit.yaml:255
