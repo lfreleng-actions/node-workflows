@@ -57,7 +57,8 @@ gerrit-validate -> resolve-commit -> { repository-metadata
                                       | resolve-version }
 resolve-version -> check-release
 node-metadata -> build
-{ resolve-version | build } -> snapshot-publish
+{ resolve-commit | build } -> snapshot-freshness
+{ resolve-version | build | snapshot-freshness } -> snapshot-publish
 { check-release | resolve-version | build } -> release-publish
 ```
 
@@ -117,6 +118,23 @@ serialise merge runs per repository: every merge publishes the same
 caller in `examples/merge/gerrit.yaml` queues them with
 `cancel-in-progress: false` and `queue: max`, rather than cancelling
 runs or grouping them by change.
+
+Re-runs cannot put an older snapshot back on top. Before the snapshot
+publishes, a `snapshot-freshness` job checks that the built commit is
+still the tip of its branch: `gerrit_branch` on Gerrit, read from
+Gerrit, or the branch the GitHub-native run built. Once the branch has
+moved on, the run for the newer commit owns the snapshot, so this run
+skips it with a notice and the release leg carries on. A run that
+builds a tag or a commit SHA has no branch to compare and publishes.
+The check works per branch, so give each active branch its own
+SNAPSHOT version: branches sharing one replace each other's snapshot
+on every merge, re-run or not.
+If the run cannot read the tip, the snapshot publishes with a warning
+rather than leave the newest merge without one. The job summary
+records the decision. "Re-run failed jobs" on a snapshot publish
+fails, because it would reuse an earlier attempt's build; use
+"Re-run all jobs". Release publishes take neither guard: a release
+version is immutable, so a re-run republishes the same version.
 
 Release publishes also gain attestation and a signature. The build job
 uploads the built tree rather than a tarball, so a `pack-release` job

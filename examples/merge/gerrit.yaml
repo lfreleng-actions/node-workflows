@@ -99,10 +99,10 @@ on:
 #
 # Each run builds the commit its change merged as, not the branch tip.
 # GitHub starts queued runs in the order they began waiting, which
-# mostly but not always matches merge order. If two merges on one
-# branch run out of order, the older commit's snapshot publishes last
-# and stays the published snapshot until the next merge on that branch
-# replaces it; re-run the newer merge's run to restore it sooner. Give
+# mostly but not always matches merge order. A run whose commit is no
+# longer the tip of its branch skips its snapshot, so two merges on
+# one branch running out of order, or a re-run of an old merge, cannot
+# put the older commit's snapshot back over the newer one's. Give
 # each active branch its own SNAPSHOT version, or the branch whose run
 # finishes last replaces the others' snapshot.
 concurrency:

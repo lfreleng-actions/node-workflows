@@ -803,6 +803,13 @@ jobs:
       - 'node-metadata'
       - 'resolve-commit'
     runs-on: ubuntu-latest
+    outputs:
+      # The attempt that built the node-build-content hand-off;
+      # snapshot-publish refuses an older one (#140).
+      attempt: ${{ github.run_attempt }}
+      # The commit the GitHub-native path built, for
+      # snapshot-freshness. The Gerrit path uses resolve-commit's.
+      commit: ${{ steps.built-commit.outputs.commit }}
     permissions:
       contents: read
     timeout-minutes: 10
@@ -852,6 +859,13 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref }}
           persist-credentials: false
+      - name: 'Record the built commit'
+        id: built-commit
+        if: inputs.gerrit_refspec == ''
+        shell: bash
+        run: |
+          # Record the built commit
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: 'Build project'
         # yamllint disable-line rule:line-length
@@ -910,6 +924,154 @@ jobs:
       targets_json: ${{ inputs.release_targets }}
       registry_url: ${{ inputs.release_registry_url }}
 
+  # Every merge publishes the same X.Y.Z-SNAPSHOT, and the last publish
+  # wins. Re-running an old run rebuilds its pinned commit and would
+  # put that older tree back over a newer merge's snapshot (#140). So
+  # the snapshot publishes only while the commit this run built is
+  # still the tip of its branch. Once the branch has moved on, the run
+  # that built the newer tip owns the snapshot, and this one skips it.
+  # Release publishes do not depend on this: a release version is
+  # immutable, so re-running one republishes the same version.
+  # Freshness is per branch, which assumes each active branch has its
+  # own SNAPSHOT version; branches sharing one replace each other's
+  # snapshot on every merge, re-run or not.
+  #
+  # Decided once, before the matrix, so every target gets the same
+  # answer. A job rather than a step, so that a skip leaves
+  # snapshot-publish 'skipped' instead of 'success' with nothing sent.
+  #
+  # When the tip cannot be read, the snapshot still publishes, with a
+  # warning. resolve-commit has already proved the commit merged, and
+  # with runs serialised per repository (see examples/merge) a newer
+  # merge's run publishes after this one in any case. Skipping on a
+  # transient error would instead leave the newest merge without its
+  # snapshot: the stale snapshot this check exists to prevent.
+  snapshot-freshness:
+    name: 'Check Snapshot Freshness'
+    needs:
+      - 'resolve-commit'
+      - 'build'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.freshness.outputs.publish }}
+    # The token reads a GitHub branch tip, private repositories
+    # included. The Gerrit path reads Gerrit anonymously, as
+    # resolve-commit does, and never sees the token.
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+          allow_list_summary: 'false'
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          # yamllint disable-line rule:line-length
+          egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # On the GitHub-native path the branch is the one the build
+      # checked out: inputs.ref, or the triggering ref when inputs.ref
+      # is empty and the run builds the calling repository. A tag, a
+      # commit SHA, or another repository's default branch names no
+      # branch, so there is nothing to compare.
+      - name: 'Compare the built commit with the branch tip'
+        id: freshness
+        shell: bash
+        env:
+          IS_GERRIT: ${{ inputs.gerrit_refspec != '' }}
+          # yamllint disable-line rule:line-length
+          COMMIT: ${{ inputs.gerrit_refspec != '' && needs.resolve-commit.outputs.commit || needs.build.outputs.commit }}
+          GERRIT_BRANCH: ${{ inputs.gerrit_branch }}
+          # yamllint disable-line rule:line-length
+          GERRIT_URL: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          GERRIT_PROJECT: ${{ inputs.gerrit_project }}
+          REPOSITORY: ${{ inputs.repository || github.repository }}
+          # yamllint disable-line rule:line-length
+          REF: ${{ inputs.ref != '' && inputs.ref || ((inputs.repository == '' || inputs.repository == github.repository) && github.ref || '') }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Compare the built commit with the branch tip
+          if [[ ! "${COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::No built commit to compare with the branch tip"
+            exit 1
+          fi
+          # $1 annotation level, $2 publish (true|false), $3... message
+          decide() {
+            local level="$1" publish="$2"
+            shift 2
+            echo "::${level}::$*"
+            echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+            {
+              echo '### Snapshot freshness'
+              echo ''
+              if [ "${publish}" = 'true' ]; then
+                echo "Publishing the snapshot of \`${COMMIT}\`. $*"
+              else
+                echo "Skipping the snapshot of \`${COMMIT}\`. $*"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if [ "${IS_GERRIT}" = 'true' ]; then
+            remote="${GERRIT_URL}/${GERRIT_PROJECT}"
+            branch="${GERRIT_BRANCH}"
+          else
+            remote="${GITHUB_SERVER_URL}/${REPOSITORY}"
+            case "${REF}" in
+              refs/heads/*) branch="${REF#refs/heads/}" ;;
+              refs/*|'') branch='' ;;
+              *)
+                # A bare name may be a branch; a SHA never is
+                branch="${REF}"
+                if [[ "${REF}" =~ ^[0-9a-f]{40}$ ]]; then
+                  branch=''
+                fi
+                ;;
+            esac
+            # checkout persists no credential, so the job token
+            # authenticates the lookup, scoped to the GitHub server
+            if [ -n "${GITHUB_TOKEN}" ]; then
+              basic=$(printf 'x-access-token:%s' "${GITHUB_TOKEN}" \
+                | base64 | tr -d '\n')
+              echo "::add-mask::${basic}"
+              export GIT_CONFIG_COUNT=1
+              export GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraheader"
+              export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic}"
+            fi
+          fi
+
+          if [ -z "${branch}" ]; then
+            decide notice true "The run builds '${REF:-a default branch}'," \
+              "not a named branch, so no newer run can own the snapshot."
+            exit 0
+          fi
+          head="refs/heads/${branch}"
+          listing=$(git ls-remote --exit-code -- "${remote}" "${head}" \
+            2> /dev/null) && rc=0 || rc=$?
+          tip=$(awk -v ref="${head}" '$2 == ref { print $1 }' \
+            <<< "${listing}")
+          if [ "${rc}" = '2' ] && [ "${IS_GERRIT}" != 'true' ] \
+            && [ "${REF}" = "${branch}" ]; then
+            decide notice true "'${REF}' is not a branch, so no newer run" \
+              "can own the snapshot."
+          elif [[ ! "${tip}" =~ ^[0-9a-f]{40}$ ]]; then
+            decide warning true "Cannot read the tip of ${branch}" \
+              "(git ls-remote exit ${rc}), so the snapshot publishes" \
+              "unchecked."
+          elif [ "${tip}" = "${COMMIT}" ]; then
+            decide notice true "It is the tip of ${branch}."
+          else
+            decide notice false "${branch} has moved on to \`${tip}\`;" \
+              "the run for that commit owns the snapshot."
+          fi
+
   snapshot-publish:
     # The leg name comes from the target, so a failed check names the
     # registry that failed rather than leaving the reader to open it.
@@ -920,8 +1082,9 @@ jobs:
       - 'node-metadata'
       - 'build'
       - 'resolve-snapshot-targets'
+      - 'snapshot-freshness'
     # yamllint disable-line rule:line-length
-    if: ${{ !cancelled() && needs.resolve-version.result == 'success' && needs.build.result == 'success' && needs.resolve-snapshot-targets.result == 'success' }}
+    if: ${{ !cancelled() && needs.resolve-version.result == 'success' && needs.build.result == 'success' && needs.resolve-snapshot-targets.result == 'success' && needs.snapshot-freshness.outputs.publish == 'true' }}
     strategy:
       # One registry rejecting a publish must not abandon the others:
       # the legs are independent destinations for the same artefact,
@@ -948,6 +1111,33 @@ jobs:
           egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # "Re-run failed jobs" reruns this job alone, reusing the build
+      # job's artefact and snapshot-freshness's verdict from the
+      # attempt that produced them. If another run has published
+      # since, that older tree would go back over its snapshot. So a
+      # publish refuses a build from an earlier attempt; "Re-run all
+      # jobs" rebuilds and checks the branch tip afresh.
+      #
+      # release-publish takes no such guard. A release version is
+      # immutable, so an older attempt's tarball can displace nothing,
+      # and a retry has to reuse the tarball that attest and
+      # sign-artefacts recorded, not pack a new one.
+      - name: 'Refuse a build from an earlier attempt'
+        id: attempt
+        shell: bash
+        env:
+          BUILD_ATTEMPT: ${{ needs.build.outputs.attempt }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          # Refuse a build from an earlier attempt
+          if [ "${BUILD_ATTEMPT}" != "${RUN_ATTEMPT}" ]; then
+            echo "::error::The build comes from attempt ${BUILD_ATTEMPT}" \
+              "of this run, not attempt ${RUN_ATTEMPT}. Publishing it" \
+              "could put an older snapshot back over a newer merge's." \
+              "Use 'Re-run all jobs', not 'Re-run failed jobs'."
+            exit 1
+          fi
 
       # Publishes use the build job's artefact — the exact tree the
       # build produced — rather than a fresh (unbuilt) checkout, so
