@@ -521,7 +521,19 @@ filename to contain both `gerrit` and `merge` (for example
 
 `.github/workflows/testing.yaml` exercises `build-test.yaml` on pull
 requests against pinned Node.js fixture repositories (a modern npm
-project and a legacy ONAP project). The release and merge workflows
+project and a legacy ONAP project). The `build-test-assert` job then
+checks what those runs produced, beyond their passing verdicts:
+
+- every leg uploads an SBOM that is CycloneDX JSON listing at least
+  one component, and the `test-node-project` SBOM lists `express`
+  and its transitive dependency `body-parser`, both versioned;
+- the `node-test-results` artefact exists for the leg that sets
+  `test_artifact_path`;
+- the audit and Grype jobs of every leg ran; a skipped job fails
+  the check.
+
+Neither fixture emits `dist/`, so the check makes no claim about the
+`node-build-output` artefact. The release and merge workflows
 need tag-push and merged-commit contexts (plus publish credentials),
 so instantiating repositories exercise those through their own
 release and merge cycles.
