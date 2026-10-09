@@ -188,6 +188,8 @@ yields registry-native provenance too.
 | `test_script`             | string  | `'test'`   | package.json test script(s); comma/space/newline separated list                |
 | `test_permit_fail`        | boolean | `false`    | Permit test failures without failing the workflow                              |
 | `test_artifact_path`      | string  | `''`       | Test output/report path uploaded as an artefact; empty disables                |
+| `junit_report_path`       | string  | `''`       | JUnit XML glob summarised in the tests job and uploaded; empty disables        |
+| `coverage_path`           | string  | `''`       | `lcov.info`/`coverage-summary.json` (or their directory) summarised and kept   |
 | `audit_enabled`           | boolean | `true`     | Run the dependency audit job (set false to skip)                               |
 | `audit_level`             | string  | `'high'`   | npm audit severity threshold that fails the audit                              |
 | `production_only`         | boolean | `false`    | Restrict the audit to production dependencies                                  |
@@ -516,6 +518,92 @@ requires the verify caller filename to contain both `gerrit` and
 filename to contain both `gerrit` and `merge` (for example
 `gerrit-merge.yaml`). See the `gerrit.yaml` variants under
 `examples/` for complete callers, including vote/comment plumbing.
+
+## Test Results and Coverage
+
+The `tests` job can summarise a run in its job summary and keep the
+reports as artefacts. Both inputs take paths relative to
+`path_prefix`, and both are off by default:
+
+<!-- markdownlint-disable MD013 -->
+
+| Input               | Points at                                                      | Job summary                                   | Artefact        |
+| ------------------- | -------------------------------------------------------------- | --------------------------------------------- | --------------- |
+| `junit_report_path` | A glob of JUnit XML files (`*` and `**` allowed)               | Test counts: passed, failed, errored, skipped | `node-junit`    |
+| `coverage_path`     | `lcov.info`, `coverage-summary.json`, or a directory of either | Line, branch, function and statement coverage | `node-coverage` |
+
+<!-- markdownlint-enable MD013 -->
+
+Reporting never changes the job's result. The `Run tests` step alone
+decides pass or fail, honouring `test_permit_fail`, and the reports
+still render after a failing run, when they matter most. A report
+that does not exist raises a warning, not an error: a suite that
+crashes before writing one has already failed the job. The workflow
+reports coverage but enforces no threshold.
+
+[junit-test-report-action](https://github.com/lfreleng-actions/junit-test-report-action)
+renders the JUnit counts. For coverage, the job reads the istanbul
+`json-summary` format when `coverage-summary.json` exists, and
+otherwise totals the `LF`/`LH`, `BRF`/`BRH` and `FNF`/`FNH` records of
+`lcov.info`. `lcov.info` carries no statement count, so that row
+needs `coverage-summary.json`. The `node-coverage` artefact holds
+what `coverage_path` names: name the directory to keep the HTML
+report beside `lcov.info` for a later Sonar or Codecov job. The names
+stay fixed, so a run that calls the workflow more than once with these
+inputs set holds one artefact of each name per call, and a download by
+name returns one of them.
+
+The tests job runs `package.json` scripts by name, and accepts names
+made of letters, digits, `-` and `_` (`test-ci`, not `test:ci`). Add
+a script that writes the reports and select it with `test_script`:
+
+```yaml
+    with:
+      test_script: 'test-ci'
+      junit_report_path: 'junit.xml'
+      coverage_path: 'coverage'
+```
+
+A `test-ci` script for each common runner, writing `junit.xml` and a
+`coverage` directory:
+
+<!-- markdownlint-disable MD013 -->
+
+- Jest, with the `jest-junit` package:
+
+  ```json
+  "test-ci": "jest --ci --coverage --coverageReporters=lcov --coverageReporters=json-summary --reporters=default --reporters=jest-junit"
+  ```
+
+- Vitest, with `@vitest/coverage-v8`. Without `reportOnFailure`,
+  Vitest writes no coverage for a failing run:
+
+  ```json
+  "test-ci": "vitest run --reporter=default --reporter=junit --outputFile.junit=junit.xml --coverage --coverage.reporter=lcov --coverage.reporter=json-summary --coverage.reportOnFailure"
+  ```
+
+- Mocha, with the `mocha-junit-reporter` and `c8` packages:
+
+  ```json
+  "test-ci": "c8 --reporter=lcov --reporter=json-summary mocha --reporter mocha-junit-reporter --reporter-options mochaFile=junit.xml"
+  ```
+
+- The Node.js test runner, with no packages. Its coverage is still
+  experimental and writes `lcov.info` alone, and each
+  `--test-reporter-destination` directory has to exist already, so
+  this writes both reports to the project root; set
+  `coverage_path: 'lcov.info'`:
+
+  ```json
+  "test-ci": "node --test --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=junit.xml --test-reporter=lcov --test-reporter-destination=lcov.info"
+  ```
+
+<!-- markdownlint-enable MD013 -->
+
+> [!NOTE]
+> junit-test-report-action counts `<testsuite>` elements. Node.js
+> writes a top-level `test()` straight under `<testsuites>`, where
+> the summary misses it: group tests in a `describe()` or `suite()`.
 
 ## Self-testing
 
