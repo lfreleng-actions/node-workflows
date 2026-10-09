@@ -111,12 +111,15 @@ change ref re-runs an already-merged change, and an unmerged one
 fails the run.
 
 Because the run reads Gerrit, a caller has no reason to wait for
-replication to the GitHub mirror before calling it. Callers should
-serialise merge runs per repository: every merge publishes the same
-`X.Y.Z-SNAPSHOT`, so two runs at once race to publish it. The Gerrit
-caller in `examples/merge/gerrit.yaml` queues them with
+replication to the GitHub mirror before calling it.
+
+Callers should serialise merge runs per repository: every merge
+publishes the same `X.Y.Z-SNAPSHOT`, so two runs at once race to
+publish it. Both callers in `examples/merge/` queue them with
 `cancel-in-progress: false` and `queue: max`, rather than cancelling
-runs or grouping them by change.
+runs or grouping them by change or branch. Without `queue: max` a
+newer run replaces a pending one, and a release file that the
+replaced run's commit added never publishes.
 
 Release publishes also gain attestation and a signature. The build job
 uploads the built tree rather than a tarball, so a `pack-release` job
