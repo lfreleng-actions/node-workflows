@@ -58,7 +58,9 @@ gerrit-validate -> resolve-commit -> { repository-metadata
 resolve-version -> check-release
 node-metadata -> build
 { resolve-version | build } -> snapshot-publish
-{ check-release | resolve-version | build } -> release-publish
+{ check-release | resolve-version | build } -> pack-release (stamp, pack, SBOM)
+pack-release -> { attest | sign-artefacts | grype }
+{ pack-release | attest | sign-artefacts } -> release-publish
 ```
 
 ## Release Models
@@ -137,6 +139,26 @@ Disabling either toggle skips that job and lets the publish proceed.
 
 Snapshot publishes stay unattested and unsigned by design, since every
 merge replaces them.
+
+The `pack-release` job also generates a CycloneDX SBOM of the release
+(`sbom-action`, syft backend) and uploads it as the
+`sbom-files-node-merge` workflow artefact, named apart from the verify
+lane's `sbom-files`. It scans the project directory after the version
+stamp, not the tarball: `npm pack` leaves out `package-lock.json`, so
+the packed tree yields no components, while the stamped lockfile puts
+the release version on the root component. A failed SBOM fails
+`pack-release` and so blocks the publish, as the records above do, so
+the run that publishes a version always uploads its SBOM; set
+`sbom_enabled: false` to skip it. A dry run still generates it, since
+a workflow artefact leaves no public record. Snapshots get no SBOM, as
+with attestation and signing; the verify lane's SBOM already covers
+each change's dependencies.
+
+A `grype` job then scans the release SBOM, informationally, as in
+`java-workflows`' merge lane: findings at `medium` or above appear in
+the job summary, but the job never fails the run and the publish does
+not wait for it. The verify lane's Grype scan is the gate. Set
+`grype_enabled: false` to skip it.
 
 The calling job must grant `id-token: write` and `attestations: write`.
 A caller's `permissions` block caps what the reusable workflow's jobs
@@ -261,6 +283,8 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 | `build_scripts`            | string  | `'build'`    | package.json script(s) the build job runs                                                                                        |
 | `attestations`             | boolean | `true`       | SLSA build provenance for the packed release tarball (release publishes)                                                         |
 | `sigstore_sign`            | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
+| `sbom_enabled`             | boolean | `true`       | Generate the release SBOM (`sbom-files-node-merge` artefact); a failure blocks the release publish                               |
+| `grype_enabled`            | boolean | `true`       | Run the informational Grype scan over the release SBOM; never fails the run                                                      |
 | `snapshot_targets`         | string  | `''`         | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
 | `release_targets`          | string  | `''`         | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
 | `snapshot_registry_url`    | string  | `''`         | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |

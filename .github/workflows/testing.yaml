@@ -539,6 +539,85 @@ jobs:
                   "pack-release, but publishes that job's tarball"
               )
 
+          # The release SBOM (#127) has to scan the stamped project
+          # directory: the packed tree holds no lockfile and yields no
+          # components, and a scan before the stamp records the
+          # committed version rather than the release. It blocks the
+          # publish through pack-release, so continue-on-error there
+          # would let a version ship without one. The artefact name
+          # must differ from build-test.yaml's sbom-files, and the
+          # Grype job must read it without ever gating the publish.
+          pack_steps = merge_jobs['pack-release'].get('steps') or []
+          step_ids = [s.get('id') for s in pack_steps]
+          sbom_at = [
+              i for i, s in enumerate(pack_steps)
+              if 'sbom-action' in str(s.get('uses', ''))
+          ]
+          if len(sbom_at) != 1:
+              errors.append(
+                  f'merge.yaml/pack-release has {len(sbom_at)} '
+                  'sbom-action steps, expected one'
+              )
+          else:
+              sbom_step = pack_steps[sbom_at[0]]
+              sbom_with = sbom_step.get('with') or {}
+              if 'pack' not in step_ids or sbom_at[0] < step_ids.index(
+                      'pack'):
+                  errors.append(
+                      'merge.yaml/pack-release generates the SBOM '
+                      'before the stamp, so it misses the release version'
+                  )
+              wanted_prefix = OPEN + 'inputs.path_prefix' + CLOSE
+              if str(sbom_with.get('path_prefix', '')) != wanted_prefix:
+                  errors.append(
+                      'merge.yaml/pack-release scans '
+                      f"{sbom_with.get('path_prefix')!r}, expected "
+                      f'{wanted_prefix!r}; only the project directory '
+                      'holds the lockfile'
+                  )
+              if not str(sbom_with.get('output_directory', '')).startswith(
+                      OPEN + 'runner.temp' + CLOSE):
+                  errors.append(
+                      'merge.yaml/pack-release writes the SBOM outside '
+                      'RUNNER_TEMP, where it can enter the project tree'
+                  )
+              if sbom_step.get('continue-on-error'):
+                  errors.append(
+                      'merge.yaml/pack-release lets the SBOM fail, so a '
+                      'release could publish without one'
+                  )
+          uploads = [
+              str((s.get('with') or {}).get('name', ''))
+              for s in pack_steps
+              if 'upload-artifact' in str(s.get('uses', ''))
+          ]
+          if 'sbom-files-node-merge' not in uploads:
+              errors.append(
+                  'merge.yaml/pack-release uploads no '
+                  'sbom-files-node-merge artefact'
+              )
+          grype_job = merge_jobs.get('grype') or {}
+          grype_names = [
+              str((s.get('with') or {}).get('name', ''))
+              for s in grype_job.get('steps') or []
+              if 'download-artifact' in str(s.get('uses', ''))
+          ]
+          if grype_names != ['sbom-files-node-merge']:
+              errors.append(
+                  f'merge.yaml/grype downloads {grype_names!r}, '
+                  "expected ['sbom-files-node-merge']"
+              )
+          if grype_job.get('continue-on-error') is not True:
+              errors.append(
+                  'merge.yaml/grype is not continue-on-error, so a '
+                  'scanner failure would fail the merge run'
+              )
+          if 'grype' in (merge_jobs['release-publish'].get('needs') or []):
+              errors.append(
+                  'merge.yaml/release-publish needs grype, so an '
+                  'informational scan would gate the publish'
+              )
+
           # A release version that disagrees with version.properties
           # has to fail the run (#118). It used to be a version
           # equality in pack-release's 'if:', which skipped the pack,
