@@ -633,6 +633,73 @@ jobs:
                       'permanent record for a version that never shipped'
                   )
 
+          # A release leg publishes only when its registry check says
+          # so, which is what lets a re-run skip targets that already
+          # hold the release (#124).
+          step = [
+              s for s in merge_jobs['release-publish'].get('steps') or []
+              if s.get('name') == 'Publish release'
+          ]
+          step_if = str(step[0].get('if', '')) if step else ''
+          if "steps.registry-check.outputs.publish == 'true'" not in step_if:
+              errors.append(
+                  "merge.yaml/release-publish 'Publish release' ignores "
+                  'the registry check, so a re-run republishes'
+              )
+          # The check resolves the destination with npm, whose answer
+          # varies by release, so the publish's Node.js must be set up
+          # first: the runner's own npm can resolve another registry.
+          names = [
+              s.get('id') or s.get('name')
+              for s in merge_jobs['release-publish'].get('steps') or []
+          ]
+          if ('Set up Node.js' not in names or 'registry-check' not in names
+                  or names.index('Set up Node.js')
+                  > names.index('registry-check')):
+              errors.append(
+                  'merge.yaml/release-publish runs its registry check '
+                  'before setting up the Node.js the publish uses'
+              )
+
+          # release_only recovers a missed release without the snapshot
+          # lane, which would republish the snapshot from an old commit
+          # (#124). Gating the snapshot resolver is what skips it, so
+          # snapshot-publish must keep requiring the resolver's
+          # success. Nothing on the release path may carry the gate,
+          # and a recovery at a commit adding no release file has to
+          # fail rather than go green having published nothing.
+          resolver_if = str(
+              merge_jobs['resolve-snapshot-targets'].get('if', ''))
+          if '!inputs.release_only' not in resolver_if:
+              errors.append(
+                  'merge.yaml/resolve-snapshot-targets is not skipped '
+                  'by release_only, so a recovery publishes a snapshot'
+              )
+          if ("needs.resolve-snapshot-targets.result == 'success'"
+                  not in str(merge_jobs['snapshot-publish'].get('if', ''))):
+              errors.append(
+                  'merge.yaml/snapshot-publish does not require its '
+                  'resolver to succeed, so release_only cannot skip it'
+              )
+          for job_id in ('resolve-release-targets', 'check-release',
+                         'pack-release', 'release-publish'):
+              if 'release_only' in str(merge_jobs[job_id].get('if', '')):
+                  errors.append(
+                      f'merge.yaml/{job_id} is gated on release_only, '
+                      'which must never stop the release itself'
+                  )
+          guard = [
+              s for s in merge_jobs['check-release'].get('steps') or []
+              if 'inputs.release_only' in str(s.get('if', ''))
+          ]
+          if (len(guard) != 1
+                  or "has_release != 'true'" not in str(guard[0]['if'])
+                  or 'exit 1' not in str(guard[0].get('run', ''))):
+              errors.append(
+                  'merge.yaml/check-release does not fail a release_only '
+                  'run whose commit adds no release file'
+              )
+
           # Snapshots publish under snapshot_dist_tag, never the
           # action's default 'latest', which npm install resolves and
           # which has to keep naming the newest release (#122).
@@ -1341,6 +1408,317 @@ jobs:
           fi
           echo "Credential gate correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
 
+  # A release leg asks the registry before publishing, so a re-run
+  # skips targets that already hold the release (#124). No registry is
+  # reachable from here, so the check is extracted and run against a
+  # stub npm answering as each registry state would.
+  release-registry-check:
+    name: 'Test: release registry check'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise the release registry check'
+        shell: bash
+        run: |
+          # Exercise the release registry check
+          check="${RUNNER_TEMP}/registry-check.sh"
+          python3 - <<'EXTRACT' > "${check}"
+          import sys
+
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              jobs = yaml.safe_load(handle)['jobs']
+          steps = [
+              s for s in jobs['release-publish']['steps']
+              if s.get('id') == 'registry-check'
+          ]
+          if len(steps) != 1:
+              sys.exit('Could not extract the registry check')
+          print(steps[0]['run'])
+          EXTRACT
+
+          # Release tarballs as npm packs them: everything under
+          # package/. $1 file name, $2 package.json content
+          make_tarball() {
+            local dir
+            dir="$(mktemp -d)"
+            mkdir "${dir}/package"
+            printf '%s\n' "$2" > "${dir}/package/package.json"
+            tar -czf "${RUNNER_TEMP}/$1" -C "${dir}" package
+          }
+          make_tarball widget.tgz '{"name": "@acme/widget", "version": "1.2.3"}'
+          make_tarball stale.tgz '{"name": "@acme/widget", "version": "1.2.2"}'
+          make_tarball redirect.tgz '{"name": "@acme/widget",
+            "version": "1.2.3", "publishConfig":
+            {"@acme:registry": "https://elsewhere.example.org/"}}'
+          make_tarball pinned.tgz '{"name": "@acme/widget",
+            "version": "1.2.3", "publishConfig":
+            {"registry": "https://registry.example.org/npm"}}'
+          make_tarball masked.tgz '{"name": "@acme/widget",
+            "version": "1.2.3", "publishConfig": {"registry": ""}}'
+          make_tarball unmasked.tgz '{"name": "@acme/widget",
+            "version": "1.2.3", "publishConfig": {"@acme:registry": ""}}'
+          make_tarball padded.tgz '{"name": " @acme/widget\t",
+            "version": "1.2.3"}'
+          make_tarball unscoped.tgz '{"name": "widget",
+            "version": "1.2.3", "publishConfig": {"scope": null}}'
+          tarball="${RUNNER_TEMP}/widget.tgz"
+          pinned="${RUNNER_TEMP}/pinned.tgz"
+          registry='https://registry.example.org/npm/'
+          npmrc="${RUNNER_TEMP}/read.npmrc"
+          : > "${npmrc}"
+          summary="${RUNNER_TEMP}/summary.md"
+          project="${RUNNER_TEMP}/project"
+          mkdir -p "${project}"
+          # 'key value' lines npm config list --json answers from,
+          # standing in for the project's npm configuration; empty
+          # unless a case sets one. A value that parses as JSON, such
+          # as null, is taken as JSON, as npm reports it
+          npm_config="${RUNNER_TEMP}/npm-config"
+          : > "${npm_config}"
+
+          # The stand-in npm answers config list --json from
+          # STUB_CONFIG, and npm view, whose arguments it records, as
+          # the registry state named by STUB_MODE would. STUB_FILE is
+          # the tarball the registry is meant to hold. The project sits
+          # in a workspace whose root redirects the publish: without
+          # --no-workspaces, as the publish passes, npm reads the
+          # root's configuration instead of the project's.
+          stub="${RUNNER_TEMP}/stub-bin"
+          args="${RUNNER_TEMP}/npm-args"
+          mkdir -p "${stub}"
+          cat > "${stub}/npm" <<'STUB'
+          #!/usr/bin/env bash
+          if [ "$1" = 'config' ]; then
+            [ "$2 $3" = 'list --json' ] || exit 98
+            if [ "$4" != '--no-workspaces' ]; then
+              echo '{"scope": "@root",
+                "@root:registry": "https://elsewhere.example.org/"}'
+              exit 0
+            fi
+            jq -Rn '[inputs | capture("^(?<k>[^ ]+) (?<v>.*)$")
+              | .v as $v | {(.k): (try ($v | fromjson) catch $v)}]
+              | add // {}' "${STUB_CONFIG}"
+            exit 0
+          fi
+          printf '%s\n' "$@" > "${STUB_ARGS}"
+          sha512="sha512-$(openssl dgst -sha512 -binary "${STUB_FILE}" \
+            | openssl base64 -A)"
+          sha1="$(openssl dgst -sha1 -r "${STUB_FILE}")"
+          sha1="${sha1%% *}"
+          case "${STUB_MODE}" in
+            e404)
+              echo '{"error": {"code": "E404"}}'
+              echo 'npm error code E404' >&2
+              exit 1 ;;
+            empty) ;;
+            identical)
+              printf '{"integrity": "%s sha1-x", "shasum": "%s"}\n' \
+                "${sha512}" "${sha1}" ;;
+            sha1-only) printf '{"shasum": "%s"}\n' "${sha1^^}" ;;
+            # Another algorithm in integrity leaves sha1 to decide
+            sha1-different)
+              printf '{"integrity": "sha384-x", "shasum": "%s"}\n' \
+                "$(printf '0%.0s' {1..40})" ;;
+            # sha512 decides even where the legacy sha1 agrees
+            different)
+              printf '{"integrity": "sha512-AAAA", "shasum": "%s"}\n' \
+                "${sha1}" ;;
+            no-digest) echo '{"tarball": "https://example.org/w.tgz"}' ;;
+            e401)
+              echo '{"error": {"code": "E401"}}'
+              echo 'npm error code E401' >&2
+              exit 1 ;;
+            network)
+              echo 'npm error code ENOTFOUND' >&2
+              exit 1 ;;
+            *) exit 99 ;;
+          esac
+          STUB
+          chmod +x "${stub}/npm"
+
+          errors=0
+          # $1 case, $2 registry state, $3 DRY_RUN,
+          # $4 want (publish|skip|unchecked|fail), $5 tarball (default
+          # widget); unchecked publishes without querying the registry
+          check() {
+            local out_file="${RUNNER_TEMP}/check.out" file="${5:-${tarball}}"
+            : > "${out_file}"
+            : > "${args}"
+            set +e
+            out="$(PATH="${stub}:${PATH}" STUB_MODE="$2" \
+              STUB_ARGS="${args}" STUB_FILE="${file}" \
+              STUB_CONFIG="${npm_config}" PROJECT_DIR="${project}" \
+              TARBALL="${file}" PUBLISH_VERSION='1.2.3' \
+              REGISTRY_URL="${registry}" TARGET_NAME='example' \
+              NPMRC_PATH="${npmrc}" DRY_RUN="$3" \
+              GITHUB_OUTPUT="${out_file}" GITHUB_STEP_SUMMARY="${summary}" \
+              bash -eo pipefail "${check}" 2>&1)"
+            rc=$?
+            set -e
+            case "$4" in
+              publish|skip|unchecked)
+                local want=true
+                [ "$4" = 'skip' ] && want=false
+                if [ "${rc}" != '0' ] \
+                  || ! grep -qx "publish=${want}" "${out_file}"; then
+                  echo "$1: expected publish=${want} ❌"
+                  printf '%s\n' "${out}"
+                  errors=1
+                fi
+                if [ "$4" = 'unchecked' ] && [ -s "${args}" ]; then
+                  echo "$1: expected no registry query ❌"
+                  errors=1
+                fi
+                # The destination is project configuration, which can
+                # carry a credential, so it must never reach the log
+                if printf '%s' "${out}" | grep -q 'elsewhere'; then
+                  echo "$1: printed the configured registry ❌"
+                  errors=1
+                fi
+                ;;
+              fail)
+                if [ "${rc}" = '0' ] \
+                  || ! printf '%s' "${out}" | grep -q '^::error::'; then
+                  echo "$1: expected a failure with an error ❌"
+                  printf '%s\n' "${out}"
+                  errors=1
+                fi
+                ;;
+            esac
+          }
+
+          check 'absent (E404)' e404 false publish
+          # The query must read the leg's registry, with the leg's
+          # credential, and pin the package's scope: npm prefers a
+          # scoped registry setting over --registry
+          for want in --registry "${registry}" --userconfig "${npmrc}" \
+            "--@acme:registry=${registry}" '@acme/widget@1.2.3'; do
+            if ! grep -qxF -- "${want}" "${args}"; then
+              echo "npm view was not given ${want} ❌"
+              errors=1
+            fi
+          done
+          check 'absent (npm 6 empty output)' empty false publish
+          check 'identical integrity' identical false skip
+          check 'identical legacy shasum' sha1-only false skip
+          check 'different integrity' different false fail
+          # A mismatch reports the pair of digests that decided it
+          check 'different legacy shasum' sha1-different false fail
+          want='Registry: sha1 0{40}; this run: sha1 [0-9a-f]{40}$'
+          if ! printf '%s' "${out}" | grep -qE "${want}"; then
+            echo "different legacy shasum: digests not reported ❌"
+            printf '%s\n' "${out}"
+            errors=1
+          fi
+          check 'present without a digest' no-digest false fail
+          # Only a definite absence publishes; a read that failed for
+          # any other reason must not publish blind
+          check 'read refused' e401 false fail
+          check 'registry unreachable' network false fail
+          # A dry run publishes nothing, so a refused read still
+          # rehearses; what it does read decides as live
+          check 'dry run, read refused' e401 true publish
+          check 'dry run, identical' identical true skip
+          check 'dry run, different' different true fail
+          check 'tarball of another version' e404 false fail \
+            "${RUNNER_TEMP}/stale.tgz"
+          check 'publishConfig naming the target' identical false skip \
+            "${pinned}"
+          # This check cannot read a registry the package is sent to
+          # elsewhere, so it publishes as before and warns, without
+          # querying: by publishConfig, by the project's setting for
+          # the package's scope, or by one for the configured scope
+          check 'publishConfig redirect' identical false unchecked \
+            "${RUNNER_TEMP}/redirect.tgz"
+          # Empty still masks --registry before npm 10.5.2
+          check 'empty publishConfig registry' identical false unchecked \
+            "${RUNNER_TEMP}/masked.tgz"
+          echo '@acme:registry https://elsewhere.example.org/' \
+            > "${npm_config}"
+          check 'project .npmrc redirect' identical false unchecked
+          printf '%s\n' 'scope @other' \
+            '@other:registry https://elsewhere.example.org/' \
+            > "${npm_config}"
+          check 'configured scope redirect' identical false unchecked
+          # A literal scope=undefined is a scope npm honours, and some
+          # npm releases print it without the '@'
+          printf '%s\n' 'scope undefined' \
+            '@undefined:registry https://elsewhere.example.org/' \
+            > "${npm_config}"
+          check "scope named 'undefined'" identical false unchecked
+          # npm takes the first registry that applies, so the package's
+          # own scope naming the target outranks a configured scope
+          printf '%s\n' "@acme:registry ${registry}" 'scope @other' \
+            '@other:registry https://elsewhere.example.org/' \
+            > "${npm_config}"
+          check 'own scope outranks configured scope' identical false skip
+          # A present but empty publishConfig key masks the project's
+          # setting, and npm falls through to --registry
+          echo '@acme:registry https://elsewhere.example.org/' \
+            > "${npm_config}"
+          check 'empty publishConfig masks .npmrc' identical false skip \
+            "${RUNNER_TEMP}/unmasked.tgz"
+          echo "@acme:registry ${registry}" > "${npm_config}"
+          check 'project .npmrc naming the target' identical false skip
+          # npm trims the name before publishing, and so must the query
+          check 'name with surrounding whitespace' identical false skip \
+            "${RUNNER_TEMP}/padded.tgz"
+          if ! grep -qxF -- '@acme/widget@1.2.3' "${args}"; then
+            echo "name with surrounding whitespace: not trimmed ❌"
+            errors=1
+          fi
+          # From npm 9 a scope=null or scope=false is no scope at all,
+          # and config list --json reports it as JSON null or false;
+          # npm 8 honours it, and reports it as '@null'
+          printf '%s\n' 'scope null' \
+            '@null:registry https://elsewhere.example.org/' \
+            > "${npm_config}"
+          check 'scope=null, npm 9 onwards' identical false skip
+          printf '%s\n' 'scope false' \
+            '@false:registry https://elsewhere.example.org/' \
+            > "${npm_config}"
+          check 'scope=false, npm 9 onwards' identical false skip
+          printf '%s\n' 'scope @null' \
+            '@null:registry https://elsewhere.example.org/' \
+            > "${npm_config}"
+          check 'scope=null, npm 8' identical false unchecked
+          # A null publishConfig scope masks the configured one, and
+          # names no scope of its own
+          printf '%s\n' 'scope @other' \
+            '@other:registry https://elsewhere.example.org/' \
+            '@null:registry https://elsewhere.example.org/' \
+            > "${npm_config}"
+          check 'null publishConfig scope masks .npmrc' identical false \
+            skip "${RUNNER_TEMP}/unscoped.tgz"
+          : > "${npm_config}"
+
+          if [ "${errors}" != '0' ]; then
+            echo "Registry check incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Registry check correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
   # snapshot_dist_tag must never be 'latest', and must be a tag npm
   # accepts (#122). The validation step is extracted and driven with
   # the values that matter.
@@ -1720,6 +2098,8 @@ jobs:
               ('merge.yaml', 'snapshot-publish', 'Publish snapshot'):
                   'node_version',
               ('merge.yaml', 'release-publish', 'Publish release'):
+                  'node_version',
+              ('merge.yaml', 'release-publish', 'Set up Node.js'):
                   'node_version',
               ('build-test-release.yaml', 'build', 'Set up Node.js'):
                   'node_version',
