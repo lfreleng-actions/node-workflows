@@ -458,29 +458,79 @@ Nexus publishing uses the 1Password credential model through
 
 ## Verifying Release Artefacts (Model A)
 
-Verify the SLSA build provenance attestation with the GitHub CLI:
+The attestation and the signature both come from jobs inside this
+reusable workflow, so the Sigstore certificate behind each one names
+the reusable workflow as the signer. The calling run's repository and
+tag appear in the GitHub extensions of the certificate, not in its
+identity:
 
-```shell
-gh attestation verify <package>-<version>.tgz --repo <owner>/<repo>
-```
+<!-- markdownlint-disable MD013 -->
 
-Verify the Sigstore signature bundle with cosign:
+| Certificate field                             | Binds                                       | Value                                                                                                |
+| --------------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Subject Alternative Name (identity)           | This workflow, at the ref the caller pinned | `https://github.com/lfreleng-actions/node-workflows/.github/workflows/build-test-release.yaml@<ref>` |
+| GitHub Workflow Repository                    | The calling repository                      | `<owner>/<repo>`                                                                                     |
+| GitHub Workflow Ref and Source Repository Ref | The tag the caller ran on                   | `refs/tags/<tag>`                                                                                    |
+| GitHub Workflow Trigger                       | The triggering event                        | `push`                                                                                               |
+
+<!-- markdownlint-enable MD013 -->
+
+`<ref>` is whatever follows `@` in the caller's `uses:` line,
+typically a node-workflows commit SHA. Check the identity and the
+extensions together: the identity alone accepts an artefact that any
+project released through this workflow, and the extensions alone
+accept one from any workflow that ran on that tag.
+
+The extensions describe the calling run, not the checkout. The
+`repository` and `ref` inputs can point the build at other source, so
+the extensions identify the packaged source when the caller leaves
+both inputs empty, as the examples do, and not otherwise.
+
+Verify the SLSA build provenance attestation with GitHub CLI v2.102.0
+or later; earlier releases matched `--signer-workflow` as a prefix
+([GHSA-wjmr-j3rp-mh2g]) and `--source-ref` without regard to case
+([GHSA-4mq3-hpgx-9cx8]). `--signer-workflow` is mandatory: without it
+`gh` expects a signer in the project repository and rejects every
+release:
 
 <!-- markdownlint-disable MD013 -->
 
 ```shell
-# Pin the identity to this reusable workflow and the release tag so
-# signatures from unrelated workflows or refs get rejected; replace
-# <tag> with the release tag under verification
+gh attestation verify <package>-<version>.tgz \
+  --repo <owner>/<repo> \
+  --signer-workflow lfreleng-actions/node-workflows/.github/workflows/build-test-release.yaml \
+  --source-ref refs/tags/<tag>
+```
+
+<!-- markdownlint-enable MD013 -->
+
+Verify the Sigstore signature bundle with cosign v3 or later. The
+workflow emits a v0.3 Sigstore bundle, which cosign v2.2 cannot read:
+
+<!-- markdownlint-disable MD013 -->
+
+```shell
 cosign verify-blob \
   --bundle <package>-<version>.tgz.sigstore.json \
   --certificate-identity-regexp \
-  'https://github.com/lfreleng-actions/node-workflows/.github/workflows/build-test-release.yaml@refs/tags/<tag>' \
+  '^https://github\.com/lfreleng-actions/node-workflows/\.github/workflows/build-test-release\.yaml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-repository <owner>/<repo> \
+  --certificate-github-workflow-ref refs/tags/<tag> \
+  --certificate-github-workflow-trigger push \
   <package>-<version>.tgz
 ```
 
 <!-- markdownlint-enable MD013 -->
+
+Both commands accept any revision of this workflow. To pin the
+revision as well, take the commit SHA from the project's caller at the
+release tag, add `--signer-digest <sha>` to the `gh` command, and
+replace cosign's `--certificate-identity-regexp` with
+`--certificate-identity` and the full SAN ending in `@<sha>`.
+
+[GHSA-wjmr-j3rp-mh2g]: https://github.com/cli/cli/security/advisories/GHSA-wjmr-j3rp-mh2g
+[GHSA-4mq3-hpgx-9cx8]: https://github.com/cli/cli/security/advisories/GHSA-4mq3-hpgx-9cx8
 
 ## Usage
 
