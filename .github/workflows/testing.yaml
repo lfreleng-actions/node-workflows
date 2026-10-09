@@ -635,30 +635,80 @@ jobs:
 
           # A release leg publishes only when its registry check says
           # so, which is what lets a re-run skip targets that already
-          # hold the release (#124).
-          step = [
-              s for s in merge_jobs['release-publish'].get('steps') or []
-              if s.get('name') == 'Publish release'
-          ]
-          step_if = str(step[0].get('if', '')) if step else ''
-          if "steps.registry-check.outputs.publish == 'true'" not in step_if:
+          # hold the release (#124, #141).
+          with open('.github/workflows/build-test-release.yaml') as handle:
+              btr_jobs = yaml.safe_load(handle)['jobs']
+          for name, lane_jobs, job_id in (
+                  ('merge.yaml', merge_jobs, 'release-publish'),
+                  ('build-test-release.yaml', btr_jobs, 'nexus-publish')):
+              step = [
+                  s for s in lane_jobs[job_id].get('steps') or []
+                  if s.get('name') == 'Publish release'
+              ]
+              step_if = str(step[0].get('if', '')) if step else ''
+              registry_gate = "steps.registry-check.outputs.publish == 'true'"
+              if registry_gate not in step_if:
+                  errors.append(
+                      f"{name}/{job_id} 'Publish release' ignores "
+                      'the registry check, so a re-run republishes'
+                  )
+              # The check resolves the destination with npm, whose
+              # answer varies by release, so the publish's Node.js must
+              # be set up first: the runner's own npm can resolve
+              # another registry.
+              names = [
+                  s.get('id') or s.get('name')
+                  for s in lane_jobs[job_id].get('steps') or []
+              ]
+              if ('Set up Node.js' not in names
+                      or 'registry-check' not in names
+                      or names.index('Set up Node.js')
+                      > names.index('registry-check')):
+                  errors.append(
+                      f'{name}/{job_id} runs its registry check '
+                      'before setting up the Node.js the publish uses'
+                  )
+
+          # Model A publishes before it promotes (#141), so a registry
+          # refusing the release leaves the GitHub release a draft. The
+          # publish still follows attach-artefacts, the job gating on
+          # every audit, test and provenance record. Promotion may pass
+          # a skipped publish only when publishing is off: a skip from
+          # a failed resolver must stop it too.
+          def needs_of(job):
+              found = job.get('needs') or []
+              return [found] if isinstance(found, str) else found
+
+          btr_publish = btr_jobs['nexus-publish']
+          btr_promote = btr_jobs['promote-release']
+          if 'promote-release' in needs_of(btr_publish):
               errors.append(
-                  "merge.yaml/release-publish 'Publish release' ignores "
-                  'the registry check, so a re-run republishes'
+                  'build-test-release.yaml/nexus-publish waits on '
+                  'promote-release, so a failed publish leaves the '
+                  'release promoted'
               )
-          # The check resolves the destination with npm, whose answer
-          # varies by release, so the publish's Node.js must be set up
-          # first: the runner's own npm can resolve another registry.
-          names = [
-              s.get('id') or s.get('name')
-              for s in merge_jobs['release-publish'].get('steps') or []
-          ]
-          if ('Set up Node.js' not in names or 'registry-check' not in names
-                  or names.index('Set up Node.js')
-                  > names.index('registry-check')):
+          if ('attach-artefacts' not in needs_of(btr_publish)
+                  or "needs.attach-artefacts.result == 'success'"
+                  not in str(btr_publish.get('if', ''))):
               errors.append(
-                  'merge.yaml/release-publish runs its registry check '
-                  'before setting up the Node.js the publish uses'
+                  'build-test-release.yaml/nexus-publish does not '
+                  'require attach-artefacts to succeed, so a failed '
+                  'audit or test would not stop the publish'
+              )
+          promote_if = str(btr_promote.get('if', ''))
+          wanted = (
+              "(needs.nexus-publish.result == 'success' || "
+              "(needs.nexus-publish.result == 'skipped' && "
+              '!inputs.nexus_publish))'
+          )
+          if ('nexus-publish' not in needs_of(btr_promote)
+                  or wanted not in promote_if
+                  or "needs.attach-artefacts.result == 'success'"
+                  not in promote_if):
+              errors.append(
+                  'build-test-release.yaml/promote-release does not '
+                  f'require attach-artefacts and {wanted}, so it can '
+                  'promote a release the registries do not hold'
               )
 
           # release_only recovers a missed release without the snapshot
@@ -1409,9 +1459,10 @@ jobs:
           echo "Credential gate correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # A release leg asks the registry before publishing, so a re-run
-  # skips targets that already hold the release (#124). No registry is
-  # reachable from here, so the check is extracted and run against a
-  # stub npm answering as each registry state would.
+  # skips targets that already hold the release (#124, #141). No
+  # registry is reachable from here, so the check is extracted and run
+  # against a stub npm answering as each registry state would. Both
+  # release lanes carry it, and must carry the same one.
   release-registry-check:
     name: 'Test: release registry check'
     runs-on: ubuntu-latest
@@ -1446,15 +1497,27 @@ jobs:
 
           import yaml
 
-          with open('.github/workflows/merge.yaml') as handle:
-              jobs = yaml.safe_load(handle)['jobs']
-          steps = [
-              s for s in jobs['release-publish']['steps']
-              if s.get('id') == 'registry-check'
-          ]
-          if len(steps) != 1:
-              sys.exit('Could not extract the registry check')
-          print(steps[0]['run'])
+          # workflow -> the release publish job carrying the check
+          LANES = {
+              'merge.yaml': 'release-publish',
+              'build-test-release.yaml': 'nexus-publish',
+          }
+          bodies = {}
+          for name, job_id in LANES.items():
+              with open(f'.github/workflows/{name}') as handle:
+                  jobs = yaml.safe_load(handle)['jobs']
+              steps = [
+                  s for s in jobs[job_id]['steps']
+                  if s.get('id') == 'registry-check'
+              ]
+              if len(steps) != 1:
+                  sys.exit(f'Could not extract the check from {name}')
+              bodies[name] = steps[0]['run']
+          # One check for both lanes: a copy that drifted would let one
+          # lane's re-run republish, or fail, where the other's skips
+          if len(set(bodies.values())) != 1:
+              sys.exit('The two registry checks differ')
+          print(next(iter(bodies.values())))
           EXTRACT
 
           # Release tarballs as npm packs them: everything under
@@ -2111,6 +2174,8 @@ jobs:
                   'test_node_version',
               ('build-test-release.yaml', 'audit', 'Audit dependencies'):
                   'node_version',
+              ('build-test-release.yaml', 'nexus-publish',
+               'Set up Node.js'): 'node_version',
               ('build-test-release.yaml', 'nexus-publish',
                'Publish release'): 'node_version',
           }

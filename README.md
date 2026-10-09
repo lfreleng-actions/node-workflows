@@ -45,9 +45,12 @@ expensive test suite on releases):
 ```text
 gerrit-validate -> { repository-metadata | node-metadata | tag-validate }
 { tag-validate | node-metadata } -> build -> { audit | sbom -> grype }
-  -> tests -> attach-artefacts -> promote-release -> nexus-publish
+  -> tests -> attach-artefacts -> nexus-publish -> promote-release
 build -> sign-artefacts -> attach-artefacts
 ```
+
+`nexus-publish` skips when `nexus_publish` is `false`, and
+`promote-release` then follows `attach-artefacts` directly.
 
 `merge.yaml`:
 
@@ -76,9 +79,12 @@ then attests and signs it:
   (toggle with the `sigstore_sign` input)
 
 The tarball, Sigstore bundle and SBOM files attach to a draft GitHub
-release, which the workflow then promotes. With `nexus_publish: true`
-the workflow also publishes the package to every configured registry,
-in parallel, using the credential contract below.
+release. With `nexus_publish: true` the workflow then publishes the
+package to every configured registry, in parallel, using the
+credential contract below. The workflow promotes the release last,
+once every publish leg has succeeded: a registry that refuses the
+package leaves the release a draft, and re-running the failed jobs
+completes it (see [Re-running a Release](#re-running-a-release)).
 
 ### Model B: merge-driven (`merge.yaml`)
 
@@ -171,8 +177,9 @@ yields registry-native provenance too.
 ### Re-running a Release
 
 npm never overwrites a published version, and a release reaching
-more than one registry is not atomic. Before publishing, each
-`merge.yaml` release leg asks its registry for the version
+more than one registry is not atomic. Before publishing, each release
+leg (`merge.yaml`'s `release-publish`, and `build-test-release.yaml`'s
+`nexus-publish`) asks its registry for the version
 (`npm view <package>@<version> dist`), reading with the leg's own
 credential, and compares what it finds with the tarball it would
 publish:
@@ -210,6 +217,9 @@ check existed.
 
 - **Partly published.** Re-run the failed jobs of the original run.
   Targets that already hold the release skip it; the rest publish.
+  In Model A the GitHub release stays a draft until every leg
+  succeeds, so the same re-run then promotes it; promotion leaves an
+  already published release untouched.
 - **Never published** (the merge run skipped or lost the release, or is
   too old to re-run). Dispatch `merge.yaml` at the commit that added
   the release file, with `release_only: true`. On a GitHub caller set
@@ -278,7 +288,7 @@ All `build-test.yaml` inputs above (with `build_timeout_minutes` and
 | ----------------- | ------- | ---------- | ---------------------------------------------------------------------- |
 | `attestations`    | boolean | `true`     | Generate SLSA build provenance attestations for the packed tarball     |
 | `sigstore_sign`   | boolean | `true`     | Sign the packed tarball with Sigstore (keyless/OIDC)                   |
-| `nexus_publish`   | boolean | `false`    | Publish the package to one or more npm registries after promotion      |
+| `nexus_publish`   | boolean | `false`    | Publish the package to one or more npm registries before promotion     |
 | `publish_targets` | string  | `''`       | JSON array of publish targets; see [Publish Targets](#publish-targets) |
 | `registry_url`    | string  | `''`       | Single registry URL; deprecated, prefer `publish_targets`              |
 | `nexus_user`      | string  | `''`       | Nexus username override; empty derives it from the repository name     |
