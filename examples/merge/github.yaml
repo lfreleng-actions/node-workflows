@@ -25,9 +25,30 @@ on:
       - main
       - master
 
+# Keyed on the repository, not the branch. Every merge publishes the
+# same X.Y.Z-SNAPSHOT version under one dist-tag, so two pushes running
+# at once race to publish it, even on different branches. Never cancel
+# a running lane, as one stopped mid-publish can leave its targets
+# inconsistent. queue: max holds up to 100 pending runs instead of
+# letting a newer one replace the one pending. Release detection reads
+# only the commit its own run builds, so a replaced run whose push added
+# a releases/ file would never publish that release, and nothing would
+# report it. The queue is bounded: once 100 runs wait, GitHub cancels
+# each further run, which then publishes nothing. Re-run a cancelled
+# run once the queue drains.
+#
+# Each run builds the commit its push landed, not the branch tip.
+# GitHub starts queued runs in the order they began waiting, which
+# mostly but not always matches push order. If two pushes to one
+# branch run out of order, the older commit's snapshot publishes last
+# and stays the published snapshot until the next push to that branch
+# replaces it; re-run the newer push's run to restore it sooner. Give
+# each active branch its own SNAPSHOT version, or the branch whose run
+# finishes last replaces the others' snapshot.
 concurrency:
-  group: "${{ github.workflow }}-${{ github.ref }}"
+  group: node-merge-${{ github.repository }}
   cancel-in-progress: false
+  queue: max
 
 permissions: {}
 
