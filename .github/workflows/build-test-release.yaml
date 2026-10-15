@@ -1693,7 +1693,7 @@ jobs:
 
       - name: 'Publish release'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@f16a8028741af0092c72f4a24f6626d9c2afb54b  # v0.2.1
+        uses: lfreleng-actions/node-publish-action@448b280446b6ea9acff88ad44062d74e2fcc45b0  # v0.2.2
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ steps.publish-params.outputs.publish_version }}
