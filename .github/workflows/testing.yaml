@@ -140,6 +140,10 @@ jobs:
             # the fixture rather than reaching for a permit flag.
             audit_permit_fail: false
             grype_permit_fail: false
+            # The fixture's jest run writes no report file, so upload
+            # its test sources: build-test-assert checks the upload
+            # wiring (path join, artefact name), not report content.
+            test_artifact_path: '*.test.js'
           - name: 'sdc-onap-ui-common'
             repository: 'onap/sdc-onap-ui-common'
             ref: 'c305ee4240e368dd0b2238a4f39881a97bad6746'
@@ -154,6 +158,7 @@ jobs:
             audit_permit_fail: true
             # 2020-era dependencies trip the Grype severity gate
             grype_permit_fail: true
+            test_artifact_path: ''
     permissions:
       contents: read
       pull-requests: read  # repository-metadata-action queries PR data
@@ -165,6 +170,179 @@ jobs:
       test_permit_fail: ${{ matrix.test_permit_fail }}
       audit_permit_fail: ${{ matrix.audit_permit_fail }}
       grype_permit_fail: ${{ matrix.grype_permit_fail }}
+      test_artifact_path: ${{ matrix.test_artifact_path }}
+
+  # Proves build-test produced something, not just that its job graph
+  # went green: an empty SBOM, or an audit or Grype job that never
+  # ran, would otherwise pass. Runs whatever the legs' verdicts, so a
+  # CVE in a fixture cannot hide the SBOM checks; a leg whose
+  # artefacts never uploaded still fails here.
+  #
+  # Every leg uploads under the same artefact names, so a run holds
+  # one 'sbom-files' per leg and a download by name cannot say whose
+  # it is. The artefacts are fetched by ID instead, and the
+  # test-node-project SBOM is told apart by its root package.
+  #
+  # Neither fixture emits dist/, so build-test uploads no
+  # node-build-output (its upload only warns); nothing is asserted
+  # about it until a fixture builds one.
+  build-test-assert:
+    name: 'Test: build-test results'
+    runs-on: ubuntu-latest
+    needs: build-test
+    if: ${{ !cancelled() }}
+    permissions:
+      actions: read  # list this run's jobs and download its artefacts
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # A called workflow's job verdicts never reach the caller, so
+      # read them from the run. Both legs keep audit and Grype at
+      # their defaults; a failure still counts as having run, as the
+      # leg itself reports it.
+      - name: 'Assert audit and Grype ran'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          # Keep in step with the build-test matrix names
+          LEGS: 'test-node-project sdc-onap-ui-common'
+        run: |
+          # Assert audit and Grype ran
+          set -euo pipefail
+          status=0
+          fail() { echo "::error::$1"; status=1; }
+          api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
+          jobs="$(gh api --paginate "${api}/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | [.name, (.conclusion // .status)] | @tsv')"
+          for leg in ${LEGS}; do
+            for job in 'Audit' 'Grype Audit SBOM'; do
+              name="Build/Test (${leg}) / ${job}"
+              result="$(awk -F'\t' -v n="${name}" '$1 == n { print $2 }' \
+                <<< "${jobs}")"
+              case "${result}" in
+                success|failure) echo "${name}: ${result}" ;;
+                '') fail "${name}: no such job in this run" ;;
+                *) fail "${name}: ${result//$'\n'/ }, expected it to run" ;;
+              esac
+            done
+          done
+          exit "${status}"
+
+      - name: 'Download build-test artefacts'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          # Download build-test artefacts
+          set -euo pipefail
+          api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
+          for name in sbom-files node-test-results; do
+            ids="$(gh api --paginate \
+              "${api}/artifacts?name=${name}&per_page=100" \
+              --jq '.artifacts[] | select(.expired | not) | .id')"
+            for id in ${ids}; do
+              mkdir -p "${name}/${id}"
+              gh api "repos/${REPOSITORY}/actions/artifacts/${id}/zip" \
+                > "${name}/${id}.zip"
+              unzip -q "${name}/${id}.zip" -d "${name}/${id}"
+              rm "${name}/${id}.zip"
+              echo "${name} ${id}:" \
+                "$(find "${name}/${id}" -type f -printf '%P ')"
+            done
+          done
+
+      # Each SBOM must be a CycloneDX document listing components. The
+      # test-node-project one must also hold express, which it
+      # declares, and body-parser, which only express pulls in: both
+      # present and versioned means the lockfile graph was read.
+      - name: 'Assert SBOM contents'
+        shell: bash
+        env:
+          ROOT: 'test-node-project'
+          EXPECT: 'express body-parser'
+          LEG_COUNT: '2'
+        run: |
+          # Assert SBOM contents
+          set -euo pipefail
+          shopt -s nullglob
+          status=0
+          fail() { echo "::error::$1"; status=1; }
+          sboms=(sbom-files/*/sbom-cyclonedx.json)
+          if [ "${#sboms[@]}" -lt "${LEG_COUNT}" ]; then
+            fail "Found ${#sboms[@]} SBOMs, expected one per leg (${LEG_COUNT})"
+          fi
+          found=0
+          for sbom in "${sboms[@]}"; do
+            if ! jq -e '.bomFormat == "CycloneDX"
+                and (.specVersion | type == "string")
+                and (.components | type == "array")' \
+                "${sbom}" > /dev/null 2>&1; then
+              fail "${sbom} is not a CycloneDX JSON document"
+              continue
+            fi
+            count="$(jq '.components | length' "${sbom}")"
+            if [ "${count}" -eq 0 ]; then
+              fail "${sbom} lists no components"
+              continue
+            fi
+            echo "${sbom}: ${count} components"
+            if ! jq -e --arg p "pkg:npm/${ROOT}@" \
+              'any(.components[]; (.purl // "") | startswith($p))' \
+              "${sbom}" > /dev/null; then
+              continue
+            fi
+            found=$((found + 1))
+            for dep in ${EXPECT}; do
+              version="$(jq -r --arg p "pkg:npm/${dep}@" \
+                '[.components[] | select((.purl // "") | startswith($p))
+                  | .version // ""] | first // ""' "${sbom}")"
+              if [ -z "${version}" ]; then
+                fail "${dep} missing or unversioned in the ${ROOT} SBOM"
+              else
+                echo "${ROOT}: ${dep} ${version}"
+              fi
+            done
+          done
+          if [ "${found}" -eq 0 ]; then
+            fail "No SBOM lists the ${ROOT} package itself"
+          fi
+          exit "${status}"
+
+      - name: 'Assert test results artefact'
+        shell: bash
+        env:
+          EXPECT_FILE: 'sum.test.js'
+        run: |
+          # Assert test results artefact
+          set -euo pipefail
+          shopt -s nullglob
+          results=(node-test-results/*/)
+          if [ "${#results[@]}" -eq 0 ]; then
+            echo "::error::No node-test-results artefact, though" \
+              "test-node-project sets test_artifact_path"
+            exit 1
+          fi
+          for dir in "${results[@]}"; do
+            if [ ! -f "${dir}${EXPECT_FILE}" ]; then
+              echo "::error::${dir} lacks ${EXPECT_FILE}"
+              exit 1
+            fi
+          done
+          echo "node-test-results holds ${EXPECT_FILE} ✅"
 
   # The publish-targets resolver is the one part of the merge and
   # build-test-release publish paths that CI can exercise: it reads
