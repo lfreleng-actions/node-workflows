@@ -135,6 +135,14 @@ on:
         required: false
         type: string
         default: ''
+      artifact_suffix:
+        description: >-
+          Appended to the name of every artefact this call uploads, so
+          a run that calls the workflow more than once keeps each
+          call's artefacts apart; letters, digits, '.', '_' and '-'
+        required: false
+        type: string
+        default: ''
 
       # --- Audit ---
       audit_enabled:
@@ -354,6 +362,21 @@ jobs:
           check junit_report_path "${JUNIT_REPORT_PATH}" 'A-Za-z0-9._*-'
           check coverage_path "${COVERAGE_PATH}" 'A-Za-z0-9._-'
           exit "${errors}"
+
+      - name: 'Validate artifact_suffix input'
+        if: inputs.artifact_suffix != ''
+        shell: bash
+        env:
+          ARTIFACT_SUFFIX: ${{ inputs.artifact_suffix }}
+        run: |
+          # Every upload appends this to its artefact name, so admit
+          # only characters artefact names and paths take as they are
+          if [[ ! "${ARTIFACT_SUFFIX}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            # A newline in the value could forge a workflow command
+            echo "::error::Invalid artifact_suffix input:" \
+              "$(printf '%s' "${ARTIFACT_SUFFIX}" | tr -d '\r\n')"
+            exit 1
+          fi
 
       - name: 'Validate job timeout inputs'
         shell: bash
@@ -805,7 +828,7 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: node-build-output
+          name: node-build-output${{ inputs.artifact_suffix }}
           path: ${{ inputs.path_prefix }}/dist
           retention-days: 7
           # Not every package emits dist/; the upload is informational
@@ -904,7 +927,7 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ matrix.artifact }}${{ inputs.artifact_suffix }}
           path: ${{ inputs.path_prefix }}/${{ inputs.test_artifact_path }}
           retention-days: 7
           if-no-files-found: warn
@@ -915,7 +938,8 @@ jobs:
       # the reports matter most. A missing report warns: tests that
       # crash before writing one already fail the Run tests step.
       # The uploads take the leg's matrix.suffix, empty on the single
-      # default leg, as uploads in one run need distinct names.
+      # default leg, and the call's artifact_suffix, as uploads in one
+      # run need distinct names.
       - name: 'Summarise JUnit test results'
         id: junit
         if: ${{ !cancelled() && inputs.junit_report_path != '' }}
@@ -925,7 +949,8 @@ jobs:
           # yamllint disable-line rule:line-length
           report-paths: ${{ inputs.path_prefix }}/${{ inputs.junit_report_path }}
           fail-on-failure: 'false'
-          artifact-name: 'node-junit${{ matrix.suffix }}'
+          # yamllint disable-line rule:line-length
+          artifact-name: 'node-junit${{ matrix.suffix }}${{ inputs.artifact_suffix }}'
 
       - name: 'Report missing JUnit reports'
         if: ${{ !cancelled() && steps.junit.outputs.result == 'none' }}
@@ -1033,7 +1058,7 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: 'node-coverage${{ matrix.suffix }}'
+          name: 'node-coverage${{ matrix.suffix }}${{ inputs.artifact_suffix }}'
           path: ${{ inputs.path_prefix }}/${{ inputs.coverage_path }}
           retention-days: 7
           if-no-files-found: warn
@@ -1116,6 +1141,7 @@ jobs:
     outputs:
       # 'true' or 'false' when the change was resolved, else empty
       dependency_changed: ${{ steps.dependency-change.outputs.changed }}
+      sbom_artifact_id: ${{ steps.upload-sbom.outputs.artifact-id }}
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
@@ -1288,10 +1314,11 @@ jobs:
           echo "result=${changed} (since ${base:0:12})" >> "${GITHUB_OUTPUT}"
 
       - name: 'Upload SBOM artifacts'
+        id: upload-sbom
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: sbom-files
+          name: sbom-files${{ inputs.artifact_suffix }}
           # Glob matches whichever SBOM formats the generator produced
           path: sbom-cyclonedx.*
           retention-days: 45
@@ -1340,17 +1367,33 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: 'Download SBOM artefact'
+      # By this call's artefact ID, never by name: another call in the
+      # run can share the name, and a name resolves to the newest
+      # upload, which may be that call's SBOM. The step name carries
+      # the ID into the job log, where the self-test reads it.
+      # yamllint disable-line rule:line-length
+      - name: 'Download SBOM artefact ${{ needs.sbom.outputs.sbom_artifact_id }}'
+        id: download-sbom
         # yamllint disable-line rule:line-length
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
-          name: sbom-files
+          artifact-ids: ${{ needs.sbom.outputs.sbom_artifact_id }}
 
-      # The change signal comes from this call's own sbom job output,
-      # never from the artefact: several calls in one run each upload
-      # 'sbom-files', and a download by name returns the newest, which
-      # may be another call's. Only a resolved 'true' or 'false'
-      # writes the manifest; without one, the gate stays on.
+      # download-artifact looks IDs up among the newest artefact of
+      # each name only, so it cannot find an older upload whose name
+      # another call reused: the fix belongs in the caller
+      - name: 'Explain SBOM download failure'
+        if: failure() && steps.download-sbom.outcome == 'failure'
+        shell: bash
+        run: |
+          # Explain SBOM download failure
+          echo "::error::If no artefact ID was found, another call in" \
+            "this run uploaded a newer artefact under this call's SBOM" \
+            "name. Give each call its own artifact_suffix input."
+
+      # The change signal comes from this call's own sbom job output
+      # rather than a file in the artefact. Only a resolved 'true' or
+      # 'false' writes the manifest; without one, the gate stays on.
       - name: 'Write dependency-change manifest'
         if: inputs.grype_gate_when == 'dependencies-changed'
         shell: bash
@@ -1383,6 +1426,7 @@ jobs:
         with:
           sbom: 'sbom-cyclonedx.json'
           fail-on: ${{ inputs.grype_fail_on }}
+          artifact-name: 'grype-scan-results${{ inputs.artifact_suffix }}'
           gate-when: ${{ inputs.grype_gate_when }}
           # Absent unless the sbom job resolved the change; an absent
           # manifest keeps the gate on

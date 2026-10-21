@@ -181,6 +181,9 @@ jobs:
       test_artifact_path: ${{ matrix.test_artifact_path }}
       grype_gate_when: ${{ matrix.grype_gate_when }}
       test_node_versions: ${{ matrix.test_node_versions }}
+      # Both legs upload in this run, so each names its artefacts
+      # apart, as any caller of the workflow more than once must
+      artifact_suffix: '-${{ matrix.name }}'
 
   # Proves build-test produced something, not just that its job graph
   # went green: an empty SBOM, or an audit or Grype job that never
@@ -188,13 +191,11 @@ jobs:
   # CVE in a fixture cannot hide the SBOM checks; a leg whose
   # artefacts never uploaded still fails here.
   #
-  # Every leg uploads under the same artefact names, so a run holds
-  # one 'sbom-files' per leg and a download by name cannot say whose
-  # it is. The artefacts are fetched by ID instead, and the
-  # test-node-project SBOM is told apart by its root package.
+  # Each leg passes '-<leg name>' as artifact_suffix, so its artefacts
+  # carry the leg's name: 'sbom-files-test-node-project', say.
   #
   # Neither fixture emits dist/, so build-test uploads no
-  # node-build-output (its upload only warns); nothing is asserted
+  # node-build-output-* (its upload only warns); nothing is asserted
   # about it until a fixture builds one.
   build-test-assert:
     name: 'Test: build-test results'
@@ -250,6 +251,56 @@ jobs:
           done
           exit "${status}"
 
+      # Each leg's Grype job names the SBOM artefact ID it downloaded
+      # in its download step. That has to be the ID of the SBOM its
+      # own leg uploaded, or the legs crossed over and a gate passed
+      # on another leg's dependencies.
+      - name: 'Assert Grype scanned its own SBOM'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          # Keep in step with the build-test matrix names
+          LEGS: 'test-node-project sdc-onap-ui-common'
+        run: |
+          # Assert Grype scanned its own SBOM
+          set -euo pipefail
+          status=0
+          fail() { echo "::error::$1"; status=1; }
+          api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
+          # Keep the prefix in step with the grype job's download step
+          scans="$(gh api --paginate "${api}/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | [.name] + [.steps[]? | .name
+                | select(startswith("Download SBOM artefact "))
+                | ltrimstr("Download SBOM artefact ")]
+              | select(length > 1) | @tsv')"
+          uploads="$(gh api --paginate "${api}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not)
+              | select(.name | startswith("sbom-files-"))
+              | [.name, (.id | tostring)] | @tsv')"
+          for leg in ${LEGS}; do
+            job="Build/Test (${leg}) / Grype Audit SBOM"
+            scanned="$(awk -F'\t' -v n="${job}" '$1 == n { print $2 }' \
+              <<< "${scans}")"
+            uploaded="$(awk -F'\t' -v n="sbom-files-${leg}" \
+              '$1 == n { print $2 }' <<< "${uploads}")"
+            if [[ ! "${scanned}" =~ ^[0-9]+$ ]]; then
+              fail "${job}: no single SBOM artefact ID in its download step"
+            elif [[ ! "${uploaded}" =~ ^[0-9]+$ ]]; then
+              ids="${uploaded//$'\n'/ }"
+              fail "Expected one sbom-files-${leg} artefact, found '${ids}'"
+            elif [ "${scanned}" != "${uploaded}" ]; then
+              owner="$(awk -F'\t' -v id="${scanned}" '$2 == id { print $1 }' \
+                <<< "${uploads}")"
+              want="sbom-files-${leg} ${uploaded}"
+              fail "${job} scanned ${owner:-artefact} ${scanned}, not ${want}"
+            else
+              echo "${job}: scanned sbom-files-${leg} ${uploaded} ✅"
+            fi
+          done
+          exit "${status}"
+
       - name: 'Download build-test artefacts'
         shell: bash
         env:
@@ -260,13 +311,13 @@ jobs:
           # Download build-test artefacts
           set -euo pipefail
           api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
-          # A tests matrix suffixes node-test-results per leg
-          # (node-test-results-node-22), so match the family by name
-          # rather than asking the API for one exact name
+          # Each leg suffixes its artefacts, and a tests matrix
+          # suffixes node-test-results again per version
+          # (node-test-results-node-22-test-node-project), so match
+          # the families by name rather than asking for exact names
           artefacts="$(gh api --paginate "${api}/artifacts?per_page=100" \
             --jq '.artifacts[] | select(.expired | not)
-              | select(.name == "sbom-files"
-                or (.name | test("^node-test-results(-|$)")))
+              | select(.name | test("^(sbom-files|node-test-results)(-|$)"))
               | "\(.name) \(.id)"')"
           while read -r name id; do
             [ -n "${name}" ] || continue
@@ -279,28 +330,32 @@ jobs:
               "$(find "${name}/${id}" -type f -printf '%P ')"
           done <<< "${artefacts}"
 
-      # Each SBOM must be a CycloneDX document listing components. The
-      # test-node-project one must also hold express, which it
-      # declares, and body-parser, which only express pulls in: both
-      # present and versioned means the lockfile graph was read.
+      # Each leg must upload one SBOM under its own name, a CycloneDX
+      # document listing components. The test-node-project one must
+      # list that package and hold express, which it declares, and
+      # body-parser, which only express pulls in: both present and
+      # versioned means the lockfile graph was read. No other leg's
+      # SBOM may list test-node-project.
       - name: 'Assert SBOM contents'
         shell: bash
         env:
           ROOT: 'test-node-project'
           EXPECT: 'express body-parser'
-          LEG_COUNT: '2'
+          # Keep in step with the build-test matrix names
+          LEGS: 'test-node-project sdc-onap-ui-common'
         run: |
           # Assert SBOM contents
           set -euo pipefail
           shopt -s nullglob
           status=0
           fail() { echo "::error::$1"; status=1; }
-          sboms=(sbom-files/*/sbom-cyclonedx.json)
-          if [ "${#sboms[@]}" -lt "${LEG_COUNT}" ]; then
-            fail "Found ${#sboms[@]} SBOMs, expected one per leg (${LEG_COUNT})"
-          fi
-          found=0
-          for sbom in "${sboms[@]}"; do
+          for leg in ${LEGS}; do
+            sboms=("sbom-files-${leg}"/*/sbom-cyclonedx.json)
+            if [ "${#sboms[@]}" -ne 1 ]; then
+              fail "Found ${#sboms[@]} sbom-files-${leg} SBOMs, expected 1"
+              continue
+            fi
+            sbom="${sboms[0]}"
             if ! jq -e '.bomFormat == "CycloneDX"
                 and (.specVersion | type == "string")
                 and (.components | type == "array")' \
@@ -314,12 +369,22 @@ jobs:
               continue
             fi
             echo "${sbom}: ${count} components"
-            if ! jq -e --arg p "pkg:npm/${ROOT}@" \
+            lists_root=false
+            if jq -e --arg p "pkg:npm/${ROOT}@" \
               'any(.components[]; (.purl // "") | startswith($p))' \
               "${sbom}" > /dev/null; then
+              lists_root=true
+            fi
+            if [ "${leg}" != "${ROOT}" ]; then
+              if [ "${lists_root}" = true ]; then
+                fail "${sbom} lists ${ROOT}, so it is not the ${leg} SBOM"
+              fi
               continue
             fi
-            found=$((found + 1))
+            if [ "${lists_root}" != true ]; then
+              fail "${sbom} does not list the ${ROOT} package itself"
+              continue
+            fi
             for dep in ${EXPECT}; do
               version="$(jq -r --arg p "pkg:npm/${dep}@" \
                 '[.components[] | select((.purl // "") | startswith($p))
@@ -331,9 +396,6 @@ jobs:
               fi
             done
           done
-          if [ "${found}" -eq 0 ]; then
-            fail "No SBOM lists the ${ROOT} package itself"
-          fi
           exit "${status}"
 
       # test-node-project fans its tests out over test_node_versions,
@@ -345,7 +407,9 @@ jobs:
         env:
           EXPECT_FILE: 'sum.test.js'
           # Keep in step with test-node-project's test_node_versions
-          EXPECT: 'node-test-results-node-22 node-test-results-node-24'
+          EXPECT: >-
+            node-test-results-node-22-test-node-project
+            node-test-results-node-24-test-node-project
         run: |
           # Assert test results artefacts
           set -euo pipefail
@@ -3111,10 +3175,12 @@ jobs:
               if step(doc, 'tests', 'junit')['uses'] != pin:
                   sys.exit(f'junit-test-report-action pin in {path}'
                            ' differs from this job')
-              # Matrix legs upload in one run, so every upload must
-              # carry the leg's suffix. Split so Actions leaves the
-              # expression in this script unexpanded.
+              # Matrix legs and repeated calls upload in one run, so
+              # every upload must carry the leg's suffix and the
+              # call's. Split so Actions leaves the expressions in this
+              # script unexpanded.
               suffix = '$' '{{ matrix.suffix }}'
+              call = '$' '{{ inputs.artifact_suffix }}'
               tests = doc['jobs']['tests']['steps']
               uploads = {
                   s.get('name'): s.get('with', {})
@@ -3130,9 +3196,9 @@ jobs:
                       'Upload test artefacts', {}).get('name'),
               }
               wants = {
-                  'junit': 'node-junit' + suffix,
-                  'coverage': 'node-coverage' + suffix,
-                  'test results': '$' '{{ matrix.artifact }}',
+                  'junit': 'node-junit' + suffix + call,
+                  'coverage': 'node-coverage' + suffix + call,
+                  'test results': '$' '{{ matrix.artifact }}' + call,
               }
               for kind, want in wants.items():
                   if names[kind] != want:
