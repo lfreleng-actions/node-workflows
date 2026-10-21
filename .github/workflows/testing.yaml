@@ -1380,6 +1380,153 @@ jobs:
           PY
           echo "Merge output wiring correct ✅" >> "$GITHUB_STEP_SUMMARY"
 
+      # Both release lanes attest their CycloneDX SBOM against the
+      # tarball they publish (#180). Neither lane runs in CI, so read
+      # the wiring: the SBOM attestation must name the provenance's
+      # subject, read the lane's own SBOM artefact, and skip with
+      # SBOM generation while the provenance still runs.
+      - name: 'Assert SBOM attestation matches provenance'
+        shell: bash
+        run: |
+          # Assert SBOM attestation matches provenance
+          python3 - <<'PY'
+          import os
+          import sys
+
+          import yaml
+
+          # Assembled, as above, so it is not a workflow expression
+          OPEN = '${' + '{ '
+          CLOSE = ' }' + '}'
+
+          LANES = {
+              'build-test-release.yaml': {
+                  'subject': 'attest/' + OPEN
+                  + 'needs.build.outputs.tarball_name' + CLOSE,
+                  'source': ('artifact-ids', OPEN
+                             + 'needs.sbom.outputs.sbom_artifact_id'
+                             + CLOSE),
+                  'gate': "needs.sbom.result == 'success'",
+                  'needs': 'sbom',
+              },
+              'merge.yaml': {
+                  'subject': 'attest/' + OPEN
+                  + 'needs.pack-release.outputs.tarball_name' + CLOSE,
+                  'source': ('name', 'sbom-files-node-merge'),
+                  'gate': 'inputs.sbom_enabled',
+                  'needs': 'pack-release',
+              },
+          }
+
+          errors = []
+          for name, want in LANES.items():
+              with open(f'.github/workflows/{name}') as handle:
+                  job = (yaml.safe_load(handle)['jobs'].get('attest')
+                         or {})
+              where = f'{name}/attest'
+              steps = job.get('steps') or []
+              attests = [
+                  (i, s) for i, s in enumerate(steps)
+                  if str(s.get('uses', '')).startswith('actions/attest@')
+              ]
+              provenance = [
+                  (i, s) for i, s in attests
+                  if 'sbom-path' not in (s.get('with') or {})
+              ]
+              sbom = [
+                  (i, s) for i, s in attests
+                  if 'sbom-path' in (s.get('with') or {})
+              ]
+              if len(provenance) != 1 or len(sbom) != 1:
+                  errors.append(
+                      f'{where} has {len(provenance)} provenance and '
+                      f'{len(sbom)} SBOM attestation steps, expected one '
+                      'of each'
+                  )
+                  continue
+              prov_with = provenance[0][1].get('with') or {}
+              sbom_at, sbom_step = sbom[0]
+              sbom_with = sbom_step.get('with') or {}
+              for label, inputs in (('provenance', prov_with),
+                                    ('SBOM', sbom_with)):
+                  subject = str(inputs.get('subject-path', '')).strip()
+                  if subject != want['subject']:
+                      errors.append(
+                          f'{where} {label} subject is {subject!r}, '
+                          f"expected {want['subject']!r}"
+                      )
+              # sbom-path cannot be combined with predicate inputs
+              for key in sbom_with:
+                  if key.startswith('predicate'):
+                      errors.append(
+                          f'{where} SBOM attestation also sets {key}'
+                      )
+              if provenance[0][1].get('if'):
+                  errors.append(
+                      f'{where} provenance step is conditional; it must '
+                      'run whether or not the SBOM does'
+                  )
+              if want['gate'] != str(sbom_step.get('if', '')).strip():
+                  errors.append(
+                      f"{where} SBOM attestation is not gated on "
+                      f"{want['gate']!r}"
+                  )
+              job_if = str(job.get('if', ''))
+              if 'sbom' in job_if:
+                  errors.append(
+                      f'{where} is gated on the SBOM, so disabling it '
+                      'also drops the provenance'
+                  )
+              job_needs = job.get('needs') or []
+              if isinstance(job_needs, str):
+                  job_needs = [job_needs]
+              if want['needs'] not in job_needs:
+                  errors.append(
+                      f"{where} does not need {want['needs']}, so it "
+                      'cannot read the SBOM'
+                  )
+              sbom_path = str(sbom_with.get('sbom-path', '')).strip()
+              sbom_dir = os.path.dirname(sbom_path)
+              downloads = [
+                  (i, s) for i, s in enumerate(steps)
+                  if 'download-artifact' in str(s.get('uses', ''))
+                  and str((s.get('with') or {}).get('path', '')).strip()
+                  == sbom_dir
+              ]
+              if not sbom_dir or len(downloads) != 1:
+                  errors.append(
+                      f'{where} has {len(downloads)} downloads into '
+                      f'{sbom_dir!r}, the SBOM path {sbom_path!r}, '
+                      'expected one'
+                  )
+                  continue
+              dl_at, dl_step = downloads[0]
+              key, value = want['source']
+              got = str((dl_step.get('with') or {}).get(key, '')).strip()
+              if got != value:
+                  errors.append(
+                      f'{where} downloads the SBOM by {key} {got!r}, '
+                      f"expected {value!r}, the lane's own artefact"
+                  )
+              if dl_at > sbom_at:
+                  errors.append(
+                      f'{where} downloads the SBOM after attesting it'
+                  )
+              if want['gate'] != str(dl_step.get('if', '')).strip():
+                  errors.append(
+                      f"{where} SBOM download is not gated on "
+                      f"{want['gate']!r}"
+                  )
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('SBOM attestation wiring incorrect \u274c')
+
+          print('SBOM attestation wiring correct \u2705')
+          PY
+          echo "SBOM attestation wiring correct ✅" >> "$GITHUB_STEP_SUMMARY"
+
   # setup-node v5+ restores and saves an npm cache unasked when
   # package.json names npm in packageManager or
   # devEngines.packageManager. merge.yaml and build-test-release.yaml
