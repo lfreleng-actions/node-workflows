@@ -932,7 +932,10 @@ artefact is whose:
   `node-test-results-node-<version>-test-node-project` artefact per
   version and no other `node-test-results` artefact;
 - the audit and Grype jobs of every leg ran; a skipped job fails
-  the check.
+  the check;
+- each leg's Grype job downloaded, by the artefact ID its download
+  step names, the SBOM its own leg uploaded, so legs that cross over
+  fail the check.
 
 Neither fixture emits `dist/`, so the check makes no claim about the
 `node-build-output` artefact. The release and merge workflows

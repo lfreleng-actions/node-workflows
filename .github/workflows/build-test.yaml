@@ -1370,7 +1370,7 @@ jobs:
       # By this call's artefact ID, never by name: another call in the
       # run can share the name, and a name resolves to the newest
       # upload, which may be that call's SBOM. The step name carries
-      # the ID into the job log.
+      # the ID into the job log, where the self-test reads it.
       # yamllint disable-line rule:line-length
       - name: 'Download SBOM artefact ${{ needs.sbom.outputs.sbom_artifact_id }}'
         id: download-sbom

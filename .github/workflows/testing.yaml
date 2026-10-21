@@ -251,6 +251,56 @@ jobs:
           done
           exit "${status}"
 
+      # Each leg's Grype job names the SBOM artefact ID it downloaded
+      # in its download step. That has to be the ID of the SBOM its
+      # own leg uploaded, or the legs crossed over and a gate passed
+      # on another leg's dependencies.
+      - name: 'Assert Grype scanned its own SBOM'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          # Keep in step with the build-test matrix names
+          LEGS: 'test-node-project sdc-onap-ui-common'
+        run: |
+          # Assert Grype scanned its own SBOM
+          set -euo pipefail
+          status=0
+          fail() { echo "::error::$1"; status=1; }
+          api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
+          # Keep the prefix in step with the grype job's download step
+          scans="$(gh api --paginate "${api}/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | [.name] + [.steps[]? | .name
+                | select(startswith("Download SBOM artefact "))
+                | ltrimstr("Download SBOM artefact ")]
+              | select(length > 1) | @tsv')"
+          uploads="$(gh api --paginate "${api}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not)
+              | select(.name | startswith("sbom-files-"))
+              | [.name, (.id | tostring)] | @tsv')"
+          for leg in ${LEGS}; do
+            job="Build/Test (${leg}) / Grype Audit SBOM"
+            scanned="$(awk -F'\t' -v n="${job}" '$1 == n { print $2 }' \
+              <<< "${scans}")"
+            uploaded="$(awk -F'\t' -v n="sbom-files-${leg}" \
+              '$1 == n { print $2 }' <<< "${uploads}")"
+            if [[ ! "${scanned}" =~ ^[0-9]+$ ]]; then
+              fail "${job}: no single SBOM artefact ID in its download step"
+            elif [[ ! "${uploaded}" =~ ^[0-9]+$ ]]; then
+              ids="${uploaded//$'\n'/ }"
+              fail "Expected one sbom-files-${leg} artefact, found '${ids}'"
+            elif [ "${scanned}" != "${uploaded}" ]; then
+              owner="$(awk -F'\t' -v id="${scanned}" '$2 == id { print $1 }' \
+                <<< "${uploads}")"
+              want="sbom-files-${leg} ${uploaded}"
+              fail "${job} scanned ${owner:-artefact} ${scanned}, not ${want}"
+            else
+              echo "${job}: scanned sbom-files-${leg} ${uploaded} ✅"
+            fi
+          done
+          exit "${status}"
+
       - name: 'Download build-test artefacts'
         shell: bash
         env:
