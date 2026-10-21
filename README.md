@@ -301,6 +301,7 @@ it with `dry_run: true` to rehearse first.
 | `test_artifact_path`      | string  | `''`       | Test output/report path uploaded as an artefact; empty disables                |
 | `junit_report_path`       | string  | `''`       | JUnit XML glob summarised in the tests job and uploaded; empty disables        |
 | `coverage_path`           | string  | `''`       | `lcov.info`/`coverage-summary.json` (or their directory) summarised and kept   |
+| `artifact_suffix`         | string  | `''`       | Appended to every artefact name; give each call in one run its own             |
 | `audit_enabled`           | boolean | `true`     | Run the dependency audit job (set false to skip)                               |
 | `audit_level`             | string  | `'high'`   | npm audit severity threshold that fails the audit                              |
 | `production_only`         | boolean | `false`    | Restrict the audit to production dependencies                                  |
@@ -323,6 +324,19 @@ it with `dry_run: true` to rehearse first.
 <!-- markdownlint-enable MD013 -->
 
 The workflow takes no secrets and exposes no outputs.
+
+#### Calling a workflow more than once in a run
+
+Every artefact a call uploads takes a fixed name: `sbom-files`,
+`grype-scan-results`, the test report names below, and
+`node-build-output` (`node-release-package` and `sigstore-bundle` in
+`build-test-release.yaml`). A run that calls `build-test.yaml` or
+`build-test-release.yaml` more than once, from a matrix over projects
+or once per `path_prefix` in a monorepo, must give each call its own
+`artifact_suffix`, such as `-${{ matrix.project }}`. The workflow
+appends the suffix to every artefact name, so `sbom-files-api` and
+`sbom-files-web` stay apart. The suffix takes letters, digits, `.`,
+`_` and `-`.
 
 #### Grype gating
 
@@ -835,9 +849,9 @@ what `coverage_path` names: name the directory to keep the HTML
 report beside `lcov.info` for a later Sonar or Codecov job. With
 `test_node_versions` set, each leg suffixes these names as described
 in [Testing across Node.js versions](#testing-across-nodejs-versions).
-Otherwise the names stay fixed, so a run that calls the workflow more
-than once with these inputs set holds one artefact of each name per
-call, and a download by name returns one of them.
+A run that calls the workflow more than once with these inputs set
+needs a distinct `artifact_suffix` per call; see
+[Calling a workflow more than once in a run](#calling-a-workflow-more-than-once-in-a-run).
 
 The tests job runs `package.json` scripts by name, and accepts names
 made of letters, digits, `-` and `_` (`test-ci`, not `test:ci`). Add
@@ -896,15 +910,18 @@ A `test-ci` script for each common runner, writing `junit.xml` and a
 `.github/workflows/testing.yaml` exercises `build-test.yaml` on pull
 requests against pinned Node.js fixture repositories (a modern npm
 project and a legacy ONAP project). The `build-test-assert` job then
-checks what those runs produced, beyond their passing verdicts:
+checks what those runs produced, beyond their passing verdicts. Each
+leg passes its name as `artifact_suffix`, so the check knows whose
+artefact is whose:
 
-- every leg uploads an SBOM that is CycloneDX JSON listing at least
-  one component, and the `test-node-project` SBOM lists `express`
-  and its transitive dependency `body-parser`, both versioned;
+- every leg uploads one SBOM, CycloneDX JSON listing at least one
+  component; the `test-node-project` SBOM lists that package,
+  `express` and its transitive dependency `body-parser`, all
+  versioned, and no other leg's SBOM lists `test-node-project`;
 - the leg that sets `test_artifact_path` fans its tests out over
   `test_node_versions`, and uploads one
-  `node-test-results-node-<version>` artefact per version and no
-  other `node-test-results` artefact;
+  `node-test-results-node-<version>-test-node-project` artefact per
+  version and no other `node-test-results` artefact;
 - the audit and Grype jobs of every leg ran; a skipped job fails
   the check.
 
