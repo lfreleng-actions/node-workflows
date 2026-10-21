@@ -338,6 +338,15 @@ appends the suffix to every artefact name, so `sbom-files-api` and
 `sbom-files-web` stay apart. The suffix takes letters, digits, `.`,
 `_` and `-`.
 
+Within a call, jobs hand artefacts to one another by artefact ID, never
+by name, so the Grype job scans the SBOM its own call generated, and
+the release jobs attest, sign, attach and publish their own call's
+tarball. `actions/download-artifact` looks an ID up among the newest
+artefact of each name, so when a later call in the run reuses an
+artefact name, the earlier call fails its download rather than reading
+the other call's artefact. The fix for that failure is a distinct
+`artifact_suffix` per call.
+
 #### Grype gating
 
 With `grype_gate_when: dependencies-changed`, Grype still scans and

@@ -1141,6 +1141,7 @@ jobs:
     outputs:
       # 'true' or 'false' when the change was resolved, else empty
       dependency_changed: ${{ steps.dependency-change.outputs.changed }}
+      sbom_artifact_id: ${{ steps.upload-sbom.outputs.artifact-id }}
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
@@ -1313,6 +1314,7 @@ jobs:
           echo "result=${changed} (since ${base:0:12})" >> "${GITHUB_OUTPUT}"
 
       - name: 'Upload SBOM artifacts'
+        id: upload-sbom
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -1365,17 +1367,33 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: 'Download SBOM artefact'
+      # By this call's artefact ID, never by name: another call in the
+      # run can share the name, and a name resolves to the newest
+      # upload, which may be that call's SBOM. The step name carries
+      # the ID into the job log.
+      # yamllint disable-line rule:line-length
+      - name: 'Download SBOM artefact ${{ needs.sbom.outputs.sbom_artifact_id }}'
+        id: download-sbom
         # yamllint disable-line rule:line-length
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
-          name: sbom-files${{ inputs.artifact_suffix }}
+          artifact-ids: ${{ needs.sbom.outputs.sbom_artifact_id }}
 
-      # The change signal comes from this call's own sbom job output,
-      # never from the artefact: several calls in one run each upload
-      # 'sbom-files', and a download by name returns the newest, which
-      # may be another call's. Only a resolved 'true' or 'false'
-      # writes the manifest; without one, the gate stays on.
+      # download-artifact looks IDs up among the newest artefact of
+      # each name only, so it cannot find an older upload whose name
+      # another call reused: the fix belongs in the caller
+      - name: 'Explain SBOM download failure'
+        if: failure() && steps.download-sbom.outcome == 'failure'
+        shell: bash
+        run: |
+          # Explain SBOM download failure
+          echo "::error::If no artefact ID was found, another call in" \
+            "this run uploaded a newer artefact under this call's SBOM" \
+            "name. Give each call its own artifact_suffix input."
+
+      # The change signal comes from this call's own sbom job output
+      # rather than a file in the artefact. Only a resolved 'true' or
+      # 'false' writes the manifest; without one, the gate stays on.
       - name: 'Write dependency-change manifest'
         if: inputs.grype_gate_when == 'dependencies-changed'
         shell: bash
