@@ -46,6 +46,7 @@ expensive test suite on releases):
 gerrit-validate -> { repository-metadata | node-metadata | tag-validate }
 { tag-validate | node-metadata } -> build -> { audit | sbom -> grype }
   -> tests -> attach-artefacts -> nexus-publish -> promote-release
+{ build | sbom } -> attest -> attach-artefacts
 build -> sign-artefacts -> attach-artefacts
 ```
 
@@ -78,6 +79,8 @@ then attests and signs it:
 
 - SLSA build provenance via `actions/attest`
   (toggle with the `attestations` input)
+- CycloneDX SBOM attestation via `actions/attest`, naming the same
+  tarball (needs both `attestations` and `sbom_enabled`)
 - Sigstore keyless signature bundle via `cosign sign-blob`
   (toggle with the `sigstore_sign` input)
 
@@ -155,14 +158,19 @@ archive and stamps nothing. The workflow then records:
 
 - SLSA build provenance via `actions/attest`
   (toggle with the `attestations` input)
+- CycloneDX SBOM attestation via `actions/attest`, naming the same
+  tarball (needs both `attestations` and `sbom_enabled`)
 - Sigstore keyless signature bundle via `cosign sign-blob`
   (toggle with the `sigstore_sign` input)
 
-The release publish waits for both. An enabled record that fails blocks
-the publish rather than trailing it, because hosted npm repositories are
-typically write-once: nothing can add provenance to a version that
+The release publish waits for the `attest` and `sign-artefacts` jobs
+that make them. An enabled record that fails blocks the publish rather
+than trailing it, because hosted npm repositories are typically
+write-once: nothing can add provenance to a version that
 already published without it, whereas a blocked publish is retryable.
 Disabling either toggle skips that job and lets the publish proceed.
+Disabling `sbom_enabled` skips the SBOM attestation, but the
+provenance still runs.
 
 Snapshot publishes stay unattested and unsigned by design, since every
 merge replaces them.
@@ -179,7 +187,9 @@ the run that publishes a version always uploads its SBOM; set
 `sbom_enabled: false` to skip it. A dry run still generates it, since
 a workflow artefact leaves no public record. Snapshots get no SBOM, as
 with attestation and signing; the verify lane's SBOM already covers
-each change's dependencies.
+each change's dependencies. Outside a dry run, the `attest` job also
+attests this SBOM against the release tarball; see
+[Verifying Release Artefacts](#verifying-release-artefacts-model-a).
 
 A `grype` job then scans the release SBOM, informationally, as in
 `java-workflows`' merge lane: findings at `medium` or above appear in
@@ -197,8 +207,8 @@ Both release lanes publish the **same archive** they attest. The
 `pack-release` job, and the matching step inside `build-test-release`'s
 `build` job, pack once, and the publish job hands that file to npm
 through `node-publish-action`'s `tarball_path`, so npm packs nothing
-at publish time. The provenance and the Sigstore signature cover the
-exact bytes the registry received.
+at publish time. The provenance, the SBOM attestation and the Sigstore
+signature cover the exact bytes the registry received.
 
 That also settles a difference the two paths used to carry. `npm pack`
 and `npm publish` do not build identical archives: npm runs
@@ -762,6 +772,40 @@ gh attestation verify <package>-<version>.tgz \
 ```
 
 <!-- markdownlint-enable MD013 -->
+
+When `sbom_enabled` is on, the same job also attests the CycloneDX
+SBOM against the same tarball. `gh` checks SLSA provenance unless told
+otherwise, so name the CycloneDX predicate type to verify the SBOM
+attestation instead:
+
+<!-- markdownlint-disable MD013 -->
+
+```shell
+gh attestation verify <package>-<version>.tgz \
+  --repo <owner>/<repo> \
+  --signer-workflow lfreleng-actions/node-workflows/.github/workflows/build-test-release.yaml \
+  --source-ref refs/tags/<tag> \
+  --predicate-type https://cyclonedx.org/bom
+```
+
+<!-- markdownlint-enable MD013 -->
+
+The SBOM describes the project's dependencies as `sbom-action`'s syft
+backend resolves them from the lockfile, not the list of files inside
+the tarball. The attestation states that this workflow produced this
+SBOM for this release. npm records build provenance and has no
+place for an SBOM, and adding one to the tarball would change the
+attested bytes, so the attestation is what ties the SBOM to the
+published package.
+
+Any copy of the tarball verifies, the registry's included, since both
+lanes publish the archive they attest. `npm pack <package>@<version>`
+fetches the registry's copy.
+
+Both `gh` commands verify a Model B release, with `merge.yaml` in place
+of `build-test-release.yaml` in `--signer-workflow`, and
+`--source-ref` set to the GitHub ref of the run that published it:
+the pushed branch, or the ref a `workflow_dispatch` targeted.
 
 Verify the Sigstore signature bundle with cosign v3 or later. The
 workflow emits a v0.3 Sigstore bundle, which cosign v2.2 cannot read:

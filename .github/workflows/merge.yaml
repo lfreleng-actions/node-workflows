@@ -2380,6 +2380,32 @@ jobs:
           # yamllint disable-line rule:line-length
           subject-path: attest/${{ needs.pack-release.outputs.tarball_name }}
 
+      # pack-release uploads the release SBOM whenever sbom_enabled is
+      # set, and must succeed for this job to run, so the artefact is
+      # there to download. With sbom_enabled off, the provenance above
+      # is the only attestation.
+      - name: 'Download release SBOM'
+        if: inputs.sbom_enabled
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: sbom-files-node-merge
+          path: 'sbom'
+
+      # Binds the CycloneDX SBOM to the same tarball the provenance
+      # names, so both attestations cover the published bytes. A
+      # separate step because sbom-path cannot share a step with the
+      # predicate inputs. The SBOM describes the project's
+      # lockfile-resolved dependencies, not the tarball's file list.
+      - name: 'Attest SBOM'
+        if: inputs.sbom_enabled
+        # yamllint disable-line rule:line-length
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          # yamllint disable-line rule:line-length
+          subject-path: attest/${{ needs.pack-release.outputs.tarball_name }}
+          sbom-path: 'sbom/sbom-cyclonedx.json'
+
   sign-artefacts:
     name: 'Sign Artefacts'
     runs-on: ubuntu-latest
