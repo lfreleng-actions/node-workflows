@@ -817,7 +817,7 @@ jobs:
       # installs dependencies with the resolved build tool first
       - name: 'Build project'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@02ffec745cddf67291d0b28f64bd81990cae327f  # v0.2.4
+        uses: lfreleng-actions/node-build-action@592a923aaf25853712b43b82e7e7cf7980728dcb  # v0.2.5
         with:
           node_version: ${{ needs.node-metadata.outputs.build_node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
@@ -893,7 +893,7 @@ jobs:
       - name: 'Run tests'
         id: run-tests
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@02ffec745cddf67291d0b28f64bd81990cae327f  # v0.2.4
+        uses: lfreleng-actions/node-build-action@592a923aaf25853712b43b82e7e7cf7980728dcb  # v0.2.5
         # The NO_BLOCK/soft-fail pattern: setting the
         # test_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
         # repository variable (an org/repo-wide override that
@@ -1115,12 +1115,16 @@ jobs:
       # lacks one, so legacy projects still get audit coverage
       - name: 'Audit dependencies'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-audit-action@e2fb529140ff803c457451f16c2bc12107e1a5d3  # v0.0.3
+        uses: lfreleng-actions/node-audit-action@b531c8229b3a543610b62a7a98b752d30dda5dff  # v0.1.0
         with:
           path_prefix: ${{ inputs.path_prefix }}
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           audit_level: ${{ inputs.audit_level }}
           production_only: ${{ inputs.production_only }}
+          # Pinned to npm: the action's 'auto' default runs native
+          # Yarn, pnpm and Bun audits through Corepack, whose egress
+          # hosts the organisation allow-list does not yet carry
+          package_manager: 'npm'
           # The NO_BLOCK/soft-fail pattern: setting the
           # audit_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
           # repository variable (an org/repo-wide override that

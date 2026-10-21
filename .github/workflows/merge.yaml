@@ -1001,7 +1001,7 @@ jobs:
 
       - name: 'Build project'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@02ffec745cddf67291d0b28f64bd81990cae327f  # v0.2.4
+        uses: lfreleng-actions/node-build-action@592a923aaf25853712b43b82e7e7cf7980728dcb  # v0.2.5
         with:
           node_version: ${{ needs.node-metadata.outputs.build_node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
@@ -1379,7 +1379,7 @@ jobs:
         # yamllint disable-line rule:line-length
         if: steps.creds.outputs.available == 'true' || inputs.dry_run
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@448b280446b6ea9acff88ad44062d74e2fcc45b0  # v0.2.2
+        uses: lfreleng-actions/node-publish-action@1aba0ee5d24837780fccd3f830b12d41e183e8fb  # v0.4.0
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ needs.resolve-version.outputs.snapshot_version }}
@@ -2081,7 +2081,7 @@ jobs:
         # yamllint disable-line rule:line-length
         if: (steps.creds.outputs.available == 'true' || inputs.dry_run) && steps.registry-check.outputs.publish == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@448b280446b6ea9acff88ad44062d74e2fcc45b0  # v0.2.2
+        uses: lfreleng-actions/node-publish-action@1aba0ee5d24837780fccd3f830b12d41e183e8fb  # v0.4.0
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
           registry_url: ${{ matrix.target.registry_url }}
