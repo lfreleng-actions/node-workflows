@@ -2269,7 +2269,7 @@ jobs:
         id: sbom
         if: inputs.sbom_enabled
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/sbom-action@58b6094cf67d072d6eb772590c43ee52c8c69bb6  # v0.2.0
+        uses: lfreleng-actions/sbom-action@cd6b02f4d099fc19153b505c9faa7bd01ccfa0e5  # v0.4.0
         with:
           path_prefix: ${{ inputs.path_prefix }}
           filename_prefix: 'sbom-cyclonedx'
