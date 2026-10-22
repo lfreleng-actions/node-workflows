@@ -1415,10 +1415,15 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has_release: ${{ steps.detect.outputs.has_release }}
-      version: ${{ steps.detect.outputs.version }}
+      version: ${{ steps.verify-version.outputs.version }}
+      # Read from the schema-validated release file for #126; nothing
+      # consumes them yet.
+      git_tag: ${{ steps.release-schema.outputs.git_tag }}
+      tag_release: ${{ steps.release-schema.outputs.tag_release }}
     permissions:
       contents: read
-    timeout-minutes: 5
+    # The schema action installs lftools-uv cold on every run
+    timeout-minutes: 10
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
@@ -1466,8 +1471,9 @@ jobs:
           persist-credentials: false
 
       # Generic release-trigger detection (NOT a placeholder): the
-      # merged commit adds a file under releases/ carrying a
-      # "version: X.Y.Z" line; that version drives release-publish.
+      # merged commit adds one file under releases/. The schema step
+      # below validates it and reads its version, which drives
+      # release-publish.
       - name: 'Detect release file in merged commit'
         id: detect
         shell: bash
@@ -1512,7 +1518,7 @@ jobs:
           if [ "${file_count}" -eq 0 ]; then
             echo "No release file in merged commit"
             echo "has_release=false" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "release_file=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Enforce exactly one release descriptor per merged commit;
@@ -1524,23 +1530,24 @@ jobs:
           fi
           release_file="${files}"
           echo "Release file detected: ${release_file}"
-          # Tolerate a missing version: line (grep exits 1 under
-          # pipefail); the guard below then reports it cleanly
-          version=$({ grep -E '^[[:space:]]*version:' \
-            "${release_file}" || true; } \
-            | head -n1 | awk '{print $2}' | tr -d '\r' | tr -d "'\"")
-          # Guard against malformed/hostile content before the value
-          # reaches $GITHUB_OUTPUT and downstream jobs.
-          case "${version}" in
-            '' | *[!0-9A-Za-z._-]*)
-              echo "::error::Invalid or missing version in release" \
-                "file: ${release_file}"
-              exit 1
-              ;;
-          esac
-          echo "Release version: ${version}"
           echo "has_release=true" >> "$GITHUB_OUTPUT"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_file=${release_file}" >> "$GITHUB_OUTPUT"
+
+      # A file that fails the npm release schema fails the run here,
+      # before anything packs, signs, attests or publishes. It needs
+      # no credentials, so it runs on dry runs too. The action parses
+      # the file as YAML and exposes its fields as outputs, replacing
+      # a grep for the first 'version:' line.
+      - name: 'Validate release file against schema'
+        id: release-schema
+        if: steps.detect.outputs.has_release == 'true'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        with:
+          distribution-type: 'npm'
+          release-file: ${{ steps.detect.outputs.release_file }}
+          # Unset, the action runs whatever lftools-uv PyPI serves
+          lftools-uv-version: '0.7.5'
 
       # The release file's version must match version.properties; a
       # mismatch means the release descriptor and committed version
@@ -1552,9 +1559,19 @@ jobs:
         if: steps.detect.outputs.has_release == 'true'
         shell: bash
         env:
-          RELEASE_VERSION: ${{ steps.detect.outputs.version }}
+          RELEASE_VERSION: ${{ steps.release-schema.outputs.version }}
           RESOLVED_VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
+          # Guard against malformed/hostile content before the value
+          # reaches $GITHUB_OUTPUT and downstream jobs. The schema
+          # allows SemVer build metadata ('+...'); this lane does not.
+          case "${RELEASE_VERSION}" in
+            '' | *[!0-9A-Za-z._-]*)
+              echo "::error::Invalid or missing version in the" \
+                "release file"
+              exit 1
+              ;;
+          esac
           # Cross-check the release file against version.properties
           if [ "${RELEASE_VERSION}" != "${RESOLVED_VERSION}" ]; then
             echo "::error::Release file version" \
@@ -1563,6 +1580,51 @@ jobs:
             exit 1
           fi
           echo "Release version verified: ${RELEASE_VERSION}"
+          echo "version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+
+      # The release file's optional project should name the package
+      # it releases. Compared with package.json, not the repository:
+      # a mirror's name can differ (sdc-onap-ui-common releases
+      # onap-ui-common). A mismatch warns rather than fails.
+      - name: 'Compare release project with package name'
+        id: project-check
+        if: >-
+          steps.detect.outputs.has_release == 'true'
+          && steps.release-schema.outputs.project != ''
+        shell: bash
+        env:
+          RELEASE_PROJECT: ${{ steps.release-schema.outputs.project }}
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+        run: |
+          # Compare the release file's project with package.json name
+          manifest="${PATH_PREFIX}/package.json"
+          name=''
+          if [ -f "${manifest}" ]; then
+            name="$(jq -r '.name // empty' "${manifest}" 2> /dev/null \
+              || true)"
+          fi
+          if [ -z "${name}" ]; then
+            echo "::warning::No package name in ${manifest}; cannot" \
+              "compare the release file's project with it"
+            exit 0
+          fi
+          # Accept the full name or the name without its npm scope
+          if [ "${RELEASE_PROJECT}" = "${name}" ] \
+            || [ "${RELEASE_PROJECT}" = "${name#@*/}" ]; then
+            echo "Release project matches package name"
+            exit 0
+          fi
+          # project is contributor-controlled: print it only when it
+          # cannot carry a workflow command or other markup
+          safe='^[A-Za-z0-9._@/-]+$'
+          if [[ "${RELEASE_PROJECT}" =~ ${safe} ]] \
+            && [[ "${name}" =~ ${safe} ]]; then
+            echo "::warning::Release file project '${RELEASE_PROJECT}'" \
+              "does not match package name '${name}'"
+          else
+            echo "::warning::Release file project does not match the" \
+              "package name in ${manifest}"
+          fi
 
       # release_only exists to publish a release, so a recovery run at
       # a commit that adds no release file is a wrong commit, not a

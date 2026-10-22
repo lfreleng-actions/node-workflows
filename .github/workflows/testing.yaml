@@ -1901,6 +1901,7 @@ jobs:
           # Exercise release detection
           detect="${RUNNER_TEMP}/detect.sh"
           verify="${RUNNER_TEMP}/verify.sh"
+          project="${RUNNER_TEMP}/project.sh"
           python3 - <<'EXTRACT'
           import os
 
@@ -1911,7 +1912,8 @@ jobs:
           steps = doc['jobs']['check-release']['steps']
           tmp = os.environ['RUNNER_TEMP']
           for step_id, name in (('detect', 'detect.sh'),
-                                ('verify-version', 'verify.sh')):
+                                ('verify-version', 'verify.sh'),
+                                ('project-check', 'project.sh')):
               run = [s for s in steps if s.get('id') == step_id][0]['run']
               with open(os.path.join(tmp, name), 'w') as handle:
                   handle.write(run)
@@ -1919,7 +1921,9 @@ jobs:
           # Fail loudly rather than silently testing nothing if a
           # step is renamed or loses its check
           if ! grep -q 'is-shallow-repository' "${detect}" \
-            || ! grep -q 'RESOLVED_VERSION' "${verify}"; then
+            || ! grep -q 'release_file=' "${detect}" \
+            || ! grep -q 'RESOLVED_VERSION' "${verify}" \
+            || ! grep -q 'RELEASE_PROJECT' "${project}"; then
             echo "Could not extract release detection ❌"
             echo "Update the extraction in this job to match"
             exit 1
@@ -1970,7 +1974,8 @@ jobs:
           errors=0
           # $1 case, $2 branch, $3 depth (0 = full history),
           # $4 want (pass|fail), $5 expected has_release,
-          # $6 expected version; FROM overrides the source repository
+          # $6 expected release_file; FROM overrides the source
+          # repository
           check() {
             local work="${RUNNER_TEMP}/case-$1" depth=()
             rm -rf "${work}"
@@ -2004,38 +2009,111 @@ jobs:
               return
             fi
             if ! grep -qx "has_release=$5" "${work}.out" \
-              || ! grep -qx "version=$6" "${work}.out"; then
+              || ! grep -qx "release_file=$6" "${work}.out"; then
               echo "$1: wrong outputs ❌"
               cat "${work}.out"
               errors=1
             fi
           }
 
-          check 'release, parent fetched' release 2 pass true 1.1.1
+          check 'release, parent fetched' release 2 pass true \
+            releases/1.1.1.yaml
           check 'no release, parent fetched' plain 2 pass false ''
           check 'release file edited' edited 2 pass false ''
           check 'release file deleted' deleted 2 pass false ''
           check 'two release files' two 2 fail
 
-          # A release version must match version.properties, or the
-          # run fails (#118). $1 case, $2 release, $3 resolved, $4 want
+          # The schema step's version must pass the character guard
+          # and match version.properties, or the run fails (#118).
+          # $1 case, $2 release, $3 resolved, $4 want
           verify_case() {
+            local outputs="${RUNNER_TEMP}/verify.out"
+            : > "${outputs}"
             set +e
             out="$(RELEASE_VERSION="$2" RESOLVED_VERSION="$3" \
+              GITHUB_OUTPUT="${outputs}" \
               bash -eo pipefail "${verify}" 2>&1)"
             rc=$?
             set -e
-            if [ "$4" = 'pass' ] && [ "${rc}" != '0' ]; then
-              echo "$1: verification failed (${rc}) ❌"
+            if [ "$4" = 'pass' ]; then
+              if [ "${rc}" != '0' ]; then
+                echo "$1: verification failed (${rc}) ❌"
+                errors=1
+              elif ! grep -qx "version=$2" "${outputs}"; then
+                echo "$1: version output missing ❌"
+                cat "${outputs}"
+                errors=1
+              fi
+            elif [ "${rc}" = '0' ] \
+              || ! printf '%s' "${out}" | grep -q '^::error::'; then
+              echo "$1: did not fail with an error ❌"
               errors=1
-            elif [ "$4" = 'fail' ] && { [ "${rc}" = '0' ] \
-              || ! printf '%s' "${out}" | grep -q '^::error::'; }; then
-              echo "$1: mismatch did not fail with an error ❌"
+            elif [ -s "${outputs}" ]; then
+              echo "$1: failed but still wrote an output ❌"
               errors=1
             fi
           }
           verify_case 'versions match' 1.1.1 1.1.1 pass
           verify_case 'versions differ' 1.1.2 1.1.1 fail
+          verify_case 'version empty' '' '' fail
+          # SemVer build metadata passes the schema; the lane rejects it
+          verify_case 'build metadata' 1.1.1+build 1.1.1+build fail
+          verify_case 'hostile version' '1.1.1;x' '1.1.1;x' fail
+
+          # project differing from package.json name warns and never
+          # fails. $1 case, $2 project, $3 package name ('' writes no
+          # package.json), $4 expected (match|warn|warn-quiet)
+          project_case() {
+            local dir="${RUNNER_TEMP}/project-case"
+            rm -rf "${dir}"
+            mkdir -p "${dir}"
+            if [ -n "$3" ]; then
+              jq -n --arg name "$3" '{name: $name}' > "${dir}/package.json"
+            fi
+            set +e
+            out="$(cd "${dir}" && RELEASE_PROJECT="$2" PATH_PREFIX='.' \
+              bash -eo pipefail "${project}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${rc}" != '0' ]; then
+              echo "$1: project check failed (${rc}) ❌"
+              errors=1
+              return
+            fi
+            case "$4" in
+              match)
+                if printf '%s' "${out}" | grep -q '^::warning::'; then
+                  echo "$1: warned on a matching project ❌"
+                  errors=1
+                fi
+                ;;
+              warn)
+                if ! printf '%s' "${out}" \
+                  | grep -qF "::warning::Release file project '$2'"; then
+                  echo "$1: no warning naming the project ❌"
+                  errors=1
+                fi
+                ;;
+              warn-quiet)
+                if ! printf '%s' "${out}" | grep -q '^::warning::' \
+                  || printf '%s' "${out}" | grep -qF "$2"; then
+                  echo "$1: expected a warning omitting the project ❌"
+                  errors=1
+                fi
+                ;;
+            esac
+          }
+          project_case 'project matches' onap-ui-common onap-ui-common match
+          project_case 'project matches unscoped' onap-ui-common \
+            '@onap/onap-ui-common' match
+          project_case 'project matches scoped' '@onap/onap-ui-common' \
+            '@onap/onap-ui-common' match
+          project_case 'project differs' other-project onap-ui-common warn
+          project_case 'repository name is not the package' \
+            sdc-onap-ui-common onap-ui-common warn
+          project_case 'hostile project' '::stop-commands::x' \
+            onap-ui-common warn-quiet
+          project_case 'no package.json' onap-ui-common '' warn-quiet
           # The defect: a depth-1 clone has no parent, and must fail
           # rather than report no release (#117)
           check 'release, shallow without parent' release 1 fail
@@ -2051,13 +2129,252 @@ jobs:
           git -C "${first}" add releases
           git -C "${first}" commit -q -m 'Initial release'
           FROM="${first}" check 'release in the root commit' main 0 \
-            pass true 1.0.0
+            pass true releases/1.0.0.yaml
 
           if [ "${errors}" != '0' ]; then
             echo "Release detection incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           echo "Release detection correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # merge.yaml's check-release validates the release file with
+  # verify-release-schema-action (#148). Run the same pin, with the
+  # same lftools-uv version, against an ONAP-shaped file that has to
+  # pass and files that have to fail, and keep the wiring in
+  # merge.yaml from drifting away from what this job proves.
+  release-schema:
+    name: 'Test: release file schema'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # merge.yaml cannot run in CI, so read its wiring: the schema
+      # step must be gated on a detected release, run before the
+      # version comparison, and feed the job's guarded version
+      # output. The pin and lftools-uv version must match the steps
+      # below, or this job proves nothing about the shipped one.
+      - name: 'Assert release schema wiring'
+        shell: bash
+        run: |
+          # Assert release schema wiring
+          python3 - <<'PY'
+          import sys
+
+          import yaml
+
+          # Assembled so it is not a workflow expression to actionlint
+          OPEN = '${' + '{ '
+          CLOSE = ' }' + '}'
+
+          with open('.github/workflows/merge.yaml') as handle:
+              job = yaml.safe_load(handle)['jobs']['check-release']
+          with open('.github/workflows/testing.yaml') as handle:
+              tests = yaml.safe_load(handle)['jobs']['release-schema']
+
+          errors = []
+          steps = job.get('steps') or []
+          ids = [s.get('id') for s in steps]
+          schema = [s for s in steps if s.get('id') == 'release-schema']
+          if len(schema) != 1:
+              sys.exit('::error::merge.yaml/check-release has no '
+                       'release-schema step \u274c')
+          schema = schema[0]
+          schema_with = schema.get('with') or {}
+          if str(schema.get('if', '')).strip() != (
+                  "steps.detect.outputs.has_release == 'true'"):
+              errors.append('release-schema is not gated on has_release')
+          if schema_with.get('distribution-type') != 'npm':
+              errors.append('release-schema does not set '
+                            'distribution-type: npm')
+          if not schema_with.get('lftools-uv-version'):
+              errors.append('release-schema does not pin '
+                            'lftools-uv-version')
+          wanted_file = OPEN + 'steps.detect.outputs.release_file' + CLOSE
+          if schema_with.get('release-file') != wanted_file:
+              errors.append('release-schema does not validate the '
+                            'detected release file')
+          if 'verify-version' not in ids or ids.index(
+                  'release-schema') > ids.index('verify-version'):
+              errors.append('release-schema does not run before '
+                            'verify-version')
+          verify = steps[ids.index('verify-version')] \
+              if 'verify-version' in ids else {}
+          wanted_env = OPEN + 'steps.release-schema.outputs.version' + CLOSE
+          if (verify.get('env') or {}).get('RELEASE_VERSION') != wanted_env:
+              errors.append('verify-version does not read the schema '
+                            "step's version")
+          outputs = job.get('outputs') or {}
+          wanted = {
+              'version': 'steps.verify-version.outputs.version',
+              'git_tag': 'steps.release-schema.outputs.git_tag',
+              'tag_release': 'steps.release-schema.outputs.tag_release',
+          }
+          for key, expr in wanted.items():
+              if outputs.get(key) != OPEN + expr + CLOSE:
+                  errors.append(f'check-release output {key} is '
+                                f'{outputs.get(key)!r}, expected {expr}')
+
+          # Every action step in this job must match the shipped pin
+          tested = [s for s in tests.get('steps') or []
+                    if 'verify-release-schema-action' in str(
+                        s.get('uses', ''))]
+          if not tested:
+              errors.append('testing.yaml/release-schema runs no '
+                            'verify-release-schema-action step')
+          for step in tested:
+              if step.get('uses') != schema.get('uses'):
+                  errors.append(f"{step.get('id')} uses "
+                                f"{step.get('uses')!r}, merge.yaml uses "
+                                f"{schema.get('uses')!r}")
+              got = (step.get('with') or {}).get('lftools-uv-version')
+              if got != schema_with.get('lftools-uv-version'):
+                  errors.append(f"{step.get('id')} runs lftools-uv "
+                                f'{got!r}, merge.yaml runs '
+                                f"{schema_with.get('lftools-uv-version')!r}")
+
+          # The uses: lines themselves, comment included, so a bump in
+          # one file only is caught even where YAML would agree
+          def uses_lines(path):
+              with open(path) as handle:
+                  return {line.strip() for line in handle
+                          if line.strip().startswith('uses:')
+                          and 'verify-release-schema-action' in line}
+          lines = (uses_lines('.github/workflows/merge.yaml')
+                   | uses_lines('.github/workflows/testing.yaml'))
+          if len(lines) != 1:
+              errors.append('verify-release-schema-action pins differ: '
+                            f'{sorted(lines)!r}')
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('Release schema wiring incorrect \u274c')
+          print('Release schema wiring correct \u2705')
+          PY
+          echo "Release schema wiring correct ✅" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Write release file fixtures'
+        shell: bash
+        run: |
+          # Write release file fixtures
+          dir="${RUNNER_TEMP}/release-fixtures"
+          mkdir -p "${dir}"
+          # Shaped like onap/sdc-onap-ui-common's release files
+          printf 'project: onap-ui-common\nversion: 1.1.2\n' \
+            > "${dir}/onap.yaml"
+          printf '%s\n' 'distribution_type: npm' 'version: 1.1.2' \
+            "git_tag: 'v1.1.2'" 'tag_release: false' \
+            > "${dir}/full.yaml"
+          printf 'project: onap-ui-common\nversion: 1.1\n' \
+            > "${dir}/short-version.yaml"
+          printf 'project: onap-ui-common\n' > "${dir}/no-version.yaml"
+          printf 'distribution_type: maven\nversion: 1.1.2\n' \
+            > "${dir}/maven.yaml"
+
+      - name: 'Validate ONAP-shaped release file'
+        id: onap
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        with:
+          distribution-type: 'npm'
+          release-file: ${{ runner.temp }}/release-fixtures/onap.yaml
+          lftools-uv-version: '0.7.5'
+      - name: 'Validate release file with optional fields'
+        id: full
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        with:
+          distribution-type: 'npm'
+          release-file: ${{ runner.temp }}/release-fixtures/full.yaml
+          lftools-uv-version: '0.7.5'
+      - name: 'Reject a two-part version'
+        id: short-version
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        with:
+          distribution-type: 'npm'
+          release-file: ${{ runner.temp }}/release-fixtures/short-version.yaml
+          lftools-uv-version: '0.7.5'
+      - name: 'Reject a missing version'
+        id: no-version
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        with:
+          distribution-type: 'npm'
+          release-file: ${{ runner.temp }}/release-fixtures/no-version.yaml
+          lftools-uv-version: '0.7.5'
+      - name: 'Reject a non-npm distribution type'
+        id: maven
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        with:
+          distribution-type: 'npm'
+          release-file: ${{ runner.temp }}/release-fixtures/maven.yaml
+          lftools-uv-version: '0.7.5'
+
+      - name: 'Assert schema outcomes'
+        shell: bash
+        env:
+          ONAP: ${{ steps.onap.outcome }}
+          ONAP_VERSION: ${{ steps.onap.outputs.version }}
+          ONAP_PROJECT: ${{ steps.onap.outputs.project }}
+          FULL: ${{ steps.full.outcome }}
+          FULL_VERSION: ${{ steps.full.outputs.version }}
+          FULL_GIT_TAG: ${{ steps.full.outputs.git_tag }}
+          FULL_TAG_RELEASE: ${{ steps.full.outputs.tag_release }}
+          SHORT_VERSION: ${{ steps.short-version.outcome }}
+          NO_VERSION: ${{ steps.no-version.outcome }}
+          MAVEN: ${{ steps.maven.outcome }}
+        run: |
+          # Assert schema outcomes
+          errors=0
+          # $1 case, $2 actual, $3 expected
+          expect() {
+            if [ "$2" != "$3" ]; then
+              echo "$1: got '$2', expected '$3' ❌"
+              errors=1
+            fi
+          }
+          expect 'ONAP-shaped file' "${ONAP}" success
+          expect 'ONAP version' "${ONAP_VERSION}" 1.1.2
+          expect 'ONAP project' "${ONAP_PROJECT}" onap-ui-common
+          expect 'file with optional fields' "${FULL}" success
+          expect 'full version' "${FULL_VERSION}" 1.1.2
+          expect 'full git_tag' "${FULL_GIT_TAG}" v1.1.2
+          expect 'full tag_release' "${FULL_TAG_RELEASE}" false
+          expect 'version: 1.1' "${SHORT_VERSION}" failure
+          expect 'version missing' "${NO_VERSION}" failure
+          expect 'distribution_type: maven' "${MAVEN}" failure
+          if [ "${errors}" != '0' ]; then
+            echo "Release schema validation incorrect ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Release schema validation correct ✅" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
   # build-test's dependencies-changed Grype gate trusts a manifest the
   # sbom job writes from git history. Extract the shipped step and
