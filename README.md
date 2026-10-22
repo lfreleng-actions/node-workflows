@@ -227,6 +227,46 @@ why the artefact-level records exist at all; publishing to a registry
 that does support it (such as npmjs.org under trusted publishing)
 yields registry-native provenance too.
 
+#### Release files
+
+The `check-release` job validates the release file against the npm
+release schema with
+[`verify-release-schema-action`](https://github.com/lfreleng-actions/verify-release-schema-action),
+and reads its fields from the parsed file rather than searching for a
+`version:` line:
+
+```yaml
+project: 'onap-ui-common'   # optional
+version: '1.1.2'            # required
+```
+
+<!-- markdownlint-disable MD013 -->
+
+| Field               | Required | Meaning                                                                       |
+| ------------------- | -------- | ----------------------------------------------------------------------------- |
+| `version`           | yes      | Full semantic version, such as `1.1.2`; it must match `version.properties`    |
+| `project`           | no       | Package the file releases                                                     |
+| `git_tag`           | no       | Tag to create for the release; read but not yet used                          |
+| `tag_release`       | no       | Whether to tag the release, `true` or `false`; read but not yet used          |
+| `ref`               | no       | Commit the release came from                                                  |
+| `distribution_type` | no       | Must be `npm` when present                                                    |
+
+<!-- markdownlint-enable MD013 -->
+
+A file that fails the schema (malformed YAML, a missing or partial
+`version` such as `1.1`, or another `distribution_type`) fails the run
+with the schema error, before the release tarball packs, signs, attests
+or publishes. The lane also rejects SemVer build metadata (`1.1.2+build`),
+which the schema allows. Validation needs no credentials, so it runs on
+dry runs too.
+
+When the file sets `project`, the job compares it with the `name` in
+`<path_prefix>/package.json`, accepting the name with or without its
+npm scope (`@scope/name` or `name`). A mismatch emits a warning and
+does not fail the run. The comparison ignores the repository name,
+since a mirror such as `sdc-onap-ui-common` can publish a package
+named `onap-ui-common`.
+
 ### Re-running a Release
 
 npm never overwrites a published version, and a release reaching
@@ -499,7 +539,7 @@ targets.
 | `snapshot_version`       | The `X.Y.Z-SNAPSHOT` version from `version.properties`                                                                             |
 | `snapshot_published`     | `'true'` when every snapshot target accepted it; `'false'` on any failed leg, a skipped lane, or a dry run                         |
 | `snapshot_target_names`  | Comma-separated names of the resolved snapshot targets                                                                             |
-| `has_release`            | `'true'` when the merged commit adds a release file matching `version.properties`, `'false'` when it adds none; `''` on a mismatch |
+| `has_release`            | `'true'` when the merged commit adds a valid release file matching `version.properties`, `'false'` when it adds none; else `''`    |
 | `release_version`        | Version the release file requests; `''` unless `has_release` is `'true'`                                                           |
 | `release_published`      | `'true'` when every release target accepted it; `'false'` with no release, on any failed leg, or on a dry run                      |
 | `release_target_names`   | Comma-separated names of the resolved release targets, set even when no release ran                                                |
