@@ -160,8 +160,10 @@ jobs:
             # The legacy dependency tree fails tests on modern runners
             test_permit_fail: true
             # No lockfile in the repository, so this leg exercises the
-            # node-audit-action lockfile synthesis; the legacy
-            # dependency tree carries known audit findings
+            # node-audit-action lockfile synthesis and, through
+            # lockfile_required's false default, the resolving install
+            # install_mode 'auto' falls back to; the legacy dependency
+            # tree carries known audit findings
             audit_permit_fail: true
             # 2020-era dependencies trip the Grype severity gate
             grype_permit_fail: true
@@ -4095,26 +4097,29 @@ jobs:
               if tool_block(body) != tool_ref:
                   sys.exit(f'build_tool block in {path} diverged')
 
-          # So is the audit package manager block, from its default to
-          # the loop over the resolved tool's lockfiles
-          def audit_block(body):
+          # So is the lockfile block, from the resolved tool's
+          # lockfiles through the audit choice to the install mode
+          def lockfile_block(body):
               lines = body.split('\n')
               start = next(
                   i for i, line in enumerate(lines)
                   if line.startswith('case "${build_tool}" in')
-                  and lines[i + 1].lstrip().startswith('pnpm) audit_')
+                  and lines[i + 1].lstrip().startswith('pnpm) tool_')
+              )
+              mode = next(
+                  i for i, line in enumerate(lines[start:], start)
+                  if line.startswith('case "${LOCKFILE_REQUIRED')
               )
               end = next(
-                  i for i, line in enumerate(lines[start:], start)
-                  if line == 'done'
+                  i for i, line in enumerate(lines[mode:], mode)
+                  if line == 'esac'
               )
               return lines[start:end + 1]
 
-          audit_ref = audit_block(reference)
+          lockfile_ref = lockfile_block(reference)
           for path, body in bodies.items():
-              if audit_block(body) != audit_ref:
-                  sys.exit(f'audit package manager block in {path} '
-                           'diverged')
+              if lockfile_block(body) != lockfile_ref:
+                  sys.exit(f'lockfile block in {path} diverged')
 
           sys.stdout.write(reference)
           EXTRACT
@@ -4452,6 +4457,102 @@ jobs:
             npm-shrinkwrap.json
           check_audit 'npm, no lockfile' npm npm
 
+          # lockfile_required freezes the install beside the resolved
+          # tool's own lockfile and refuses to run without it; false
+          # leaves node-build-action's 'auto' to decide. $1 case, $2
+          # the expected install_mode or 'reject', $3 lockfile_required,
+          # $4 the build tool, then the lockfiles path_prefix holds
+          check_install() {
+            local name="$1" want="$2" required="$3" tool="$4"
+            shift 4
+            local dir
+            dir="$(mktemp -d "${RUNNER_TEMP}/install.XXXXXX")"
+            for lockfile in "$@"; do
+              : > "${dir}/${lockfile}"
+            done
+            : > "${RUNNER_TEMP}/vout.txt"
+            set +e
+            out="$(env NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+              TEST_NODE_VERSION_INPUT='' TEST_NODE_VERSIONS_INPUT='' \
+              BUILD_TOOL_INPUT="${tool}" DETECTED_PACKAGE_MANAGER='' \
+              DETECTED_REQUIRES_NODE='' PATH_PREFIX="${dir}" \
+              LOCKFILE_REQUIRED="${required}" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/vout.txt" \
+              bash "${resolver}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${want}" = 'reject' ]; then
+              if [ "${rc}" = "0" ]; then
+                echo "${name}: expected rejection, resolver succeeded ❌"
+                errors=1
+              elif ! printf '%s\n' "${out}" \
+                | grep '^::error::' | grep -qF "${expected_file}"; then
+                echo "${name}: no labelled error naming" \
+                  "${expected_file} ❌"
+                printf '%s\n' "${out}" | tail -2
+                errors=1
+              fi
+              return
+            fi
+            if [ "${rc}" != "0" ]; then
+              echo "${name}: resolver failed unexpectedly ❌"
+              printf '%s\n' "${out}" | tail -2
+              errors=1
+              return
+            fi
+            got="$(grep '^install_mode=' "${RUNNER_TEMP}/vout.txt" \
+              | cut -d= -f2-)"
+            if [ "${got}" != "${want}" ]; then
+              echo "${name}: install_mode got '${got}'," \
+                "expected '${want}' ❌"
+              errors=1
+            fi
+          }
+          # Each tool, its own lockfile expected in the error
+          for tool_case in 'npm package-lock.json' \
+            'npm npm-shrinkwrap.json' 'yarn yarn.lock' \
+            'yarn-berry yarn.lock' 'pnpm pnpm-lock.yaml' \
+            'bun bun.lock' 'bun bun.lockb'; do
+            read -r tool expected_file <<< "${tool_case}"
+            other='pnpm-lock.yaml'
+            if [ "${tool}" = 'pnpm' ]; then
+              other='package-lock.json'
+            fi
+            check_install "${tool}, required, ${expected_file}" frozen \
+              true "${tool}" "${expected_file}"
+            check_install "${tool}, required, no lockfile" reject \
+              true "${tool}"
+            check_install "${tool}, required, only ${other}" reject \
+              true "${tool}" "${other}"
+            check_install "${tool}, not required, ${expected_file}" \
+              auto false "${tool}" "${expected_file}"
+            check_install "${tool}, not required, no lockfile" auto \
+              false "${tool}"
+          done
+          expected_file='lockfile_required'
+          check_install 'invalid lockfile_required' reject yes npm \
+            package-lock.json
+          # A rejected path_prefix reaches the log, so a newline in it
+          # must not forge a workflow command
+          set +e
+          out="$(env NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+            TEST_NODE_VERSION_INPUT='' TEST_NODE_VERSIONS_INPUT='' \
+            BUILD_TOOL_INPUT='npm' DETECTED_PACKAGE_MANAGER='' \
+            DETECTED_REQUIRES_NODE='' LOCKFILE_REQUIRED='true' \
+            PATH_PREFIX="$(printf 'missing\n::warning::forged')" \
+            GITHUB_OUTPUT="${RUNNER_TEMP}/vout.txt" \
+            bash "${resolver}" 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" = "0" ]; then
+            echo "multiline path_prefix: missing lockfile accepted ❌"
+            errors=1
+          fi
+          if printf '%s\n' "${out}" | grep -q '^::warning::forged'; then
+            echo "multiline path_prefix: forged a workflow command ❌"
+            errors=1
+          fi
+
           if [ "${errors}" != "0" ]; then
             echo "Node.js version resolution tests failed ❌" \
               >> "$GITHUB_STEP_SUMMARY"
@@ -4651,9 +4752,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # node-build-action v0.3.0 made frozen installs its default.
-      # Until #143 decides otherwise, every call keeps resolving
-      # installs, and every call has to use the same pin.
+      # Every call installs in the mode node-metadata resolves from
+      # lockfile_required, and every call has to use the same pin.
       - name: 'Assert node-build-action wiring'
         shell: bash
         run: |
@@ -4671,6 +4771,7 @@ jobs:
               ('merge.yaml', 'build', 'Build project'),
           }
           found = {}
+          docs = {}
           for name in (
               'build-test.yaml',
               'build-test-release.yaml',
@@ -4678,6 +4779,7 @@ jobs:
           ):
               with open(f'.github/workflows/{name}') as handle:
                   doc = yaml.safe_load(handle)
+              docs[name] = doc
               for job_id, job in doc['jobs'].items():
                   for step in job.get('steps') or []:
                       uses = str(step.get('uses', ''))
@@ -4699,11 +4801,51 @@ jobs:
           if len(pins) != 1:
               errors.append('node-build-action pins differ: '
                             + ', '.join(sorted(pins)))
+          # Split so Actions leaves the expression unexpanded
+          WANT_MODE = '$' '{{ needs.node-metadata.outputs.install_mode }}'
           for key, step in sorted(found.items()):
               mode = (step.get('with') or {}).get('install_mode')
-              if mode != 'install':
+              if mode != WANT_MODE:
                   errors.append(f'{"/".join(key)} passes install_mode '
-                                f'{mode!r}, expected \'install\'')
+                                f'{mode!r}, expected {WANT_MODE!r}')
+              name, job_id, _ = key
+              needs = docs[name]['jobs'][job_id].get('needs') or []
+              if isinstance(needs, str):
+                  needs = [needs]
+              if 'node-metadata' not in needs:
+                  errors.append(f'{name}/{job_id} does not need '
+                                'node-metadata')
+
+          # Release and merge lanes require a lockfile by default
+          DEFAULTS = {
+              'build-test.yaml': False,
+              'build-test-release.yaml': True,
+              'merge.yaml': True,
+          }
+          for name, want in DEFAULTS.items():
+              # PyYAML reads the bare 'on' key as True
+              inputs = docs[name][True]['workflow_call']['inputs']
+              spec = inputs.get('lockfile_required')
+              if spec is None:
+                  errors.append(f'{name} lacks the lockfile_required input')
+                  continue
+              if (spec.get('type') != 'boolean'
+                      or spec.get('default') is not want):
+                  errors.append(f'{name} lockfile_required is '
+                                f'{spec.get("type")!r} defaulting to '
+                                f'{spec.get("default")!r}, expected '
+                                f'boolean defaulting to {want!r}')
+              # The resolver reads it, and publishes what it decides
+              job = docs[name]['jobs']['node-metadata']
+              step = [s for s in job['steps'] if s.get('id') == 'resolve'][0]
+              env = str((step.get('env') or {}).get('LOCKFILE_REQUIRED'))
+              if 'inputs.lockfile_required' not in env:
+                  errors.append(f'{name} resolver does not read '
+                                'lockfile_required')
+              output = str(job.get('outputs', {}).get('install_mode'))
+              if 'steps.resolve.outputs.install_mode' not in output:
+                  errors.append(f'{name} node-metadata does not output '
+                                'install_mode')
 
           if errors:
               for message in errors:

@@ -146,6 +146,7 @@ jobs:
       # build_node_version: ''        # Node.js for the build job
       # test_node_version: ''         # Node.js for the tests job
       # build_tool: ''                # 'npm' or 'yarn'; empty auto-detects
+      # lockfile_required: false      # true requires the tool's lockfile
       # build_scripts: 'build'        # package.json build script(s)
       # test_script: 'test'           # package.json test script
 
