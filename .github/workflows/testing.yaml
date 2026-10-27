@@ -120,8 +120,9 @@ jobs:
             "$(tr '\n' ' ' <<< "${tag}")(${SHA})"
 
   # Node.js fixture repositories, fanned out in parallel via a matrix:
-  # a modern npm project and a legacy 2020-era ONAP project, pinned to
-  # exact commits so runs stay reproducible.
+  # a modern npm project, a legacy 2020-era ONAP project and the npm
+  # fixture's pnpm, Yarn and Bun variants, pinned to exact commits so
+  # runs stay reproducible.
   build-test:
     name: 'Build/Test (${{ matrix.name }})'
     needs: node-fixture-ref
@@ -167,6 +168,67 @@ jobs:
             test_artifact_path: ''
             grype_gate_when: 'always'
             test_node_versions: ''
+          # One leg per package manager variant the fixture ships, at
+          # the same pinned commit. Each builds, tests and audits with
+          # its own tool. The pnpm workspace leg points at the
+          # workspace root, which holds pnpm-lock.yaml: detection reads
+          # only the path_prefix directory, so a member package would
+          # be detected as npm.
+          - name: 'variant-pnpm'
+            repository: 'lfreleng-actions/test-node-project'
+            ref: ''
+            path_prefix: 'variants/pnpm'
+            node_version: ''
+            test_permit_fail: false
+            audit_permit_fail: false
+            grype_permit_fail: false
+            test_artifact_path: ''
+            grype_gate_when: 'always'
+            test_node_versions: ''
+          - name: 'variant-pnpm-workspace'
+            repository: 'lfreleng-actions/test-node-project'
+            ref: ''
+            path_prefix: 'variants/pnpm-workspace'
+            node_version: ''
+            test_permit_fail: false
+            audit_permit_fail: false
+            grype_permit_fail: false
+            test_artifact_path: ''
+            grype_gate_when: 'always'
+            test_node_versions: ''
+          - name: 'variant-yarn-berry'
+            repository: 'lfreleng-actions/test-node-project'
+            ref: ''
+            path_prefix: 'variants/yarn-berry'
+            node_version: ''
+            test_permit_fail: false
+            audit_permit_fail: false
+            grype_permit_fail: false
+            test_artifact_path: ''
+            grype_gate_when: 'always'
+            test_node_versions: ''
+          - name: 'variant-yarn-classic'
+            repository: 'lfreleng-actions/test-node-project'
+            ref: ''
+            path_prefix: 'variants/yarn-classic'
+            node_version: ''
+            test_permit_fail: false
+            audit_permit_fail: false
+            grype_permit_fail: false
+            test_artifact_path: ''
+            grype_gate_when: 'always'
+            test_node_versions: ''
+          - name: 'variant-bun'
+            repository: 'lfreleng-actions/test-node-project'
+            ref: ''
+            path_prefix: 'variants/bun'
+            node_version: ''
+            test_permit_fail: false
+            audit_permit_fail: false
+            grype_permit_fail: false
+            test_artifact_path: ''
+            grype_gate_when: 'always'
+            test_node_versions: ''
     permissions:
       contents: read
       pull-requests: read  # repository-metadata-action queries PR data
@@ -174,6 +236,8 @@ jobs:
     with:
       repository: ${{ matrix.repository }}
       ref: ${{ matrix.ref || needs.node-fixture-ref.outputs.sha }}
+      # The two original legs set none, and take the default
+      path_prefix: ${{ matrix.path_prefix || '.' }}
       node_version: ${{ matrix.node_version }}
       test_permit_fail: ${{ matrix.test_permit_fail }}
       audit_permit_fail: ${{ matrix.audit_permit_fail }}
@@ -181,7 +245,7 @@ jobs:
       test_artifact_path: ${{ matrix.test_artifact_path }}
       grype_gate_when: ${{ matrix.grype_gate_when }}
       test_node_versions: ${{ matrix.test_node_versions }}
-      # Both legs upload in this run, so each names its artefacts
+      # Every leg uploads in this run, so each names its artefacts
       # apart, as any caller of the workflow more than once must
       artifact_suffix: '-${{ matrix.name }}'
 
@@ -194,9 +258,11 @@ jobs:
   # Each leg passes '-<leg name>' as artifact_suffix, so its artefacts
   # carry the leg's name: 'sbom-files-test-node-project', say.
   #
-  # Neither fixture emits dist/, so build-test uploads no
-  # node-build-output-* (its upload only warns); nothing is asserted
-  # about it until a fixture builds one.
+  # Neither npm fixture emits dist/, so build-test uploads no
+  # node-build-output-* for them (its upload only warns). Each variant
+  # copies its index.js into dist/, so its upload proves the variant's
+  # build ran; the pnpm workspace root builds into its members'
+  # directories and uploads none.
   build-test-assert:
     name: 'Test: build-test results'
     runs-on: ubuntu-latest
@@ -228,7 +294,10 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           # Keep in step with the build-test matrix names
-          LEGS: 'test-node-project sdc-onap-ui-common'
+          LEGS: >-
+            test-node-project sdc-onap-ui-common variant-pnpm
+            variant-pnpm-workspace variant-yarn-berry variant-yarn-classic
+            variant-bun
         run: |
           # Assert audit and Grype ran
           set -euo pipefail
@@ -251,6 +320,54 @@ jobs:
           done
           exit "${status}"
 
+      # Each variant has to build and test with its own package
+      # manager, not merely run: its build copies index.js into dist/,
+      # which build-test uploads as node-build-output-<leg>
+      - name: 'Assert variants built and tested'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          # Keep in step with the build-test matrix names
+          LEGS: >-
+            variant-pnpm variant-pnpm-workspace variant-yarn-berry
+            variant-yarn-classic variant-bun
+          # The pnpm workspace root writes no dist/ of its own
+          OUTPUTS: >-
+            variant-pnpm variant-yarn-berry variant-yarn-classic
+            variant-bun
+        run: |
+          # Assert variants built and tested
+          set -euo pipefail
+          status=0
+          fail() { echo "::error::$1"; status=1; }
+          api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
+          jobs="$(gh api --paginate "${api}/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | [.name, (.conclusion // .status)] | @tsv')"
+          for leg in ${LEGS}; do
+            for job in 'Node.js Build' 'Tests'; do
+              name="Build/Test (${leg}) / ${job}"
+              result="$(awk -F'\t' -v n="${name}" '$1 == n { print $2 }' \
+                <<< "${jobs}")"
+              if [ "${result}" = 'success' ]; then
+                echo "${name}: success"
+              else
+                fail "${name}: '${result//$'\n'/ }', expected success"
+              fi
+            done
+          done
+          uploads="$(gh api --paginate "${api}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not) | .name')"
+          for leg in ${OUTPUTS}; do
+            if grep -qxF "node-build-output-${leg}" <<< "${uploads}"; then
+              echo "node-build-output-${leg} uploaded ✅"
+            else
+              fail "No node-build-output-${leg} artefact"
+            fi
+          done
+          exit "${status}"
+
       # Each leg's Grype job names the SBOM artefact ID it downloaded
       # in its download step. That has to be the ID of the SBOM its
       # own leg uploaded, or the legs crossed over and a gate passed
@@ -262,7 +379,10 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           # Keep in step with the build-test matrix names
-          LEGS: 'test-node-project sdc-onap-ui-common'
+          LEGS: >-
+            test-node-project sdc-onap-ui-common variant-pnpm
+            variant-pnpm-workspace variant-yarn-berry variant-yarn-classic
+            variant-bun
         run: |
           # Assert Grype scanned its own SBOM
           set -euo pipefail
@@ -335,14 +455,19 @@ jobs:
       # list that package and hold express, which it declares, and
       # body-parser, which only express pulls in: both present and
       # versioned means the lockfile graph was read. No other leg's
-      # SBOM may list test-node-project.
+      # SBOM may list test-node-project. A variant's SBOM may list
+      # nothing, as syft's lockfile support differs by package
+      # manager; it still has to be its own leg's CycloneDX document.
       - name: 'Assert SBOM contents'
         shell: bash
         env:
           ROOT: 'test-node-project'
           EXPECT: 'express body-parser'
           # Keep in step with the build-test matrix names
-          LEGS: 'test-node-project sdc-onap-ui-common'
+          LEGS: >-
+            test-node-project sdc-onap-ui-common variant-pnpm
+            variant-pnpm-workspace variant-yarn-berry variant-yarn-classic
+            variant-bun
         run: |
           # Assert SBOM contents
           set -euo pipefail
@@ -365,7 +490,10 @@ jobs:
             fi
             count="$(jq '.components | length' "${sbom}")"
             if [ "${count}" -eq 0 ]; then
-              fail "${sbom} lists no components"
+              case "${leg}" in
+                variant-*) echo "::notice::${sbom} lists no components" ;;
+                *) fail "${sbom} lists no components" ;;
+              esac
               continue
             fi
             echo "${sbom}: ${count} components"
@@ -3856,11 +3984,11 @@ jobs:
   # all. So the shipped step is extracted and driven directly.
   #
   # The guarantee is narrow, and worth stating precisely: this compares
-  # the build_node_version and test_node_version blocks across the
-  # workflows that define them, not the resolvers as a whole. The
-  # bodies are not identical -- merge.yaml has no tests job and so
-  # resolves no test version -- and drift elsewhere in the resolver
-  # would go unreported.
+  # the build_tool, build_node_version and test_node_version blocks
+  # across the workflows that define them, not the resolvers as a
+  # whole. The bodies are not identical -- merge.yaml has no tests job
+  # and so resolves no test version -- and drift elsewhere in the
+  # resolver would go unreported.
   node-version-resolution:
     name: 'Test: Node.js version resolution'
     runs-on: ubuntu-latest
@@ -3947,6 +4075,25 @@ jobs:
           for path in with_tests:
               if block(bodies[path], 'test_node_version') != test_ref:
                   sys.exit(f'test_node_version block in {path} diverged')
+
+          # The build_tool block is whole in every workflow, from its
+          # assignment to the case statement that validates it
+          def tool_block(body):
+              lines = body.split('\n')
+              start = next(
+                  i for i, line in enumerate(lines)
+                  if line.startswith('build_tool=')
+              )
+              end = next(
+                  i for i, line in enumerate(lines[start:], start)
+                  if line == 'esac'
+              )
+              return lines[start:end + 1]
+
+          tool_ref = tool_block(reference)
+          for path, body in bodies.items():
+              if tool_block(body) != tool_ref:
+                  sys.exit(f'build_tool block in {path} diverged')
 
           sys.stdout.write(reference)
           EXTRACT
@@ -4176,6 +4323,62 @@ jobs:
           check_matrix 'over the cap' reject \
             TEST_NODE_VERSIONS_INPUT='1 2 3 4 5 6 7 8 9 10 11'
 
+          # The build tool. $1 case, $2 the expected tool or 'reject',
+          # $3 the build_tool input, $4 the detected package manager
+          check_tool() {
+            local name="$1" want="$2"
+            : > "${RUNNER_TEMP}/vout.txt"
+            set +e
+            out="$(env NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+              TEST_NODE_VERSION_INPUT='' TEST_NODE_VERSIONS_INPUT='' \
+              BUILD_TOOL_INPUT="$3" DETECTED_PACKAGE_MANAGER="$4" \
+              DETECTED_REQUIRES_NODE='' \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/vout.txt" \
+              bash "${resolver}" 2>&1)"
+            rc=$?
+            set -e
+            if printf '%s' "${out}" | grep -q '^::warning::'; then
+              echo "${name}: input forged a workflow command ❌"
+              errors=1
+            fi
+            if [ "${want}" = 'reject' ]; then
+              if [ "${rc}" = "0" ] ||
+                ! printf '%s' "${out}" | grep -q '^::error::'; then
+                echo "${name}: expected a labelled rejection ❌"
+                errors=1
+              fi
+              return
+            fi
+            if [ "${rc}" != "0" ]; then
+              echo "${name}: resolver failed unexpectedly ❌"
+              printf '%s\n' "${out}" | tail -2
+              errors=1
+              return
+            fi
+            got="$(grep '^build_tool=' "${RUNNER_TEMP}/vout.txt" \
+              | cut -d= -f2-)"
+            if [ "${got}" != "${want}" ]; then
+              echo "${name}: got '${got}', expected '${want}' ❌"
+              errors=1
+            fi
+          }
+          for tool in npm yarn yarn-berry pnpm bun; do
+            check_tool "build_tool ${tool}" "${tool}" "${tool}" ''
+            check_tool "detected ${tool}" "${tool}" '' "${tool}"
+            # An explicit input outranks detection
+            check_tool "build_tool ${tool} over detected bun" "${tool}" \
+              "${tool}" 'bun'
+          done
+          check_tool 'nothing detected' npm '' ''
+          check_tool 'unknown build_tool' reject 'gradle' ''
+          check_tool 'build_tool is case-sensitive' reject 'PNPM' ''
+          check_tool 'unknown build_tool over detection' reject \
+            'deno' 'pnpm'
+          # No silent npm build for a package manager the lanes lack
+          check_tool 'unknown detected package manager' reject '' 'deno'
+          check_tool 'multiline build_tool' reject \
+            "$(printf 'npm\n::warning::forged')" ''
+
           if [ "${errors}" != "0" ]; then
             echo "Node.js version resolution tests failed ❌" \
               >> "$GITHUB_STEP_SUMMARY"
@@ -4346,3 +4549,434 @@ jobs:
           fi
           echo "Node.js version wiring correct ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  # The workflows hand the resolved build tool to node-build-action,
+  # node-audit-action and their own pack steps. None of those reach
+  # the build-test self-test's job outputs, so the wiring is asserted
+  # from the workflow files themselves.
+  package-managers:
+    name: 'Test: package manager support'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # node-build-action v0.3.0 made frozen installs its default.
+      # Until #143 decides otherwise, every call keeps resolving
+      # installs, and every call has to use the same pin.
+      - name: 'Assert node-build-action wiring'
+        shell: bash
+        run: |
+          # Assert node-build-action wiring
+          if ! python3 - <<'PY'
+          import sys
+
+          import yaml
+
+          EXPECTED = {
+              ('build-test.yaml', 'build', 'Build project'),
+              ('build-test.yaml', 'tests', 'Run tests'),
+              ('build-test-release.yaml', 'build', 'Build project'),
+              ('build-test-release.yaml', 'tests', 'Run tests'),
+              ('merge.yaml', 'build', 'Build project'),
+          }
+          found = {}
+          for name in (
+              'build-test.yaml',
+              'build-test-release.yaml',
+              'merge.yaml',
+          ):
+              with open(f'.github/workflows/{name}') as handle:
+                  doc = yaml.safe_load(handle)
+              for job_id, job in doc['jobs'].items():
+                  for step in job.get('steps') or []:
+                      uses = str(step.get('uses', ''))
+                      if uses.startswith(
+                          'lfreleng-actions/node-build-action@'
+                      ):
+                          key = (name, job_id, step.get('name'))
+                          found[key] = step
+
+          errors = []
+          for key in sorted(EXPECTED ^ found.keys()):
+              where = '/'.join(key)
+              if key in EXPECTED:
+                  errors.append(f'{where} no longer calls node-build-action')
+              else:
+                  errors.append(f'{where} calls node-build-action but is '
+                                'absent from the table in this step')
+          pins = {step['uses'] for step in found.values()}
+          if len(pins) != 1:
+              errors.append('node-build-action pins differ: '
+                            + ', '.join(sorted(pins)))
+          for key, step in sorted(found.items()):
+              mode = (step.get('with') or {}).get('install_mode')
+              if mode != 'install':
+                  errors.append(f'{"/".join(key)} passes install_mode '
+                                f'{mode!r}, expected \'install\'')
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('node-build-action wiring incorrect ❌')
+          print(f'node-build-action wiring correct ✅ ({len(found)} sites)')
+          PY
+          then
+            echo "node-build-action wiring incorrect ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "node-build-action wiring correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # The audit reads the lockfile the project installs from, with
+      # the tool that owns it, so it has to follow the resolved tool
+      - name: 'Assert node-audit-action wiring'
+        shell: bash
+        run: |
+          # Assert node-audit-action wiring
+          if ! python3 - <<'PY'
+          import sys
+
+          import yaml
+
+          # Split so Actions leaves the expression unexpanded
+          outputs = 'needs.node-metadata.outputs.'
+          WANT = (
+              '$' '{{ ' + outputs + "has_lock_file != 'true' && 'npm'"
+              ' || ' + outputs + "build_tool == 'yarn-berry' && 'yarn'"
+              ' || ' + outputs + 'build_tool }}'
+          )
+          errors = []
+          for name in ('build-test.yaml', 'build-test-release.yaml'):
+              with open(f'.github/workflows/{name}') as handle:
+                  doc = yaml.safe_load(handle)
+              steps = [
+                  step for step in doc['jobs']['audit']['steps']
+                  if str(step.get('uses', '')).startswith(
+                      'lfreleng-actions/node-audit-action@')
+              ]
+              if len(steps) != 1:
+                  errors.append(f'{name} audit job calls node-audit-action '
+                                f'{len(steps)} times, expected once')
+                  continue
+              got = (steps[0].get('with') or {}).get('package_manager')
+              if got != WANT:
+                  errors.append(f'{name} audit passes package_manager '
+                                f'{got!r}, expected {WANT!r}')
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('node-audit-action wiring incorrect ❌')
+          print('node-audit-action wiring correct ✅')
+          PY
+          then
+            echo "node-audit-action wiring incorrect ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "node-audit-action wiring correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # merge.yaml cannot run in CI, so its snapshot guard is
+      # extracted and driven against crafted manifests
+      - name: 'Exercise the snapshot specifier guard'
+        shell: bash
+        run: |
+          # Exercise the snapshot specifier guard
+          guard="${RUNNER_TEMP}/snapshot-guard.sh"
+          python3 - "${guard}" <<'EXTRACT'
+          import sys
+
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['jobs']['snapshot-publish']['steps']
+          names = [step.get('name') for step in steps]
+          guard = [s for s in steps if s.get('id') == 'snapshot-specifiers']
+          if len(guard) != 1:
+              sys.exit('snapshot-publish has no snapshot-specifiers step')
+          # It has to stand between the download and the publish
+          where = names.index(guard[0]['name'])
+          if not (names.index('Download built project') < where
+                  < names.index('Publish snapshot')):
+              sys.exit('snapshot-specifiers does not run between the '
+                       'download and the publish')
+          with open(sys.argv[1], 'w') as handle:
+              handle.write(guard[0]['run'])
+          EXTRACT
+          if ! grep -q 'workspace|catalog' "${guard}"; then
+            echo "Could not extract the snapshot guard ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          errors=0
+          cases="${RUNNER_TEMP}/manifests"
+          mkdir -p "${cases}"
+          # $1 case, $2 accept|reject, $3 build tool, $4 package.json
+          check() {
+            mkdir -p "${cases}/$1"
+            printf '%s\n' "$4" > "${cases}/$1/package.json"
+            set +e
+            out="$(BUILD_TOOL="$3" PATH_PREFIX="${cases}/$1" \
+              bash -eo pipefail "${guard}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$2" = 'accept' ] && [ "${rc}" != '0' ]; then
+              echo "$1: refused, expected it to pass ❌"
+              printf '%s\n' "${out}" | tail -2
+              errors=1
+            elif [ "$2" = 'reject' ] && { [ "${rc}" = '0' ] ||
+              ! printf '%s' "${out}" | grep -q '^::error::'; }; then
+              echo "$1: passed, expected a labelled refusal ❌"
+              errors=1
+            fi
+          }
+          workspace='{"name": "app", "version": "1.0.0",
+            "dependencies": {"sum": "workspace:*", "x": "^1.0.0"}}'
+          check 'pnpm workspace:' reject pnpm "${workspace}"
+          check 'yarn-berry workspace:' reject yarn-berry "${workspace}"
+          check 'bun workspace:' reject bun "${workspace}"
+          check 'npm workspace:' accept npm "${workspace}"
+          check 'yarn classic workspace:' accept yarn "${workspace}"
+          check 'pnpm catalog:' reject pnpm \
+            '{"devDependencies": {"jest": "catalog:"}}'
+          check 'pnpm named catalog' reject pnpm \
+            '{"peerDependencies": {"react": "catalog:react19"}}'
+          check 'yarn-berry optional workspace:' reject yarn-berry \
+            '{"optionalDependencies": {"sum": "workspace:^"}}'
+          check 'pnpm plain ranges' accept pnpm \
+            '{"dependencies": {"x": "^1.0.0", "y": "npm:z@1"}}'
+          check 'pnpm no dependencies' accept pnpm '{"name": "app"}'
+          # Only the specifier's protocol counts, not a name or a path
+          check 'pnpm workspace in a name' accept pnpm \
+            '{"dependencies": {"workspace:x": "1.0.0",
+              "y": "file:workspace:z"}}'
+          check 'pnpm unreadable package.json' reject pnpm '{not json'
+
+          if [ "${errors}" != '0' ]; then
+            echo "Snapshot specifier guard incorrect ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Snapshot specifier guard correct ✅" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The release lanes pack with the project's own tool, so a pnpm
+  # workspace package publishes resolved versions rather than
+  # workspace:*. Neither release lane can run in CI, so this runs
+  # their shared Corepack and pack steps against the fixture's
+  # variants, after asserting the two workflows carry identical
+  # copies.
+  release-pack:
+    name: 'Test: release pack with the project tool'
+    needs: node-fixture-ref
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Checkout fixture'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: 'lfreleng-actions/test-node-project'
+          ref: ${{ needs.node-fixture-ref.outputs.sha }}
+          path: 'fixture'
+          persist-credentials: false
+
+      - name: 'Extract the pack steps'
+        shell: bash
+        run: |
+          # Extract the pack steps
+          python3 - "${RUNNER_TEMP}" <<'EXTRACT'
+          import sys
+
+          import yaml
+
+          out = sys.argv[1]
+          SHARED = (
+              'Set up Corepack for packing',
+              'Set up Bun for packing',
+              'Pack release tarball',
+          )
+          jobs = {
+              'build-test-release.yaml': 'build',
+              'merge.yaml': 'pack-release',
+          }
+          copies = {}
+          for name, job in jobs.items():
+              with open(f'.github/workflows/{name}') as handle:
+                  steps = yaml.safe_load(handle)['jobs'][job]['steps']
+              names = [step.get('name') for step in steps]
+              missing = [n for n in SHARED if n not in names]
+              if missing:
+                  sys.exit(f'{name} {job} lacks ' + ', '.join(missing))
+              positions = [names.index(n) for n in SHARED]
+              if positions != sorted(positions):
+                  sys.exit(f'{name} {job} sets up its pack tool after '
+                           'packing')
+              copies[name] = [steps[i] for i in positions]
+          if copies['merge.yaml'] != copies['build-test-release.yaml']:
+              sys.exit('The pack steps in merge.yaml and '
+                       'build-test-release.yaml diverged')
+          corepack, _, pack = copies['merge.yaml']
+          with open(f'{out}/corepack.sh', 'w') as handle:
+              handle.write(corepack['run'])
+          with open(f'{out}/corepack-version', 'w') as handle:
+              handle.write(corepack['env']['COREPACK_VERSION'])
+          with open(f'{out}/pack.sh', 'w') as handle:
+              handle.write(pack['run'])
+          EXTRACT
+          if ! grep -q 'pack-dist' "${RUNNER_TEMP}/pack.sh"; then
+            echo "Could not extract the pack step ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          echo "The release lanes share one set of pack steps ✅"
+
+      - name: 'Exercise the pack steps'
+        shell: bash
+        run: |
+          # Exercise the pack steps
+          errors=0
+          fail() {
+            echo "$1 ❌"
+            errors=1
+          }
+          corepack_version="$(cat "${RUNNER_TEMP}/corepack-version")"
+          # $1 tool, $2 path; runs the Corepack step, leaving its bin
+          # directory in ${bin}
+          setup() {
+            : > "${RUNNER_TEMP}/corepack-out.txt"
+            BUILD_TOOL="$1" PATH_PREFIX="$2" \
+              COREPACK_VERSION="${corepack_version}" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/corepack-out.txt" \
+              bash -eo pipefail "${RUNNER_TEMP}/corepack.sh"
+            bin="$(grep '^bin=' "${RUNNER_TEMP}/corepack-out.txt" \
+              | cut -d= -f2-)"
+          }
+          # $1 tool, $2 path; runs the pack step, leaving its outputs
+          # in ${RUNNER_TEMP}/pack-out.txt
+          pack() {
+            : > "${RUNNER_TEMP}/pack-out.txt"
+            BUILD_TOOL="$1" PATH_PREFIX="$2" COREPACK_BIN="${bin:-}" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/pack-out.txt" \
+              bash -eo pipefail "${RUNNER_TEMP}/pack.sh"
+          }
+          output() {
+            grep "^$1=" "${RUNNER_TEMP}/pack-out.txt" | cut -d= -f2-
+          }
+
+          # A pnpm workspace member whose dependency on its sibling is
+          # workspace:*, installed at the workspace root first
+          root='fixture/variants/pnpm-workspace'
+          app="${root}/packages/app"
+          setup pnpm "${app}"
+          (cd "${root}" && "${bin}/pnpm" install --ignore-scripts)
+          pack pnpm "${app}"
+          tarball="$(output tarball_name)"
+          sha256="$(output tarball_sha256)"
+          archive="${app}/pack-dist/${tarball}"
+          if [ ! -f "${archive}" ]; then
+            fail "pnpm: no ${archive}"
+          elif [ "$(sha256sum "${archive}" | cut -d' ' -f1)" != \
+            "${sha256}" ]; then
+            fail "pnpm: tarball_sha256 does not match ${tarball}"
+          else
+            manifest="$(tar -xzOf "${archive}" package/package.json)"
+            want="$(jq -r '.version' "${root}/packages/sum/package.json")"
+            got="$(jq -r '.dependencies["@test-node-project/sum"]' \
+              <<< "${manifest}")"
+            if jq -e '[(.dependencies, .devDependencies,
+                .optionalDependencies, .peerDependencies) | objects
+                | .[] | strings | select(test("^(workspace|catalog):"))]
+                | length > 0' <<< "${manifest}" > /dev/null; then
+              fail "pnpm: packed manifest keeps a workspace specifier"
+            elif [ "${got}" != "${want}" ]; then
+              fail "pnpm: packed @test-node-project/sum is '${got}'," \
+                "expected '${want}'"
+            else
+              echo "pnpm packed ${tarball} with sum ${got} ✅"
+            fi
+          fi
+
+          # Yarn Berry names its archives package.tgz; the step takes
+          # npm's name so every tool's tarball looks alike
+          berry='fixture/variants/yarn-berry'
+          setup yarn-berry "${berry}"
+          pack yarn-berry "${berry}"
+          want="$(jq -r '"\(.name)-\(.version).tgz"' \
+            "${berry}/package.json")"
+          if [ "$(output tarball_name)" != "${want}" ] ||
+            [ ! -f "${berry}/pack-dist/${want}" ]; then
+            fail "yarn-berry: packed '$(output tarball_name)'," \
+              "expected '${want}'"
+          else
+            echo "yarn-berry packed ${want} ✅"
+          fi
+
+          # Refusals: Berry unpinned would run Yarn classic, and a tool
+          # with no pack command must not fall back to npm
+          set +e
+          out="$(BUILD_TOOL=yarn-berry \
+            PATH_PREFIX='fixture/variants/yarn-classic' \
+            COREPACK_VERSION="${corepack_version}" \
+            GITHUB_OUTPUT="${RUNNER_TEMP}/refused.txt" \
+            bash -eo pipefail "${RUNNER_TEMP}/corepack.sh" 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" = '0' ] ||
+            ! printf '%s' "${out}" | grep -q '^::error::'; then
+            fail "Corepack step accepted yarn-berry without packageManager"
+          fi
+          set +e
+          out="$(bin='' pack deno 'fixture/variants/bun' 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" = '0' ] ||
+            ! printf '%s' "${out}" | grep -q '^::error::'; then
+            fail "Pack step accepted an unknown build tool"
+          fi
+
+          if [ "${errors}" != '0' ]; then
+            echo "Release pack incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Release pack correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -72,9 +72,10 @@ on:
         default: ''
       build_tool:
         description: >-
-          Build tool: 'npm' or 'yarn'. Empty (the default) auto-detects
-          the package manager from the project lockfile/metadata and
-          otherwise falls back to npm.
+          Package manager: 'npm', 'yarn' (Yarn classic), 'yarn-berry'
+          (Yarn 2 and later), 'pnpm' or 'bun'. Empty (the default)
+          uses the one detected from package.json and the lockfiles,
+          or npm when the project names none; any other value fails.
         required: false
         type: string
         default: ''
@@ -694,7 +695,7 @@ jobs:
       - name: 'Gather Node.js build metadata'
         id: build-metadata
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/build-metadata-action@cc5d2da580c58c96455ebc0cb1004352bece2baa  # v0.10.0
+        uses: lfreleng-actions/build-metadata-action@f5788fd76522ba71a079caaa77b7e50d7a7c5d0f  # v0.11.1
         with:
           path_prefix: ${{ inputs.path_prefix }}
           artifact_upload: 'false'
@@ -738,28 +739,22 @@ jobs:
           if [ -z "${node_version}" ]; then
             node_version='22'
           fi
-          build_tool="${BUILD_TOOL_INPUT}"
+          # Detection reports npm, yarn (classic), yarn-berry, pnpm or
+          # bun, and nothing when the project names no package manager
+          build_tool="${BUILD_TOOL_INPUT:-${DETECTED_PACKAGE_MANAGER:-npm}}"
           case "${build_tool}" in
-            npm|yarn) ;;
-            '')
-              case "${DETECTED_PACKAGE_MANAGER}" in
-                npm|yarn)
-                  build_tool="${DETECTED_PACKAGE_MANAGER}"
-                  ;;
-                '')
-                  build_tool='npm'
-                  ;;
-                *)
-                  echo "::notice::Detected package manager" \
-                    "'${DETECTED_PACKAGE_MANAGER}' lacks" \
-                    "node-build-action support; using npm"
-                  build_tool='npm'
-                  ;;
-              esac
-              ;;
+            npm|yarn|yarn-berry|pnpm|bun) ;;
             *)
-              echo "::error::Invalid build_tool input: ${build_tool}" \
-                "(must be 'npm' or 'yarn')"
+              # Building an unrecognised project with npm would ignore
+              # its own lockfile, so refuse rather than fall back
+              if [ -n "${BUILD_TOOL_INPUT}" ]; then
+                origin='build_tool input'
+              else
+                origin='detected package manager'
+              fi
+              echo "::error::Unsupported ${origin}:" \
+                "'$(printf '%s' "${build_tool}" | tr -d '\r\n')'" \
+                "(must be npm, yarn, yarn-berry, pnpm or bun)"
               exit 1
               ;;
           esac
@@ -847,7 +842,7 @@ jobs:
       - name: 'Gather version metadata'
         id: build-metadata
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/build-metadata-action@cc5d2da580c58c96455ebc0cb1004352bece2baa  # v0.10.0
+        uses: lfreleng-actions/build-metadata-action@f5788fd76522ba71a079caaa77b7e50d7a7c5d0f  # v0.11.1
         with:
           path_prefix: ${{ inputs.path_prefix }}
           artifact_upload: 'false'
@@ -1001,12 +996,15 @@ jobs:
 
       - name: 'Build project'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@592a923aaf25853712b43b82e7e7cf7980728dcb  # v0.2.5
+        uses: lfreleng-actions/node-build-action@fad23d431fa5f26395b577c120a7ffff62d3e8a2  # v0.4.0
         with:
           node_version: ${{ needs.node-metadata.outputs.build_node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
           path_prefix: ${{ inputs.path_prefix }}
           scripts: ${{ inputs.build_scripts }}
+          # Resolving installs, as before v0.3.0 made frozen installs
+          # the default; whether to freeze them is #143's decision
+          install_mode: 'install'
 
       # The publish jobs consume this artefact instead of rebuilding
       # or re-checking-out: the project builds once, and the exact
@@ -1287,6 +1285,44 @@ jobs:
         with:
           name: node-build-content
           path: ${{ inputs.path_prefix }}
+
+      # node-publish-action packs the snapshot with npm, which leaves
+      # workspace: and catalog: specifiers as they are, so the
+      # published manifest would name versions nobody can install.
+      # The release lane packs with the project's own tool; until the
+      # snapshot lane does too, refuse such a manifest. Without those
+      # specifiers npm packs the same manifest the tool would.
+      - name: 'Refuse unpackable workspace specifiers'
+        id: snapshot-specifiers
+        shell: bash
+        env:
+          BUILD_TOOL: ${{ needs.node-metadata.outputs.build_tool }}
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+        run: |
+          # Refuse unpackable workspace specifiers
+          case "${BUILD_TOOL}" in
+            pnpm|yarn-berry|bun) ;;
+            *) exit 0 ;;
+          esac
+          if ! specifiers="$(jq -r '
+              [(.dependencies, .devDependencies, .optionalDependencies,
+                .peerDependencies) | objects | to_entries[]
+                | select(.value | strings | test("^(workspace|catalog):"))
+                | "\(.key)@\(.value)" | gsub("[\r\n]"; "")]
+              | unique | join(", ")' "${PATH_PREFIX}/package.json")"
+          then
+            echo "::error::Cannot read ${PATH_PREFIX}/package.json"
+            exit 1
+          fi
+          if [ -n "${specifiers}" ]; then
+            echo "::error::The snapshot lane publishes with npm, which" \
+              "does not rewrite workspace: or catalog: specifiers;" \
+              "package.json uses ${specifiers}. Snapshots of this" \
+              "${BUILD_TOOL} project are not supported yet."
+            exit 1
+          fi
+          echo "No workspace: or catalog: specifiers; npm packs the" \
+            "manifest ${BUILD_TOOL} would"
 
       # A live run without credentials fails: this workflow runs on
       # merges, where a missing secret is a misconfiguration, and
@@ -2244,8 +2280,7 @@ jobs:
           # it as packageManager; a release lane must not (CWE-349)
           package-manager-cache: false
 
-      - name: 'Pack release tarball'
-        id: pack
+      - name: 'Stamp release version'
         shell: bash
         env:
           PATH_PREFIX: ${{ inputs.path_prefix }}
@@ -2259,8 +2294,8 @@ jobs:
             exit 1
           fi
           # resolve-version already validates the version, but this job
-          # writes it into a command line and an output, so re-check it
-          # rather than trust a value crossing a job boundary
+          # writes it into a command line, so re-check it rather than
+          # trust a value crossing a job boundary
           case "${RELEASE_VERSION}" in
             '' | *[!0-9A-Za-z._-]*)
               echo "::error::Invalid release version: ${RELEASE_VERSION}"
@@ -2283,22 +2318,166 @@ jobs:
           #
           # --no-workspaces: with workspaces enabled in configuration,
           # 'npm version' stamps the workspace children and leaves the
-          # target at its committed version, and 'npm pack' packs the
-          # children instead of the target -- so the release would
-          # carry tarballs nobody asked for.
+          # target at its committed version.
           #
-          # The same pair appears in build-test-release.yaml; see #58.
+          # The same stamp appears in build-test-release.yaml; see #58.
           npm version --no-git-tag-version --allow-same-version \
             --ignore-scripts --no-workspaces "${RELEASE_VERSION}"
+
+      # npm does not rewrite workspace: or catalog: specifiers, so a
+      # pnpm, Yarn Berry or Bun project packs with its own tool, or
+      # the published manifest names versions nobody can install.
+      # This job installs nothing and holds only the path_prefix
+      # tree, so a member package whose workspace root lies outside
+      # it cannot resolve those specifiers, and the pack fails.
+      # These steps are identical copies of the build job's in
+      # build-test-release.yaml, which testing.yaml asserts.
+      - name: 'Set up Corepack for packing'
+        id: corepack
+        # yamllint disable-line rule:line-length
+        if: needs.node-metadata.outputs.build_tool == 'pnpm' || needs.node-metadata.outputs.build_tool == 'yarn-berry'
+        shell: bash
+        env:
+          BUILD_TOOL: ${{ needs.node-metadata.outputs.build_tool }}
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          COREPACK_VERSION: '0.36.0'
+        # An exact version: the registry never lets a published version
+        # change, so no lockfile is needed to fix what installs
+        run: |  # zizmor: ignore[adhoc-packages]
+          # Set up Corepack for packing
+          if [[ ! "${PATH_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || [[ "${PATH_PREFIX}" =~ (^|/)\.\.(/|$) ]]; then
+            echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
+            exit 1
+          fi
+          # The packageManager rules node-build-action applies
+          package_manager="$(jq -r '.packageManager // "" | strings' \
+            "${PATH_PREFIX}/package.json" | tr -d '\r\n')"
+          case "${BUILD_TOOL}" in
+            yarn-berry)
+              # Unpinned, Corepack would run Yarn classic
+              if [[ ! "${package_manager}" =~ ^yarn@([2-9]|[1-9][0-9]+)\. ]]
+              then
+                echo "::error::build_tool 'yarn-berry' needs" \
+                  "packageManager in package.json to pin Yarn 2 or" \
+                  "later; found '${package_manager:-nothing}'"
+                exit 1
+              fi
+              tool='yarn'
+              ;;
+            pnpm)
+              if [ -n "${package_manager}" ] &&
+                [[ "${package_manager}" != pnpm@* ]]; then
+                echo "::error::build_tool 'pnpm' conflicts with" \
+                  "packageManager '${package_manager}' in package.json"
+                exit 1
+              fi
+              tool='pnpm'
+              ;;
+            *)
+              echo "::error::Corepack does not pack with ${BUILD_TOOL}"
+              exit 1
+              ;;
+          esac
+          corepack_dir="${RUNNER_TEMP}/corepack"
+          npm install --global --prefix "${corepack_dir}" \
+            --ignore-scripts --no-audit --no-fund \
+            "corepack@${COREPACK_VERSION}"
+          # Fetch the release now, so a download failure surfaces here
+          version="$(cd "${PATH_PREFIX}" &&
+            "${corepack_dir}/bin/${tool}" --version)"
+          echo "Packing with ${tool} ${version}" \
+            "(Corepack ${COREPACK_VERSION})"
+          echo "bin=${corepack_dir}/bin" >> "$GITHUB_OUTPUT"
+
+      - name: 'Set up Bun for packing'
+        if: needs.node-metadata.outputs.build_tool == 'bun'
+        # yamllint disable-line rule:line-length
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
+        with:
+          # node-build-action's default release
+          bun-version: '1.4.3'
+          # A cache written by a less-trusted run could poison a
+          # release (CWE-349)
+          no-cache: true
+          # An exact version needs no GitHub API lookup, so no token
+          token: ''
+
+      # The archive is the release artefact: attest and sign-artefacts
+      # cover it, and the publish job hands it to npm rather than
+      # packing a second one; see #85. package.json already carries
+      # the stamped release version.
+      - name: 'Pack release tarball'
+        id: pack
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          BUILD_TOOL: ${{ needs.node-metadata.outputs.build_tool }}
+          COREPACK_BIN: ${{ steps.corepack.outputs.bin }}
+        run: |
+          # Constrain path_prefix to a relative, non-traversing,
+          # single-line path before it drives packaging paths
+          if [[ ! "${PATH_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || [[ "${PATH_PREFIX}" =~ (^|/)\.\.(/|$) ]]; then
+            echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
+            exit 1
+          fi
+          cd "${PATH_PREFIX}"
           mkdir -p pack-dist
-          tarball=$(npm pack --no-workspaces \
-            --pack-destination pack-dist | tail -n1)
-          if [ ! -f "pack-dist/${tarball}" ]; then
-            echo "::error::npm pack produced no tarball"
+          dest="${PWD}/pack-dist"
+          case "${BUILD_TOOL}" in
+            npm|yarn)
+              # Yarn classic leaves workspace protocols alone too, so
+              # npm packs both. --no-workspaces: with workspaces
+              # enabled in configuration, npm pack packs the
+              # workspace children rather than the target.
+              npm pack --no-workspaces --pack-destination "${dest}"
+              ;;
+            pnpm)
+              "${COREPACK_BIN}/pnpm" pack --pack-destination "${dest}"
+              ;;
+            yarn-berry)
+              # Berry names every archive package.tgz; take npm's
+              # <name>-<version>.tgz like the other tools
+              name="$(jq -r '.name // "" | strings' package.json)"
+              version="$(jq -r '.version // "" | strings' package.json)"
+              file="${name#@}"
+              file="${file//\//-}-${version}.tgz"
+              if [[ ! "${file}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\.tgz$ ]]
+              then
+                echo "::error::Cannot name a tarball for package" \
+                  "'$(printf '%s' "${name}@${version}" | tr -d '\r\n')'"
+                exit 1
+              fi
+              "${COREPACK_BIN}/yarn" pack --out "${dest}/${file}"
+              ;;
+            bun)
+              bun pm pack --destination "${dest}"
+              ;;
+            *)
+              echo "::error::No pack command for build tool" \
+                "'$(printf '%s' "${BUILD_TOOL}" | tr -d '\r\n')'"
+              exit 1
+              ;;
+          esac
+          # Attestation, signing and publishing each take one archive
+          shopt -s nullglob
+          tarballs=(pack-dist/*.tgz)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "::error::Expected one tarball in pack-dist after" \
+              "packing with ${BUILD_TOOL}; found ${#tarballs[@]}"
+            exit 1
+          fi
+          tarball="${tarballs[0]##*/}"
+          # The name reaches $GITHUB_OUTPUT and later paths
+          if [[ ! "${tarball}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\.tgz$ ]]; then
+            echo "::error::Unexpected tarball name:" \
+              "$(printf '%s' "${tarball}" | tr -d '\r\n')"
             exit 1
           fi
           sha256=$(sha256sum "pack-dist/${tarball}" | cut -d' ' -f1)
-          echo "Packed release tarball: ${tarball} (sha256:${sha256})"
+          echo "Packed release tarball with ${BUILD_TOOL}:" \
+            "${tarball} (sha256:${sha256})"
           echo "tarball_name=${tarball}" >> "$GITHUB_OUTPUT"
           echo "tarball_sha256=${sha256}" >> "$GITHUB_OUTPUT"
 

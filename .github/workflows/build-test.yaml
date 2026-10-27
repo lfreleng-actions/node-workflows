@@ -79,9 +79,10 @@ on:
         default: ''
       build_tool:
         description: >-
-          Build tool: 'npm' or 'yarn'. Empty (the default) auto-detects
-          the package manager from the project lockfile/metadata and
-          otherwise falls back to npm.
+          Package manager: 'npm', 'yarn' (Yarn classic), 'yarn-berry'
+          (Yarn 2 and later), 'pnpm' or 'bun'. Empty (the default)
+          uses the one detected from package.json and the lockfiles,
+          or npm when the project names none; any other value fails.
         required: false
         type: string
         default: ''
@@ -560,7 +561,7 @@ jobs:
       - name: 'Gather Node.js build metadata'
         id: build-metadata
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/build-metadata-action@cc5d2da580c58c96455ebc0cb1004352bece2baa  # v0.10.0
+        uses: lfreleng-actions/build-metadata-action@f5788fd76522ba71a079caaa77b7e50d7a7c5d0f  # v0.11.1
         with:
           path_prefix: ${{ inputs.path_prefix }}
           artifact_upload: 'false'
@@ -606,28 +607,22 @@ jobs:
           if [ -z "${node_version}" ]; then
             node_version='22'
           fi
-          build_tool="${BUILD_TOOL_INPUT}"
+          # Detection reports npm, yarn (classic), yarn-berry, pnpm or
+          # bun, and nothing when the project names no package manager
+          build_tool="${BUILD_TOOL_INPUT:-${DETECTED_PACKAGE_MANAGER:-npm}}"
           case "${build_tool}" in
-            npm|yarn) ;;
-            '')
-              case "${DETECTED_PACKAGE_MANAGER}" in
-                npm|yarn)
-                  build_tool="${DETECTED_PACKAGE_MANAGER}"
-                  ;;
-                '')
-                  build_tool='npm'
-                  ;;
-                *)
-                  echo "::notice::Detected package manager" \
-                    "'${DETECTED_PACKAGE_MANAGER}' lacks" \
-                    "node-build-action support; using npm"
-                  build_tool='npm'
-                  ;;
-              esac
-              ;;
+            npm|yarn|yarn-berry|pnpm|bun) ;;
             *)
-              echo "::error::Invalid build_tool input: ${build_tool}" \
-                "(must be 'npm' or 'yarn')"
+              # Building an unrecognised project with npm would ignore
+              # its own lockfile, so refuse rather than fall back
+              if [ -n "${BUILD_TOOL_INPUT}" ]; then
+                origin='build_tool input'
+              else
+                origin='detected package manager'
+              fi
+              echo "::error::Unsupported ${origin}:" \
+                "'$(printf '%s' "${build_tool}" | tr -d '\r\n')'" \
+                "(must be npm, yarn, yarn-berry, pnpm or bun)"
               exit 1
               ;;
           esac
@@ -817,12 +812,15 @@ jobs:
       # installs dependencies with the resolved build tool first
       - name: 'Build project'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@592a923aaf25853712b43b82e7e7cf7980728dcb  # v0.2.5
+        uses: lfreleng-actions/node-build-action@fad23d431fa5f26395b577c120a7ffff62d3e8a2  # v0.4.0
         with:
           node_version: ${{ needs.node-metadata.outputs.build_node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
           path_prefix: ${{ inputs.path_prefix }}
           scripts: ${{ inputs.build_scripts }}
+          # Resolving installs, as before v0.3.0 made frozen installs
+          # the default; whether to freeze them is #143's decision
+          install_mode: 'install'
 
       - name: 'Upload build artefact'
         # yamllint disable-line rule:line-length
@@ -893,7 +891,7 @@ jobs:
       - name: 'Run tests'
         id: run-tests
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@592a923aaf25853712b43b82e7e7cf7980728dcb  # v0.2.5
+        uses: lfreleng-actions/node-build-action@fad23d431fa5f26395b577c120a7ffff62d3e8a2  # v0.4.0
         # The NO_BLOCK/soft-fail pattern: setting the
         # test_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
         # repository variable (an org/repo-wide override that
@@ -909,6 +907,9 @@ jobs:
           scripts: ${{ inputs.test_script }}
           # Missing scripts warn and skip (npm --if-present parity)
           exit_on_fail: 'false'
+          # Resolving installs, as before v0.3.0 made frozen installs
+          # the default; whether to freeze them is #143's decision
+          install_mode: 'install'
 
       - name: 'Report permitted test failure'
         # Explicitly gated on the permit condition: without it a real
@@ -1121,10 +1122,13 @@ jobs:
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           audit_level: ${{ inputs.audit_level }}
           production_only: ${{ inputs.production_only }}
-          # Pinned to npm: the action's 'auto' default runs native
-          # Yarn, pnpm and Bun audits through Corepack, whose egress
-          # hosts the organisation allow-list does not yet carry
-          package_manager: 'npm'
+          # The project's own package manager, so the audit reads the
+          # lockfile it installs from. The action detects Yarn Berry
+          # from the lockfile itself and takes 'yarn' for both. A
+          # project without a lockfile keeps npm, whose audit
+          # synthesizes one; the other tools' audits need theirs.
+          # yamllint disable-line rule:line-length
+          package_manager: ${{ needs.node-metadata.outputs.has_lock_file != 'true' && 'npm' || needs.node-metadata.outputs.build_tool == 'yarn-berry' && 'yarn' || needs.node-metadata.outputs.build_tool }}
           # The NO_BLOCK/soft-fail pattern: setting the
           # audit_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
           # repository variable (an org/repo-wide override that
