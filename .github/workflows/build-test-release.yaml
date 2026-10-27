@@ -85,9 +85,10 @@ on:
         default: ''
       build_tool:
         description: >-
-          Build tool: 'npm' or 'yarn'. Empty (the default) auto-detects
-          the package manager from the project lockfile/metadata and
-          otherwise falls back to npm.
+          Package manager: 'npm', 'yarn' (Yarn classic), 'yarn-berry'
+          (Yarn 2 and later), 'pnpm' or 'bun'. Empty (the default)
+          uses the one detected from package.json and the lockfiles,
+          or npm when the project names none; any other value fails.
         required: false
         type: string
         default: ''
@@ -687,28 +688,22 @@ jobs:
           if [ -z "${node_version}" ]; then
             node_version='22'
           fi
-          build_tool="${BUILD_TOOL_INPUT}"
+          # Detection reports npm, yarn (classic), yarn-berry, pnpm or
+          # bun, and nothing when the project names no package manager
+          build_tool="${BUILD_TOOL_INPUT:-${DETECTED_PACKAGE_MANAGER:-npm}}"
           case "${build_tool}" in
-            npm|yarn) ;;
-            '')
-              case "${DETECTED_PACKAGE_MANAGER}" in
-                npm|yarn)
-                  build_tool="${DETECTED_PACKAGE_MANAGER}"
-                  ;;
-                '')
-                  build_tool='npm'
-                  ;;
-                *)
-                  echo "::notice::Detected package manager" \
-                    "'${DETECTED_PACKAGE_MANAGER}' lacks" \
-                    "node-build-action support; using npm"
-                  build_tool='npm'
-                  ;;
-              esac
-              ;;
+            npm|yarn|yarn-berry|pnpm|bun) ;;
             *)
-              echo "::error::Invalid build_tool input: ${build_tool}" \
-                "(must be 'npm' or 'yarn')"
+              # Building an unrecognised project with npm would ignore
+              # its own lockfile, so refuse rather than fall back
+              if [ -n "${BUILD_TOOL_INPUT}" ]; then
+                origin='build_tool input'
+              else
+                origin='detected package manager'
+              fi
+              echo "::error::Unsupported ${origin}:" \
+                "'$(printf '%s' "${build_tool}" | tr -d '\r\n')'" \
+                "(must be npm, yarn, yarn-berry, pnpm or bun)"
               exit 1
               ;;
           esac
@@ -1176,10 +1171,13 @@ jobs:
           node_version: ${{ needs.node-metadata.outputs.node_version }}
           audit_level: ${{ inputs.audit_level }}
           production_only: ${{ inputs.production_only }}
-          # Pinned to npm: the action's 'auto' default runs native
-          # Yarn, pnpm and Bun audits through Corepack, whose egress
-          # hosts the organisation allow-list does not yet carry
-          package_manager: 'npm'
+          # The project's own package manager, so the audit reads the
+          # lockfile it installs from. The action detects Yarn Berry
+          # from the lockfile itself and takes 'yarn' for both. A
+          # project without a lockfile keeps npm, whose audit
+          # synthesizes one; the other tools' audits need theirs.
+          # yamllint disable-line rule:line-length
+          package_manager: ${{ needs.node-metadata.outputs.has_lock_file != 'true' && 'npm' || needs.node-metadata.outputs.build_tool == 'yarn-berry' && 'yarn' || needs.node-metadata.outputs.build_tool }}
           # The NO_BLOCK/soft-fail pattern: setting the
           # audit_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
           # repository variable (an org/repo-wide override that
