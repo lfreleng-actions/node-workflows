@@ -343,7 +343,7 @@ it with `dry_run: true` to rehearse first.
 | `build_node_version`      | string  | `''`       | Node.js for jobs running the project's toolchain; empty follows `node_version` |
 | `test_node_version`       | string  | `''`       | Node.js for the tests job; empty follows `node_version`                        |
 | `test_node_versions`      | string  | `''`       | Node.js versions to test on, one leg each; JSON array or list, at most 10      |
-| `build_tool`              | string  | `''`       | `npm` or `yarn`; empty auto-detects from project metadata                      |
+| `build_tool`              | string  | `''`       | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects               |
 | `build_scripts`           | string  | `'build'`  | package.json script(s) the build job runs                                      |
 | `tests_enabled`           | boolean | `true`     | Run the tests job (set false to skip tests)                                    |
 | `test_script`             | string  | `'test'`   | package.json test script(s); comma/space/newline separated list                |
@@ -476,7 +476,7 @@ All `build-test.yaml` inputs above except `grype_gate_when` (with
 | `path_prefix`              | string  | `'.'`        | Path to the project root directory                                                                                               |
 | `node_version`             | string  | `''`         | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
 | `build_node_version`       | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
-| `build_tool`               | string  | `''`         | `npm` or `yarn`; empty auto-detects from project metadata                                                                        |
+| `build_tool`               | string  | `''`         | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                                                                 |
 | `build_scripts`            | string  | `'build'`    | package.json script(s) the build job runs                                                                                        |
 | `attestations`             | boolean | `true`       | SLSA build provenance for the packed release tarball (release publishes)                                                         |
 | `sigstore_sign`            | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
@@ -548,6 +548,53 @@ targets.
 
 <!-- markdownlint-enable MD013 -->
 
+## Package Managers
+
+The workflows build, test, audit and pack projects using npm, Yarn
+classic (`yarn`), Yarn 2 and later (`yarn-berry`), pnpm or Bun. Set
+`build_tool` to name one. Left empty, `build-metadata-action` detects
+it: the `packageManager` field in `package.json` decides, then
+`devEngines.packageManager`, then the lockfiles present; npm when
+nothing names one. A `build_tool` outside those five, or a detected
+tool the workflows do not support, fails `node-metadata` rather than
+falling back to npm.
+
+`node-build-action` installs the dependencies and runs the build and
+test scripts with that tool. Yarn Berry and pnpm run through
+Corepack, which fetches the release `packageManager` pins; Yarn Berry
+needs that pin, since an unpinned Corepack runs Yarn classic. The
+build and tests jobs run a resolving install (`install_mode:
+install`), as the npm and Yarn classic lanes always have, so a stale
+lockfile does not fail the build. A build script named in
+`build_scripts` that `package.json` lacks fails the build.
+
+The dependency audit runs the tool's own audit through
+`node-audit-action`: `npm audit`, `yarn audit`, `yarn npm audit`,
+`pnpm audit` or `bun audit`. Those read the tool's lockfile, so a
+project without a lockfile keeps the npm audit, which synthesises one.
+
+Both release lanes pack the release tarball with the same tool, so
+`workspace:` and `catalog:` dependency specifiers become the versions
+they name: `pnpm pack`, `yarn pack` (Yarn Berry, named
+`<name>-<version>.tgz` like npm's archives) or `bun pm pack`. npm and
+Yarn classic projects pack with `npm pack`, as before. Two limits
+apply:
+
+- `merge.yaml` packs in `pack-release` from the `node-build-content`
+  artefact, which holds the `path_prefix` tree alone. A workspace
+  member whose workspace root lies above `path_prefix` cannot resolve
+  `workspace:` there, and the pack fails. `build-test-release.yaml`
+  packs in the full checkout, so it can release such a package.
+- The snapshot lane publishes through `node-publish-action`, which
+  packs with npm and leaves those specifiers in place. For a pnpm,
+  Yarn Berry or Bun project whose `package.json` uses `workspace:` or
+  `catalog:`, `snapshot-publish` fails before it publishes rather
+  than publishing a package nobody can install.
+
+The SBOM comes from syft, which reads each tool's lockfile. It does
+not apply `include_dev: false` to pnpm v9 lockfiles, so a pnpm SBOM
+can list development dependencies too.
+
 ## Node.js Version Selection
 
 `node_version` sets the Node.js used across the pipeline. Empty (the
@@ -574,8 +621,8 @@ fresh checkout and reads the dependency tree. Neither needs a project
 toolchain of its own.
 
 > [!IMPORTANT]
-> That is not the same as running no project code. `npm pack` executes
-> `prepack` and `prepare` (see
+> That is not the same as running no project code. Packing runs the
+> project's packing hooks, such as npm's `prepack` and `prepare` (see
 > [the note on attestation scope](#release-models)). Those hooks run
 > under `node_version`, **not** `build_node_version`, so a project
 > splitting the two must keep its packing hooks compatible with the
@@ -592,7 +639,7 @@ Node 10, and falls back to a source compile that fails on newer
 runners. Meanwhile `pack-release` uses `npm pack --pack-destination`,
 which arrived in npm 7 (Node 15+); under npm 6 npm ignores the flag,
 the tarball lands in the working directory and the job fails with
-`npm pack produced no tarball`.
+`Expected one tarball in pack-dist`.
 
 Splitting the two lets such a project adopt these workflows:
 
@@ -1002,27 +1049,38 @@ A `test-ci` script for each common runner, writing `junit.xml` and a
 
 `.github/workflows/testing.yaml` exercises `build-test.yaml` on pull
 requests against pinned Node.js fixture repositories (a modern npm
-project and a legacy ONAP project). The `build-test-assert` job then
-checks what those runs produced, beyond their passing verdicts. Each
-leg passes its name as `artifact_suffix`, so the check knows whose
-artefact is whose:
+project and a legacy ONAP project), and against the npm fixture's
+pnpm, pnpm workspace, Yarn Berry, Yarn classic and Bun variants. The
+`build-test-assert` job then checks what those runs produced, beyond
+their passing verdicts. Each leg passes its name as
+`artifact_suffix`, so the check knows whose artefact is whose:
 
 - every leg uploads one SBOM, CycloneDX JSON listing at least one
-  component; the `test-node-project` SBOM lists that package,
-  `express` and its transitive dependency `body-parser`, all
-  versioned, and no other leg's SBOM lists `test-node-project`;
+  component (a variant leg's may list none, with a notice, since syft
+  may not read every tool's lockfile); the `test-node-project` SBOM
+  lists that package, `express` and its transitive dependency
+  `body-parser`, all versioned, and no other leg's SBOM lists
+  `test-node-project`;
 - the leg that sets `test_artifact_path` fans its tests out over
   `test_node_versions`, and uploads one
   `node-test-results-node-<version>-test-node-project` artefact per
   version and no other `node-test-results` artefact;
 - the audit and Grype jobs of every leg ran; a skipped job fails
   the check;
+- every variant leg's build and tests jobs succeeded, and each
+  variant but the pnpm workspace uploaded the `dist/` its build
+  wrote as `node-build-output-<leg>`;
 - each leg's Grype job downloaded, by the artefact ID its download
   step names, the SBOM its own leg uploaded, so legs that cross over
   fail the check.
 
-Neither fixture emits `dist/`, so the check makes no claim about the
-`node-build-output` artefact. The release and merge workflows
+Neither npm fixture emits `dist/`, so the check makes no claim about
+their `node-build-output` artefact. The release and merge workflows
 need tag-push and merged-commit contexts (plus publish credentials),
 so instantiating repositories exercise those through their own
-release and merge cycles.
+release and merge cycles. `testing.yaml` still checks their package
+manager handling from the workflow files: the `package-managers` job
+asserts the `node-build-action` and `node-audit-action` wiring and
+drives the snapshot specifier guard, and the `release-pack` job runs
+the shared pack steps against the fixture's pnpm workspace member and
+Yarn Berry variant.
