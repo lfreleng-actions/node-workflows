@@ -345,6 +345,7 @@ it with `dry_run: true` to rehearse first.
 | `test_node_versions`      | string  | `''`       | Node.js versions to test on, one leg each; JSON array or list, at most 10      |
 | `build_tool`              | string  | `''`       | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects               |
 | `build_scripts`           | string  | `'build'`  | package.json script(s) the build job runs                                      |
+| `lockfile_required`       | boolean | `false`    | Require the build tool's lockfile; see [Lockfiles](#lockfiles)                 |
 | `tests_enabled`           | boolean | `true`     | Run the tests job (set false to skip tests)                                    |
 | `test_script`             | string  | `'test'`   | package.json test script(s); comma/space/newline separated list                |
 | `test_permit_fail`        | boolean | `false`    | Permit test failures without failing the workflow                              |
@@ -431,7 +432,7 @@ gates.
 
 All `build-test.yaml` inputs above except `grype_gate_when` (with
 `build_timeout_minutes` and `test_timeout_minutes` both defaulting to
-`12`), plus:
+`12`, and `lockfile_required` defaulting to `true`), plus:
 
 <!-- markdownlint-disable MD013 -->
 
@@ -478,6 +479,7 @@ All `build-test.yaml` inputs above except `grype_gate_when` (with
 | `build_node_version`          | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
 | `build_tool`                  | string  | `''`         | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                                                                 |
 | `build_scripts`               | string  | `'build'`    | package.json script(s) the build job runs                                                                                        |
+| `lockfile_required`           | boolean | `true`       | Require the build tool's lockfile and install from it frozen; see [Lockfiles](#lockfiles)                                        |
 | `attestations`                | boolean | `true`       | SLSA build provenance for the packed release tarball (release publishes)                                                         |
 | `sigstore_sign`               | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
 | `sbom_enabled`                | boolean | `true`       | Generate the release SBOM (`sbom-files-node-merge` artefact); a failure blocks the release publish                               |
@@ -564,10 +566,9 @@ falling back to npm.
 test scripts with that tool. Yarn Berry and pnpm run through
 Corepack, which fetches the release `packageManager` pins; Yarn Berry
 needs that pin, since an unpinned Corepack runs Yarn classic. The
-build and tests jobs run a resolving install (`install_mode:
-install`), as the npm and Yarn classic lanes always have, so a stale
-lockfile does not fail the build. A build script named in
-`build_scripts` that `package.json` lacks fails the build.
+install mode follows `lockfile_required`; see [Lockfiles](#lockfiles).
+A build script named in `build_scripts` that `package.json` lacks
+fails the build.
 
 The dependency audit runs the tool's own audit through
 `node-audit-action`: `npm audit`, `yarn audit`, `yarn npm audit`,
@@ -605,6 +606,47 @@ apply:
 The SBOM comes from syft, which reads each tool's lockfile. It does
 not apply `include_dev: false` to pnpm v9 lockfiles, so a pnpm SBOM
 can list development dependencies too.
+
+### Lockfiles
+
+The audit, SBOM and Grype scan read the project's lockfile, so a
+release has to ship the dependency tree that lockfile records. The
+`lockfile_required` input decides how `node-build-action` installs
+dependencies in the `build` and `tests` jobs:
+
+<!-- markdownlint-disable MD013 -->
+
+| Workflow                  | Default | Behaviour                                                         |
+| ------------------------- | ------- | ----------------------------------------------------------------- |
+| `build-test-release.yaml` | `true`  | Frozen install; `node-metadata` fails without the tool's lockfile |
+| `merge.yaml`              | `true`  | Frozen install; `node-metadata` fails without the tool's lockfile |
+| `build-test.yaml`         | `false` | Frozen install with the tool's lockfile, resolving without one    |
+
+<!-- markdownlint-enable MD013 -->
+
+The lockfile that counts is the resolved build tool's own:
+`package-lock.json` or `npm-shrinkwrap.json` for npm, `yarn.lock` for
+either Yarn, `pnpm-lock.yaml` for pnpm, and `bun.lock` or `bun.lockb`
+for Bun. A pnpm project whose one lockfile is `package-lock.json` has
+none.
+
+A frozen install (`npm ci`, `yarn install --frozen-lockfile`,
+`yarn install --immutable`, `pnpm install --frozen-lockfile` or
+`bun install --frozen-lockfile`) reproduces the lockfile, so a
+lockfile out of sync with `package.json` fails the build in every
+workflow, `build-test.yaml` included. Update and commit the lockfile
+to fix it.
+
+With `lockfile_required: true`, a project without its lockfile fails
+`node-metadata` with an error naming the file it expected, before
+anything builds. Commit the lockfile, or set `lockfile_required:
+false` on a legacy project that has none, which restores a resolving
+install for it.
+
+The check reads `path_prefix` and no directory above it, as
+`node-build-action` does. A pnpm workspace member whose lockfile sits
+at the workspace root must set `path_prefix` to that root, or set
+`lockfile_required: false`.
 
 ## Node.js Version Selection
 

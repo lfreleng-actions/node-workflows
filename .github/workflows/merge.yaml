@@ -86,6 +86,15 @@ on:
         required: false
         type: string
         default: 'build'
+      lockfile_required:
+        description: >-
+          Require the build tool's own lockfile in path_prefix and
+          install from it frozen, failing node-metadata without it.
+          False installs frozen when that lockfile exists and runs a
+          resolving install otherwise.
+        required: false
+        type: boolean
+        default: true
 
       # --- Supply chain ---
       # Both apply to release publishes only. Snapshot publishes are
@@ -654,6 +663,7 @@ jobs:
       build_node_version: ${{ steps.resolve.outputs.build_node_version }}
       # yamllint disable-line rule:line-length
       audit_package_manager: ${{ steps.resolve.outputs.audit_package_manager }}
+      install_mode: ${{ steps.resolve.outputs.install_mode }}
     permissions:
       contents: read
     timeout-minutes: 5
@@ -710,6 +720,7 @@ jobs:
           BUILD_NODE_VERSION_INPUT: ${{ inputs.build_node_version }}
           BUILD_TOOL_INPUT: ${{ inputs.build_tool }}
           PATH_PREFIX: ${{ inputs.path_prefix }}
+          LOCKFILE_REQUIRED: ${{ inputs.lockfile_required }}
           # yamllint disable-line rule:line-length
           DETECTED_PACKAGE_MANAGER: ${{ steps.build-metadata.outputs.javascript_package_manager }}
           # yamllint disable-line rule:line-length
@@ -761,25 +772,53 @@ jobs:
               exit 1
               ;;
           esac
-          # node-audit-action reads the lockfile of the tool it runs,
-          # so audit natively only when the resolved tool's own
-          # lockfile sits in path_prefix. Any other project, including
-          # one holding another tool's lockfile, keeps npm, whose
-          # audit synthesizes a lockfile when it lacks one.
+          # Only the resolved tool's own lockfile in path_prefix
+          # counts, as node-build-action and node-audit-action each
+          # read that one file. Another tool's lockfile does not.
           case "${build_tool}" in
-            pnpm) audit_lockfiles=(pnpm-lock.yaml) ;;
-            yarn|yarn-berry) audit_lockfiles=(yarn.lock) ;;
-            bun) audit_lockfiles=(bun.lock bun.lockb) ;;
-            *) audit_lockfiles=(package-lock.json npm-shrinkwrap.json) ;;
+            pnpm) tool_lockfiles=(pnpm-lock.yaml) ;;
+            yarn|yarn-berry) tool_lockfiles=(yarn.lock) ;;
+            bun) tool_lockfiles=(bun.lock bun.lockb) ;;
+            *) tool_lockfiles=(package-lock.json npm-shrinkwrap.json) ;;
           esac
-          audit_package_manager='npm'
-          for lockfile in "${audit_lockfiles[@]}"; do
+          has_tool_lockfile='false'
+          for lockfile in "${tool_lockfiles[@]}"; do
             if [ -f "${PATH_PREFIX:-.}/${lockfile}" ]; then
-              # The action takes 'yarn' for Yarn classic and Berry alike
-              audit_package_manager="${build_tool/#yarn-berry/yarn}"
+              has_tool_lockfile='true'
               break
             fi
           done
+          # Audit natively only beside that lockfile. Any other
+          # project keeps npm, whose audit synthesizes a lockfile when
+          # it lacks one. The action takes 'yarn' for Yarn classic and
+          # Berry alike.
+          audit_package_manager='npm'
+          if [ "${has_tool_lockfile}" = 'true' ]; then
+            audit_package_manager="${build_tool/#yarn-berry/yarn}"
+          fi
+          # A required lockfile installs frozen, so the build ships
+          # the tree the audit, SBOM and scan read. Otherwise 'auto'
+          # freezes when the lockfile exists and resolves when not.
+          case "${LOCKFILE_REQUIRED:-false}" in
+            true)
+              if [ "${has_tool_lockfile}" != 'true' ]; then
+                expected="${tool_lockfiles[*]}"
+                echo "::error::lockfile_required is true, but" \
+                  "'$(printf '%s' "${PATH_PREFIX:-.}" | tr -d '\r\n')'" \
+                  "holds no ${build_tool} lockfile" \
+                  "(${expected// / or }). Commit the lockfile, or set" \
+                  "lockfile_required: false to permit a resolving install"
+                exit 1
+              fi
+              install_mode='frozen'
+              ;;
+            false) install_mode='auto' ;;
+            *)
+              echo "::error::Invalid lockfile_required input:" \
+                "'$(printf '%s' "${LOCKFILE_REQUIRED}" | tr -d '\r\n')'"
+              exit 1
+              ;;
+          esac
           # Jobs that run the project's own toolchain can need a
           # different Node.js from the pack/publish jobs, which only
           # need a modern npm and never rebuild. A legacy dependency
@@ -801,11 +840,13 @@ jobs:
           echo "Resolved Node.js version: ${node_version}"
           echo "Resolved build tool: ${build_tool}"
           echo "Audit package manager: ${audit_package_manager}"
+          echo "Install mode: ${install_mode}"
           echo "Build toolchain Node.js version: ${build_node_version}"
           {
             echo "node_version=${node_version}"
             echo "build_tool=${build_tool}"
             echo "audit_package_manager=${audit_package_manager}"
+            echo "install_mode=${install_mode}"
             echo "build_node_version=${build_node_version}"
           } >> "$GITHUB_OUTPUT"
 
@@ -1028,9 +1069,8 @@ jobs:
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
           path_prefix: ${{ inputs.path_prefix }}
           scripts: ${{ inputs.build_scripts }}
-          # Resolving installs, as before v0.3.0 made frozen installs
-          # the default; whether to freeze them is #143's decision
-          install_mode: 'install'
+          # node-metadata resolves it from lockfile_required
+          install_mode: ${{ needs.node-metadata.outputs.install_mode }}
 
       # The publish jobs consume this artefact instead of rebuilding
       # or re-checking-out: the project builds once, and the exact

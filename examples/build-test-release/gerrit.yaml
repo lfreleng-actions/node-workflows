@@ -60,6 +60,7 @@ jobs:
     #   build_node_version: ''        # Node.js for the build job
     #   test_node_version: ''         # Node.js for the tests job
     #   build_tool: ''                # 'npm' or 'yarn'; empty auto-detects
+    #   lockfile_required: true       # false permits no lockfile
     #   attestations: true
     #   sigstore_sign: true
     #   nexus_publish: true           # publish to npm registries
