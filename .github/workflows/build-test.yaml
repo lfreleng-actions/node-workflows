@@ -9,8 +9,10 @@
 # node-metadata resolves the effective Node.js version and build tool
 # (explicit inputs win, then package.json detection, then defaults).
 # After build the jobs in { } run in parallel; none gates another, so a
-# PR surfaces every failure (-> denotes sequence):
+# PR surfaces every failure (-> denotes sequence). Lint reads only the
+# source, so it runs beside the build:
 #   node-metadata -> build -> { tests | audit | sbom -> grype }
+#   node-metadata -> lint
 #
 # Call this from a thin caller workflow; see examples/build-test/ for
 # both a plain GitHub-native caller and a Gerrit-wrapped caller.
@@ -154,6 +156,30 @@ on:
         type: string
         default: ''
 
+      # --- Lint ---
+      lint_enabled:
+        description: >-
+          Run the lint job (set false to skip). It runs the project's
+          pre-commit hooks through standalone-linting-action, and
+          passes with a notice when path_prefix holds no
+          .pre-commit-config.yaml.
+        required: false
+        type: boolean
+        default: true
+      lint_hooks:
+        description: >-
+          Space or comma separated hook ids (or aliases) the lint job
+          runs. Empty (the default) runs the hooks the configuration
+          lists under ci.skip.
+        required: false
+        type: string
+        default: ''
+      lint_permit_fail:
+        description: 'Permit lint failures without failing the workflow'
+        required: false
+        type: boolean
+        default: false
+
       # --- Audit ---
       audit_enabled:
         description: 'Run the dependency audit job (set false to skip)'
@@ -227,7 +253,7 @@ on:
         type: number
         default: 15
       test_timeout_minutes:
-        description: 'Timeout (minutes) for the tests job'
+        description: 'Timeout (minutes) for the tests and lint jobs'
         required: false
         type: number
         default: 10
@@ -1124,6 +1150,106 @@ jobs:
           path: ${{ inputs.path_prefix }}/${{ inputs.coverage_path }}
           retention-days: 7
           if-no-files-found: warn
+
+  # Runs the project's own pre-commit hooks that pre-commit.ci cannot:
+  # by default those listed under ci.skip, typically 'language: system'
+  # hooks (eslint, prettier, tsc) needing the project's node_modules,
+  # which standalone-linting-action installs frozen from the lockfile.
+  # It reads the source alone, so it needs no build output and runs
+  # beside the build rather than after it.
+  lint:
+    name: 'Lint'
+    runs-on: ubuntu-latest
+    needs:
+      - 'node-metadata'
+    if: ${{ inputs.lint_enabled }}
+    permissions:
+      contents: read
+    timeout-minutes: ${{ inputs.test_timeout_minutes }}
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+          allow_list_summary: 'false'
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          # yamllint disable-line rule:line-length
+          egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@35e98c8043ec411611e464e296bcfb441a5c5093  # v1.1.2
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          repository: ${{ inputs.repository || github.repository }}
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # The action fails without a configuration, and many projects
+      # have none, so their lint passes with a notice instead
+      - name: 'Find lint configuration'
+        id: lint-config
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+        run: |
+          # Find lint configuration
+          config="${PATH_PREFIX}/.pre-commit-config.yaml"
+          if [ -f "${config}" ]; then
+            echo "Linting with ${config}"
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No ${config}; skipping lint"
+            echo 'present=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      # no_checkout keeps the checkout above, so a Gerrit change is
+      # linted at the change under test
+      - name: 'Lint project'
+        id: lint
+        if: steps.lint-config.outputs.present == 'true'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/standalone-linting-action@c63239ab493b3ddb506524143c34a723880d3e3c  # v0.8.0
+        # The NO_BLOCK/soft-fail pattern, as for the tests job
+        # yamllint disable-line rule:line-length
+        continue-on-error: ${{ inputs.lint_permit_fail || vars.NO_BLOCK_AUDIT_FAIL == 'true' }}
+        with:
+          path_prefix: ${{ inputs.path_prefix }}
+          no_checkout: 'true'
+          # Empty runs the configuration's ci.skip hooks
+          hooks: ${{ inputs.lint_hooks }}
+          # The project's own toolchain, as the build and tests use
+          node_version: ${{ needs.node-metadata.outputs.build_node_version }}
+          # Reaches only the hook environment, for hooks calling the
+          # GitHub API such as gha-workflow-linter
+          github_token: ${{ github.token }}
+
+      - name: 'Report permitted lint failure'
+        # yamllint disable-line rule:line-length
+        if: ${{ steps.lint.outcome == 'failure' && (inputs.lint_permit_fail || vars.NO_BLOCK_AUDIT_FAIL == 'true') }}
+        shell: bash
+        run: |
+          # Report permitted lint failure
+          echo "::warning::Lint failed, but failures are" \
+            "permitted so the job will not fail."
 
   audit:
     name: 'Audit'

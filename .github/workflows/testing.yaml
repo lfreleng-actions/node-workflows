@@ -322,6 +322,55 @@ jobs:
           done
           exit "${status}"
 
+      # Every leg lints, but only test-node-project ships a
+      # .pre-commit-config.yaml at its path_prefix: its lint job must
+      # run the action and pass, and every other leg must pass through
+      # the absent-configuration notice without calling the action
+      - name: 'Assert lint ran where configured'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          # Keep in step with the build-test matrix names
+          CONFIGURED: 'test-node-project'
+          UNCONFIGURED: >-
+            sdc-onap-ui-common variant-pnpm variant-pnpm-workspace
+            variant-yarn-berry variant-yarn-classic variant-bun
+        run: |
+          # Assert lint ran where configured
+          set -euo pipefail
+          status=0
+          fail() { echo "::error::$1"; status=1; }
+          api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
+          # One row per job: its name, verdict and the verdict of its
+          # 'Lint project' step, or 'absent' when it has no such step
+          jobs="$(gh api --paginate "${api}/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | [.name, (.conclusion // .status),
+              ([.steps[]? | select(.name == "Lint project")
+                | (.conclusion // .status)] | first // "absent")] | @tsv')"
+          # $1 leg, $2 expected 'Lint project' step verdict
+          check() {
+            local name="Build/Test ($1) / Lint" row result step
+            row="$(awk -F'\t' -v n="${name}" '$1 == n' <<< "${jobs}")"
+            result="$(cut -f2 <<< "${row}")"
+            step="$(cut -f3 <<< "${row}")"
+            if [ "${result}" != 'success' ]; then
+              fail "${name}: '${result//$'\n'/ }', expected success"
+            elif [ "${step}" != "$2" ]; then
+              fail "${name}: Lint project '${step//$'\n'/ }', expected $2"
+            else
+              echo "${name}: success, Lint project ${step} ✅"
+            fi
+          }
+          for leg in ${CONFIGURED}; do
+            check "${leg}" success
+          done
+          for leg in ${UNCONFIGURED}; do
+            check "${leg}" skipped
+          done
+          exit "${status}"
+
       # Each variant has to build and test with its own package
       # manager, not merely run: its build copies index.js into dist/,
       # which build-test uploads as node-build-output-<leg>
@@ -565,6 +614,349 @@ jobs:
             esac
           done
           exit "${status}"
+
+  # build-test-assert shows the lint job passing on a clean fixture and
+  # skipping without a configuration. This proves the other side: the
+  # action, wired as build-test.yaml wires it, fails on a lint error.
+  # The same commit linted unmodified must pass, so the failure is the
+  # seeded error's and not the fixture's or the toolchain's. It also
+  # asserts the lint job's wiring, which no run here can show.
+  lint:
+    name: 'Test: lint job'
+    runs-on: ubuntu-latest
+    needs: node-fixture-ref
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Assert lint job wiring'
+        shell: bash
+        run: |
+          # Assert lint job wiring
+          if ! python3 - <<'PY'
+          import sys
+
+          import yaml
+
+          ACTION = 'lfreleng-actions/standalone-linting-action@'
+          # The v0.8.0 commit; c408a143... is its annotated tag object
+          PIN = ACTION + 'c63239ab493b3ddb506524143c34a723880d3e3c'
+
+
+          def expr(body):
+              # Split so Actions leaves the expression unexpanded
+              return '$' '{{ ' + body + ' }}'
+
+
+          def load(name):
+              with open(f'.github/workflows/{name}') as handle:
+                  return yaml.safe_load(handle)
+
+
+          errors = []
+          doc = load('build-test.yaml')
+          jobs = doc['jobs']
+
+          # PyYAML reads the bare 'on' key as True
+          inputs = doc[True]['workflow_call']['inputs']
+          for name, kind, default in (
+              ('lint_enabled', 'boolean', True),
+              ('lint_hooks', 'string', ''),
+              ('lint_permit_fail', 'boolean', False),
+          ):
+              spec = inputs.get(name)
+              if spec is None:
+                  errors.append(f'build-test.yaml lacks the {name} input')
+              elif (spec.get('type') != kind
+                      or spec.get('default') != default
+                      or type(spec.get('default')) is not type(default)):
+                  errors.append(f'{name} is {spec.get("type")!r} '
+                                f'defaulting to {spec.get("default")!r}, '
+                                f'expected {kind} defaulting to '
+                                f'{default!r}')
+
+          job = jobs.get('lint')
+          if job is None:
+              sys.exit('::error::build-test.yaml has no lint job')
+          tests = jobs['tests']
+          needs = job.get('needs')
+          if isinstance(needs, str):
+              needs = [needs]
+          if needs != ['node-metadata']:
+              errors.append(f'lint needs {needs!r}, expected '
+                            "['node-metadata']")
+          if 'inputs.lint_enabled' not in str(job.get('if')):
+              errors.append('lint does not run on inputs.lint_enabled')
+          if job.get('permissions') != {'contents': 'read'}:
+              errors.append(f'lint permissions are '
+                            f'{job.get("permissions")!r}, expected '
+                            'contents: read')
+          if job.get('timeout-minutes') != tests.get('timeout-minutes'):
+              errors.append('lint timeout-minutes differs from tests')
+          for other_id, other in jobs.items():
+              other_needs = other.get('needs') or []
+              if isinstance(other_needs, str):
+                  other_needs = [other_needs]
+              if 'lint' in other_needs:
+                  errors.append(f'{other_id} needs lint; nothing should')
+
+          steps = job.get('steps') or []
+          by_name = {step.get('name'): step for step in steps}
+          names = [step.get('name') for step in steps]
+          # Hardening and both checkouts exactly as the tests job has
+          # them, so the job lints the change the others build
+          for name in (
+              'Load egress allow-list',
+              'Harden runner',
+              'Checkout Gerrit change',
+              'Checkout repository',
+          ):
+              want = [s for s in tests['steps'] if s.get('name') == name]
+              if by_name.get(name) is None:
+                  errors.append(f'lint lacks the {name!r} step')
+              elif not want or by_name[name] != want[0]:
+                  errors.append(f'lint {name!r} differs from tests')
+          checkout = by_name.get('Checkout repository') or {}
+          if (checkout.get('with') or {}).get(
+                  'persist-credentials') is not False:
+              errors.append('lint checkout persists credentials')
+
+          calls = [s for s in steps
+                   if str(s.get('uses', '')).startswith(ACTION)]
+          guard = [s for s in steps if s.get('id') == 'lint-config']
+          if len(calls) != 1:
+              errors.append(f'lint calls standalone-linting-action '
+                            f'{len(calls)} times, expected once')
+          if len(guard) != 1:
+              errors.append('lint has no lint-config guard step')
+          if len(calls) == 1 and len(guard) == 1:
+              call, guard = calls[0], guard[0]
+              if call['uses'] != PIN:
+                  errors.append(f'lint pins {call["uses"]}, expected '
+                                f'{PIN}')
+              if (names.index(guard['name']) > names.index(call['name'])
+                      or names.index('Checkout repository')
+                      > names.index(guard['name'])):
+                  errors.append('the lint-config guard must run between '
+                                'the checkout and the action')
+              if call.get('if') != (
+                      "steps.lint-config.outputs.present == 'true'"):
+                  errors.append(f'the action runs on {call.get("if")!r}, '
+                                'expected the lint-config guard')
+              want = {
+                  'path_prefix': expr('inputs.path_prefix'),
+                  'no_checkout': 'true',
+                  'hooks': expr('inputs.lint_hooks'),
+                  'node_version': expr(
+                      'needs.node-metadata.outputs.build_node_version'),
+                  'github_token': expr('github.token'),
+              }
+              got = call.get('with') or {}
+              if got != want:
+                  errors.append(f'the action takes {got!r}, expected '
+                                f'{want!r}')
+              permit = str(call.get('continue-on-error'))
+              for term in ('inputs.lint_permit_fail',
+                           "vars.NO_BLOCK_AUDIT_FAIL == 'true'"):
+                  if term not in permit:
+                      errors.append(f'the action continue-on-error '
+                                    f'lacks {term}')
+              run = guard.get('run') or ''
+              if '$' '{{' in run:
+                  errors.append('the lint-config guard interpolates '
+                                'into its run block')
+              env = guard.get('env') or {}
+              if env.get('PATH_PREFIX') != expr('inputs.path_prefix'):
+                  errors.append('the lint-config guard does not read '
+                                'path_prefix through env')
+          report = by_name.get('Report permitted lint failure') or {}
+          report_if = str(report.get('if'))
+          for term in ("steps.lint.outcome == 'failure'",
+                       'inputs.lint_permit_fail',
+                       "vars.NO_BLOCK_AUDIT_FAIL == 'true'"):
+              if term not in report_if:
+                  errors.append(f'the permitted failure report lacks '
+                                f'{term}')
+
+          # Release and merge lanes build commits that already passed
+          # verify, so neither lints
+          for name in ('build-test-release.yaml', 'merge.yaml'):
+              if ACTION in str(load(name)):
+                  errors.append(f'{name} calls standalone-linting-action')
+
+          # This job's own calls must test the pin build-test.yaml uses
+          own = load('testing.yaml')['jobs']['lint']['steps']
+          pins = {s['uses'] for s in own
+                  if str(s.get('uses', '')).startswith(ACTION)}
+          if pins != {PIN}:
+              errors.append(f'testing.yaml lint job pins {pins!r}, '
+                            f'expected {PIN}')
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('Lint job wiring incorrect ❌')
+          print('Lint job wiring correct ✅')
+          PY
+          then
+            echo "Lint job wiring incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Lint job wiring correct ✅" >> "$GITHUB_STEP_SUMMARY"
+
+      # The guard decides whether the action runs at all, so drive it
+      # with a configuration present and absent
+      - name: 'Exercise the lint configuration guard'
+        shell: bash
+        run: |
+          # Exercise the lint configuration guard
+          set -euo pipefail
+          guard="${RUNNER_TEMP}/lint-guard.sh"
+          python3 - "${guard}" <<'EXTRACT'
+          import sys
+
+          import yaml
+
+          with open('.github/workflows/build-test.yaml') as handle:
+              steps = yaml.safe_load(handle)['jobs']['lint']['steps']
+          guard = [s for s in steps if s.get('id') == 'lint-config']
+          if len(guard) != 1:
+              sys.exit('lint has no lint-config guard step')
+          with open(sys.argv[1], 'w') as handle:
+              handle.write(guard[0]['run'])
+          EXTRACT
+          errors=0
+          cases="${RUNNER_TEMP}/lint-guard"
+          mkdir -p "${cases}/present" "${cases}/absent"
+          touch "${cases}/present/.pre-commit-config.yaml"
+          # $1 case, $2 expected 'present' output
+          check() {
+            local out="${cases}/$1.out" log
+            : > "${out}"
+            log="$(PATH_PREFIX="${cases}/$1" GITHUB_OUTPUT="${out}" \
+              bash -eo pipefail "${guard}" 2>&1)" || true
+            if ! grep -qxF "present=$2" "${out}"; then
+              echo "$1: did not output present=$2 ❌"
+              errors=1
+            elif [ "$2" = 'false' ] && ! grep -qF \
+              "::notice::No ${cases}/$1/.pre-commit-config.yaml" \
+              <<< "${log}"; then
+              echo "$1: no notice naming the expected file ❌"
+              errors=1
+            else
+              echo "$1: present=$2 ✅"
+            fi
+          }
+          check present true
+          check absent false
+          if [ "${errors}" != '0' ]; then
+            echo "Lint configuration guard incorrect ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Lint configuration guard correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Two copies of the fixture at the pinned commit, beside this
+      # repository's checkout: one linted as it is, one with a seeded
+      # ESLint error
+      - name: 'Checkout fixture (clean)'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: 'lfreleng-actions/test-node-project'
+          ref: ${{ needs.node-fixture-ref.outputs.sha }}
+          path: 'lint-fixture/clean'
+          persist-credentials: false
+      - name: 'Checkout fixture (seeded)'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: 'lfreleng-actions/test-node-project'
+          ref: ${{ needs.node-fixture-ref.outputs.sha }}
+          path: 'lint-fixture/seeded'
+          persist-credentials: false
+
+      # The fixture's ESLint configuration rejects unused variables
+      - name: 'Seed an ESLint error'
+        shell: bash
+        run: |
+          # Seed an ESLint error
+          printf 'const lintSeedUnused = 1;\n' >> lint-fixture/seeded/sum.js
+
+      - name: 'Lint the clean fixture'
+        id: lint-clean
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/standalone-linting-action@c63239ab493b3ddb506524143c34a723880d3e3c  # v0.8.0
+        with:
+          path_prefix: 'lint-fixture/clean'
+          no_checkout: 'true'
+          hooks: 'eslint'
+          # build-test resolves 22 for this fixture, which pins none
+          node_version: '22'
+
+      - name: 'Lint the seeded fixture'
+        id: lint-seeded
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/standalone-linting-action@c63239ab493b3ddb506524143c34a723880d3e3c  # v0.8.0
+        continue-on-error: true
+        with:
+          path_prefix: 'lint-fixture/seeded'
+          no_checkout: 'true'
+          hooks: 'eslint'
+          # build-test resolves 22 for this fixture, which pins none
+          node_version: '22'
+
+      # hooks_run is published only once the hooks are about to run, so
+      # 'eslint' there proves the failure came from ESLint itself, not
+      # from the action refusing its inputs
+      - name: 'Assert the seeded error failed lint'
+        shell: bash
+        env:
+          CLEAN_HOOKS: ${{ steps.lint-clean.outputs.hooks_run }}
+          SEEDED_OUTCOME: ${{ steps.lint-seeded.outcome }}
+          SEEDED_HOOKS: ${{ steps.lint-seeded.outputs.hooks_run }}
+        run: |
+          # Assert the seeded error failed lint
+          status=0
+          if [ "${CLEAN_HOOKS}" != 'eslint' ]; then
+            echo "::error::Clean fixture ran '${CLEAN_HOOKS}', expected" \
+              "eslint"
+            status=1
+          fi
+          if [ "${SEEDED_OUTCOME}" != 'failure' ]; then
+            echo "::error::Seeded fixture lint was '${SEEDED_OUTCOME}'," \
+              "expected failure"
+            status=1
+          fi
+          if [ "${SEEDED_HOOKS}" != 'eslint' ]; then
+            echo "::error::Seeded fixture ran '${SEEDED_HOOKS}', expected" \
+              "eslint"
+            status=1
+          fi
+          if [ "${status}" != '0' ]; then
+            echo "Seeded lint error not caught ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Seeded lint error failed the lint, clean fixture passed ✅" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
   # The publish-targets resolver is the one part of the merge and
   # build-test-release publish paths that CI can exercise: it reads
@@ -4586,6 +4978,8 @@ jobs:
                   'matrix.node_version',
               ('build-test.yaml', 'audit', 'Audit dependencies'):
                   'node_version',
+              ('build-test.yaml', 'lint', 'Lint project'):
+                  'build_node_version',
               ('merge.yaml', 'build', 'Build project'):
                   'build_node_version',
               ('merge.yaml', 'pack-release', 'Set up Node.js'):

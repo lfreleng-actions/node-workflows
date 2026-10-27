@@ -36,7 +36,8 @@ GitHub-native and a Gerrit-wrapped variant per workflow.
 
 ```text
 gerrit-validate -> { repository-metadata | node-metadata }
-node-metadata -> build -> { tests | audit | sbom -> grype }
+node-metadata -> { build | lint }
+build -> { tests | audit | sbom -> grype }
 ```
 
 `build-test-release.yaml` (gating inversion: the audits gate the
@@ -353,6 +354,9 @@ it with `dry_run: true` to rehearse first.
 | `junit_report_path`       | string  | `''`       | JUnit XML glob summarised in the tests job and uploaded; empty disables        |
 | `coverage_path`           | string  | `''`       | `lcov.info`/`coverage-summary.json` (or their directory) summarised and kept   |
 | `artifact_suffix`         | string  | `''`       | Appended to every artefact name; give each call in one run its own             |
+| `lint_enabled`            | boolean | `true`     | Run the lint job (set false to skip); see [Lint](#lint)                        |
+| `lint_hooks`              | string  | `''`       | Hook ids or aliases to lint with; empty runs the configuration's `ci.skip`     |
+| `lint_permit_fail`        | boolean | `false`    | Permit lint failures without failing the workflow                              |
 | `audit_enabled`           | boolean | `true`     | Run the dependency audit job (set false to skip)                               |
 | `audit_level`             | string  | `'high'`   | npm audit severity threshold that fails the audit                              |
 | `production_only`         | boolean | `false`    | Restrict the audit to production dependencies                                  |
@@ -363,7 +367,7 @@ it with `dry_run: true` to rehearse first.
 | `grype_permit_fail`       | boolean | `false`    | Permit Grype findings without failing the job                                  |
 | `grype_gate_when`         | string  | `'always'` | `always`, or `dependencies-changed`; see [Grype gating](#grype-gating)         |
 | `build_timeout_minutes`   | number  | `15`       | Timeout (minutes) for the build job                                            |
-| `test_timeout_minutes`    | number  | `10`       | Timeout (minutes) for the tests job                                            |
+| `test_timeout_minutes`    | number  | `10`       | Timeout (minutes) for the tests and lint jobs                                  |
 | `audit_timeout_minutes`   | number  | `10`       | Timeout (minutes) for the audit, SBOM and Grype jobs                           |
 | `harden_runner_egress`    | string  | `'block'`  | Harden-runner egress policy: `block` or `audit`                                |
 | `harden_runner_allowlist` | string  | (pinned)   | Out-of-band harden-runner allow-list configuration                             |
@@ -397,6 +401,35 @@ artefact of each name, so when a later call in the run reuses an
 artefact name, the earlier call fails its download rather than reading
 the other call's artefact. The fix for that failure is a distinct
 `artifact_suffix` per call.
+
+#### Lint
+
+The `lint` job runs the project's [pre-commit](https://pre-commit.com/)
+hooks through
+[`standalone-linting-action`](https://github.com/lfreleng-actions/standalone-linting-action),
+from `<path_prefix>/.pre-commit-config.yaml`. By default it runs the
+hooks that configuration lists under `ci.skip`: the ones pre-commit.ci
+cannot run, such as local `language: system` hooks calling the
+project's own `eslint`, `prettier` or `tsc`. `lint_hooks` names other
+hooks instead. Before the hooks run, the action installs the project's
+dependencies frozen to its lockfile, with install scripts off, under
+the Node.js version the build uses. The action's README describes the
+Node.js hook pattern, `language: system` hooks running
+`npx --no-install …`, under
+[Node.js / TypeScript projects](https://github.com/lfreleng-actions/standalone-linting-action#nodejs--typescript-projects).
+
+The job needs `node-metadata` alone, so it runs beside the build. A
+failing hook fails the workflow, and with it a Gerrit caller's vote.
+`lint_permit_fail: true`, or the `NO_BLOCK_AUDIT_FAIL` variable,
+reports the failure as a warning instead. A project without a
+`.pre-commit-config.yaml` passes, with a notice naming the file the
+job looked for. `lint_enabled: false` skips the job.
+
+The job lints the same checkout as the other jobs, including a Gerrit
+change under test. Hooks such as `gha-workflow-linter` that call the
+GitHub API get the job's `github.token`, which can read the repository
+contents and nothing more. The release and merge workflows do not
+lint: they build commits that already passed this one.
 
 #### Grype gating
 
@@ -1120,6 +1153,10 @@ their passing verdicts. Each leg passes its name as
   version and no other `node-test-results` artefact;
 - the audit and Grype jobs of every leg ran; a skipped job fails
   the check;
+- every leg's lint job succeeded; the `test-node-project` leg, whose
+  `.pre-commit-config.yaml` lists `eslint`, `prettier`, `tsc` and
+  `gha-workflow-linter` under `ci.skip`, ran the linting action, and
+  every other leg, which has no configuration, skipped it;
 - every variant leg's build and tests jobs succeeded, and each
   variant but the pnpm workspace uploaded the `dist/` its build
   wrote as `node-build-output-<leg>`;
@@ -1128,7 +1165,13 @@ their passing verdicts. Each leg passes its name as
   fail the check.
 
 Neither npm fixture emits `dist/`, so the check makes no claim about
-their `node-build-output` artefact. The release and merge workflows
+their `node-build-output` artefact. The `lint` job in `testing.yaml`
+covers the failing case: it runs the linting action at the commit
+`build-test.yaml` pins, with `hooks: 'eslint'`, over two copies of the
+npm fixture, and requires the copy with a seeded unused variable to
+fail and the unmodified copy to pass. It also asserts the lint job's
+wiring, inputs and configuration guard from the workflow file. The
+release and merge workflows
 need tag-push and merged-commit contexts (plus publish credentials),
 so instantiating repositories exercise those through their own
 release and merge cycles. `testing.yaml` still checks their package
