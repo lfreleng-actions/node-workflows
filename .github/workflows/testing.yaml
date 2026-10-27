@@ -4694,3 +4694,289 @@ jobs:
           fi
           echo "node-audit-action wiring correct ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+      # merge.yaml cannot run in CI, so its snapshot guard is
+      # extracted and driven against crafted manifests
+      - name: 'Exercise the snapshot specifier guard'
+        shell: bash
+        run: |
+          # Exercise the snapshot specifier guard
+          guard="${RUNNER_TEMP}/snapshot-guard.sh"
+          python3 - "${guard}" <<'EXTRACT'
+          import sys
+
+          import yaml
+
+          with open('.github/workflows/merge.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['jobs']['snapshot-publish']['steps']
+          names = [step.get('name') for step in steps]
+          guard = [s for s in steps if s.get('id') == 'snapshot-specifiers']
+          if len(guard) != 1:
+              sys.exit('snapshot-publish has no snapshot-specifiers step')
+          # It has to stand between the download and the publish
+          where = names.index(guard[0]['name'])
+          if not (names.index('Download built project') < where
+                  < names.index('Publish snapshot')):
+              sys.exit('snapshot-specifiers does not run between the '
+                       'download and the publish')
+          with open(sys.argv[1], 'w') as handle:
+              handle.write(guard[0]['run'])
+          EXTRACT
+          if ! grep -q 'workspace|catalog' "${guard}"; then
+            echo "Could not extract the snapshot guard ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          errors=0
+          cases="${RUNNER_TEMP}/manifests"
+          mkdir -p "${cases}"
+          # $1 case, $2 accept|reject, $3 build tool, $4 package.json
+          check() {
+            mkdir -p "${cases}/$1"
+            printf '%s\n' "$4" > "${cases}/$1/package.json"
+            set +e
+            out="$(BUILD_TOOL="$3" PATH_PREFIX="${cases}/$1" \
+              bash -eo pipefail "${guard}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$2" = 'accept' ] && [ "${rc}" != '0' ]; then
+              echo "$1: refused, expected it to pass ❌"
+              printf '%s\n' "${out}" | tail -2
+              errors=1
+            elif [ "$2" = 'reject' ] && { [ "${rc}" = '0' ] ||
+              ! printf '%s' "${out}" | grep -q '^::error::'; }; then
+              echo "$1: passed, expected a labelled refusal ❌"
+              errors=1
+            fi
+          }
+          workspace='{"name": "app", "version": "1.0.0",
+            "dependencies": {"sum": "workspace:*", "x": "^1.0.0"}}'
+          check 'pnpm workspace:' reject pnpm "${workspace}"
+          check 'yarn-berry workspace:' reject yarn-berry "${workspace}"
+          check 'bun workspace:' reject bun "${workspace}"
+          check 'npm workspace:' accept npm "${workspace}"
+          check 'yarn classic workspace:' accept yarn "${workspace}"
+          check 'pnpm catalog:' reject pnpm \
+            '{"devDependencies": {"jest": "catalog:"}}'
+          check 'pnpm named catalog' reject pnpm \
+            '{"peerDependencies": {"react": "catalog:react19"}}'
+          check 'yarn-berry optional workspace:' reject yarn-berry \
+            '{"optionalDependencies": {"sum": "workspace:^"}}'
+          check 'pnpm plain ranges' accept pnpm \
+            '{"dependencies": {"x": "^1.0.0", "y": "npm:z@1"}}'
+          check 'pnpm no dependencies' accept pnpm '{"name": "app"}'
+          # Only the specifier's protocol counts, not a name or a path
+          check 'pnpm workspace in a name' accept pnpm \
+            '{"dependencies": {"workspace:x": "1.0.0",
+              "y": "file:workspace:z"}}'
+          check 'pnpm unreadable package.json' reject pnpm '{not json'
+
+          if [ "${errors}" != '0' ]; then
+            echo "Snapshot specifier guard incorrect ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Snapshot specifier guard correct ✅" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The release lanes pack with the project's own tool, so a pnpm
+  # workspace package publishes resolved versions rather than
+  # workspace:*. Neither release lane can run in CI, so this runs
+  # their shared Corepack and pack steps against the fixture's
+  # variants, after asserting the two workflows carry identical
+  # copies.
+  release-pack:
+    name: 'Test: release pack with the project tool'
+    needs: node-fixture-ref
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Checkout fixture'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: 'lfreleng-actions/test-node-project'
+          ref: ${{ needs.node-fixture-ref.outputs.sha }}
+          path: 'fixture'
+          persist-credentials: false
+
+      - name: 'Extract the pack steps'
+        shell: bash
+        run: |
+          # Extract the pack steps
+          python3 - "${RUNNER_TEMP}" <<'EXTRACT'
+          import sys
+
+          import yaml
+
+          out = sys.argv[1]
+          SHARED = (
+              'Set up Corepack for packing',
+              'Set up Bun for packing',
+              'Pack release tarball',
+          )
+          jobs = {
+              'build-test-release.yaml': 'build',
+              'merge.yaml': 'pack-release',
+          }
+          copies = {}
+          for name, job in jobs.items():
+              with open(f'.github/workflows/{name}') as handle:
+                  steps = yaml.safe_load(handle)['jobs'][job]['steps']
+              names = [step.get('name') for step in steps]
+              missing = [n for n in SHARED if n not in names]
+              if missing:
+                  sys.exit(f'{name} {job} lacks ' + ', '.join(missing))
+              positions = [names.index(n) for n in SHARED]
+              if positions != sorted(positions):
+                  sys.exit(f'{name} {job} sets up its pack tool after '
+                           'packing')
+              copies[name] = [steps[i] for i in positions]
+          if copies['merge.yaml'] != copies['build-test-release.yaml']:
+              sys.exit('The pack steps in merge.yaml and '
+                       'build-test-release.yaml diverged')
+          corepack, _, pack = copies['merge.yaml']
+          with open(f'{out}/corepack.sh', 'w') as handle:
+              handle.write(corepack['run'])
+          with open(f'{out}/corepack-version', 'w') as handle:
+              handle.write(corepack['env']['COREPACK_VERSION'])
+          with open(f'{out}/pack.sh', 'w') as handle:
+              handle.write(pack['run'])
+          EXTRACT
+          if ! grep -q 'pack-dist' "${RUNNER_TEMP}/pack.sh"; then
+            echo "Could not extract the pack step ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          echo "The release lanes share one set of pack steps ✅"
+
+      - name: 'Exercise the pack steps'
+        shell: bash
+        run: |
+          # Exercise the pack steps
+          errors=0
+          fail() {
+            echo "$1 ❌"
+            errors=1
+          }
+          corepack_version="$(cat "${RUNNER_TEMP}/corepack-version")"
+          # $1 tool, $2 path; runs the Corepack step, leaving its bin
+          # directory in ${bin}
+          setup() {
+            : > "${RUNNER_TEMP}/corepack-out.txt"
+            BUILD_TOOL="$1" PATH_PREFIX="$2" \
+              COREPACK_VERSION="${corepack_version}" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/corepack-out.txt" \
+              bash -eo pipefail "${RUNNER_TEMP}/corepack.sh"
+            bin="$(grep '^bin=' "${RUNNER_TEMP}/corepack-out.txt" \
+              | cut -d= -f2-)"
+          }
+          # $1 tool, $2 path; runs the pack step, leaving its outputs
+          # in ${RUNNER_TEMP}/pack-out.txt
+          pack() {
+            : > "${RUNNER_TEMP}/pack-out.txt"
+            BUILD_TOOL="$1" PATH_PREFIX="$2" COREPACK_BIN="${bin:-}" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/pack-out.txt" \
+              bash -eo pipefail "${RUNNER_TEMP}/pack.sh"
+          }
+          output() {
+            grep "^$1=" "${RUNNER_TEMP}/pack-out.txt" | cut -d= -f2-
+          }
+
+          # A pnpm workspace member whose dependency on its sibling is
+          # workspace:*, installed at the workspace root first
+          root='fixture/variants/pnpm-workspace'
+          app="${root}/packages/app"
+          setup pnpm "${app}"
+          (cd "${root}" && "${bin}/pnpm" install --ignore-scripts)
+          pack pnpm "${app}"
+          tarball="$(output tarball_name)"
+          sha256="$(output tarball_sha256)"
+          archive="${app}/pack-dist/${tarball}"
+          if [ ! -f "${archive}" ]; then
+            fail "pnpm: no ${archive}"
+          elif [ "$(sha256sum "${archive}" | cut -d' ' -f1)" != \
+            "${sha256}" ]; then
+            fail "pnpm: tarball_sha256 does not match ${tarball}"
+          else
+            manifest="$(tar -xzOf "${archive}" package/package.json)"
+            want="$(jq -r '.version' "${root}/packages/sum/package.json")"
+            got="$(jq -r '.dependencies["@test-node-project/sum"]' \
+              <<< "${manifest}")"
+            if jq -e '[(.dependencies, .devDependencies,
+                .optionalDependencies, .peerDependencies) | objects
+                | .[] | strings | select(test("^(workspace|catalog):"))]
+                | length > 0' <<< "${manifest}" > /dev/null; then
+              fail "pnpm: packed manifest keeps a workspace specifier"
+            elif [ "${got}" != "${want}" ]; then
+              fail "pnpm: packed @test-node-project/sum is '${got}'," \
+                "expected '${want}'"
+            else
+              echo "pnpm packed ${tarball} with sum ${got} ✅"
+            fi
+          fi
+
+          # Yarn Berry names its archives package.tgz; the step takes
+          # npm's name so every tool's tarball looks alike
+          berry='fixture/variants/yarn-berry'
+          setup yarn-berry "${berry}"
+          pack yarn-berry "${berry}"
+          want="$(jq -r '"\(.name)-\(.version).tgz"' \
+            "${berry}/package.json")"
+          if [ "$(output tarball_name)" != "${want}" ] ||
+            [ ! -f "${berry}/pack-dist/${want}" ]; then
+            fail "yarn-berry: packed '$(output tarball_name)'," \
+              "expected '${want}'"
+          else
+            echo "yarn-berry packed ${want} ✅"
+          fi
+
+          # Refusals: Berry unpinned would run Yarn classic, and a tool
+          # with no pack command must not fall back to npm
+          set +e
+          out="$(BUILD_TOOL=yarn-berry \
+            PATH_PREFIX='fixture/variants/yarn-classic' \
+            COREPACK_VERSION="${corepack_version}" \
+            GITHUB_OUTPUT="${RUNNER_TEMP}/refused.txt" \
+            bash -eo pipefail "${RUNNER_TEMP}/corepack.sh" 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" = '0' ] ||
+            ! printf '%s' "${out}" | grep -q '^::error::'; then
+            fail "Corepack step accepted yarn-berry without packageManager"
+          fi
+          set +e
+          out="$(bin='' pack deno 'fixture/variants/bun' 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" = '0' ] ||
+            ! printf '%s' "${out}" | grep -q '^::error::'; then
+            fail "Pack step accepted an unknown build tool"
+          fi
+
+          if [ "${errors}" != '0' ]; then
+            echo "Release pack incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Release pack correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"

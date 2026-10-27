@@ -931,7 +931,7 @@ jobs:
     outputs:
       artefact_id: ${{ steps.upload-build.outputs.artifact-id }}
       artefact_path: ${{ steps.build.outputs.artefact_path }}
-      tarball_name: ${{ steps.build.outputs.tarball_name }}
+      tarball_name: ${{ steps.pack.outputs.tarball_name }}
     permissions:
       contents: read
     timeout-minutes: ${{ inputs.build_timeout_minutes }}
@@ -1051,7 +1051,7 @@ jobs:
       # and needs 'npm pack --pack-destination', which arrived in npm
       # 7 -- the very constraint build_node_version exists to escape.
       # Without this the split would appear to work and the release
-      # lane would still fail with 'npm pack produced no tarball'.
+      # lane would still fail with no tarball in pack-dist.
       - name: 'Restore the publish Node.js'
         # yamllint disable-line rule:line-length
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
@@ -1061,7 +1061,164 @@ jobs:
           # it as packageManager; a release lane must not (CWE-349)
           package-manager-cache: false
 
+      # npm does not rewrite workspace: or catalog: specifiers, so a
+      # pnpm, Yarn Berry or Bun project packs with its own tool, or
+      # the published manifest names versions nobody can install.
+      # node-build-action keeps its Corepack and Bun to its own
+      # steps, so packing sets them up again the same way: Corepack
+      # into RUNNER_TEMP, run from there rather than enabled globally.
+      # The pack-release job in merge.yaml carries identical copies
+      # of these steps, which testing.yaml asserts.
+      - name: 'Set up Corepack for packing'
+        id: corepack
+        # yamllint disable-line rule:line-length
+        if: needs.node-metadata.outputs.build_tool == 'pnpm' || needs.node-metadata.outputs.build_tool == 'yarn-berry'
+        shell: bash
+        env:
+          BUILD_TOOL: ${{ needs.node-metadata.outputs.build_tool }}
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          COREPACK_VERSION: '0.36.0'
+        # An exact version: the registry never lets a published version
+        # change, so no lockfile is needed to fix what installs
+        run: |  # zizmor: ignore[adhoc-packages]
+          # Set up Corepack for packing
+          if [[ ! "${PATH_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || [[ "${PATH_PREFIX}" =~ (^|/)\.\.(/|$) ]]; then
+            echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
+            exit 1
+          fi
+          # The packageManager rules node-build-action applies
+          package_manager="$(jq -r '.packageManager // "" | strings' \
+            "${PATH_PREFIX}/package.json" | tr -d '\r\n')"
+          case "${BUILD_TOOL}" in
+            yarn-berry)
+              # Unpinned, Corepack would run Yarn classic
+              if [[ ! "${package_manager}" =~ ^yarn@([2-9]|[1-9][0-9]+)\. ]]
+              then
+                echo "::error::build_tool 'yarn-berry' needs" \
+                  "packageManager in package.json to pin Yarn 2 or" \
+                  "later; found '${package_manager:-nothing}'"
+                exit 1
+              fi
+              tool='yarn'
+              ;;
+            pnpm)
+              if [ -n "${package_manager}" ] &&
+                [[ "${package_manager}" != pnpm@* ]]; then
+                echo "::error::build_tool 'pnpm' conflicts with" \
+                  "packageManager '${package_manager}' in package.json"
+                exit 1
+              fi
+              tool='pnpm'
+              ;;
+            *)
+              echo "::error::Corepack does not pack with ${BUILD_TOOL}"
+              exit 1
+              ;;
+          esac
+          corepack_dir="${RUNNER_TEMP}/corepack"
+          npm install --global --prefix "${corepack_dir}" \
+            --ignore-scripts --no-audit --no-fund \
+            "corepack@${COREPACK_VERSION}"
+          # Fetch the release now, so a download failure surfaces here
+          version="$(cd "${PATH_PREFIX}" &&
+            "${corepack_dir}/bin/${tool}" --version)"
+          echo "Packing with ${tool} ${version}" \
+            "(Corepack ${COREPACK_VERSION})"
+          echo "bin=${corepack_dir}/bin" >> "$GITHUB_OUTPUT"
+
+      - name: 'Set up Bun for packing'
+        if: needs.node-metadata.outputs.build_tool == 'bun'
+        # yamllint disable-line rule:line-length
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
+        with:
+          # node-build-action's default release
+          bun-version: '1.4.3'
+          # A cache written by a less-trusted run could poison a
+          # release (CWE-349)
+          no-cache: true
+          # An exact version needs no GitHub API lookup, so no token
+          token: ''
+
+      # The archive is the release artefact: attest and sign-artefacts
+      # cover it, and the publish job hands it to npm rather than
+      # packing a second one; see #85. package.json already carries
+      # the stamped release version.
       - name: 'Pack release tarball'
+        id: pack
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          BUILD_TOOL: ${{ needs.node-metadata.outputs.build_tool }}
+          COREPACK_BIN: ${{ steps.corepack.outputs.bin }}
+        run: |
+          # Constrain path_prefix to a relative, non-traversing,
+          # single-line path before it drives packaging paths
+          if [[ ! "${PATH_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || [[ "${PATH_PREFIX}" =~ (^|/)\.\.(/|$) ]]; then
+            echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
+            exit 1
+          fi
+          cd "${PATH_PREFIX}"
+          mkdir -p pack-dist
+          dest="${PWD}/pack-dist"
+          case "${BUILD_TOOL}" in
+            npm|yarn)
+              # Yarn classic leaves workspace protocols alone too, so
+              # npm packs both. --no-workspaces: with workspaces
+              # enabled in configuration, npm pack packs the
+              # workspace children rather than the target.
+              npm pack --no-workspaces --pack-destination "${dest}"
+              ;;
+            pnpm)
+              "${COREPACK_BIN}/pnpm" pack --pack-destination "${dest}"
+              ;;
+            yarn-berry)
+              # Berry names every archive package.tgz; take npm's
+              # <name>-<version>.tgz like the other tools
+              name="$(jq -r '.name // "" | strings' package.json)"
+              version="$(jq -r '.version // "" | strings' package.json)"
+              file="${name#@}"
+              file="${file//\//-}-${version}.tgz"
+              if [[ ! "${file}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\.tgz$ ]]
+              then
+                echo "::error::Cannot name a tarball for package" \
+                  "'$(printf '%s' "${name}@${version}" | tr -d '\r\n')'"
+                exit 1
+              fi
+              "${COREPACK_BIN}/yarn" pack --out "${dest}/${file}"
+              ;;
+            bun)
+              bun pm pack --destination "${dest}"
+              ;;
+            *)
+              echo "::error::No pack command for build tool" \
+                "'$(printf '%s' "${BUILD_TOOL}" | tr -d '\r\n')'"
+              exit 1
+              ;;
+          esac
+          # Attestation, signing and publishing each take one archive
+          shopt -s nullglob
+          tarballs=(pack-dist/*.tgz)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "::error::Expected one tarball in pack-dist after" \
+              "packing with ${BUILD_TOOL}; found ${#tarballs[@]}"
+            exit 1
+          fi
+          tarball="${tarballs[0]##*/}"
+          # The name reaches $GITHUB_OUTPUT and later paths
+          if [[ ! "${tarball}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\.tgz$ ]]; then
+            echo "::error::Unexpected tarball name:" \
+              "$(printf '%s' "${tarball}" | tr -d '\r\n')"
+            exit 1
+          fi
+          sha256=$(sha256sum "pack-dist/${tarball}" | cut -d' ' -f1)
+          echo "Packed release tarball with ${BUILD_TOOL}:" \
+            "${tarball} (sha256:${sha256})"
+          echo "tarball_name=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "tarball_sha256=${sha256}" >> "$GITHUB_OUTPUT"
+
+      - name: 'Name release artefact'
         id: build
         shell: bash
         env:
@@ -1069,39 +1226,11 @@ jobs:
           # gerrit-validate admits only [A-Za-z0-9._-] here
           ARTIFACT_SUFFIX: ${{ inputs.artifact_suffix }}
         run: |
-          # Constrain path_prefix to a relative, non-traversing,
-          # single-line path before it reaches $GITHUB_OUTPUT
-          # (output-file injection) or drives packaging paths
-          if [[ ! "${PATH_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
-            || [[ "${PATH_PREFIX}" =~ (^|/)\.\.(/|$) ]]; then
-            echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
-            exit 1
-          fi
-          # Produce the release tarball via npm pack (package.json
-          # already carries the stamped release version).
-          #
-          # --no-workspaces for the same reason as the stamp above:
-          # with workspaces enabled in configuration, npm pack packs
-          # the workspace children rather than the target, so the
-          # release would carry tarballs nobody asked for.
-          #
-          # This archive is the release artefact: attest and
-          # sign-artefacts cover it, and nexus-publish publishes it
-          # rather than packing a second one, so there is no
-          # prepublishOnly divergence left to document; see #85.
-          cd "${PATH_PREFIX}"
-          mkdir -p pack-dist
-          tarball=$(npm pack --no-workspaces \
-            --pack-destination pack-dist | tail -n1)
-          if [ ! -f "pack-dist/${tarball}" ]; then
-            echo "::error::npm pack produced no tarball"
-            exit 1
-          fi
-          echo "Packed release tarball: ${tarball}"
+          # Name release artefact; the pack step has already
+          # constrained path_prefix to a safe relative path
           {
             echo "artefact_name=node-release-package${ARTIFACT_SUFFIX}"
             echo "artefact_path=${PATH_PREFIX}/pack-dist"
-            echo "tarball_name=${tarball}"
           } >> "$GITHUB_OUTPUT"
 
       - name: 'Upload build artefact'
