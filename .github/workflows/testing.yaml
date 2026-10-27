@@ -4095,6 +4095,27 @@ jobs:
               if tool_block(body) != tool_ref:
                   sys.exit(f'build_tool block in {path} diverged')
 
+          # So is the audit package manager block, from its default to
+          # the loop over the resolved tool's lockfiles
+          def audit_block(body):
+              lines = body.split('\n')
+              start = next(
+                  i for i, line in enumerate(lines)
+                  if line.startswith('case "${build_tool}" in')
+                  and lines[i + 1].lstrip().startswith('pnpm) audit_')
+              )
+              end = next(
+                  i for i, line in enumerate(lines[start:], start)
+                  if line == 'done'
+              )
+              return lines[start:end + 1]
+
+          audit_ref = audit_block(reference)
+          for path, body in bodies.items():
+              if audit_block(body) != audit_ref:
+                  sys.exit(f'audit package manager block in {path} '
+                           'diverged')
+
           sys.stdout.write(reference)
           EXTRACT
           # Fail loudly rather than silently testing nothing if the
@@ -4379,6 +4400,58 @@ jobs:
           check_tool 'multiline build_tool' reject \
             "$(printf 'npm\n::warning::forged')" ''
 
+          # The audit runs the resolved tool natively only beside that
+          # tool's own lockfile. $1 case, $2 the expected package
+          # manager, $3 the build tool, then the lockfiles path_prefix
+          # holds
+          check_audit() {
+            local name="$1" want="$2" tool="$3"
+            shift 3
+            local dir
+            dir="$(mktemp -d "${RUNNER_TEMP}/audit.XXXXXX")"
+            for lockfile in "$@"; do
+              : > "${dir}/${lockfile}"
+            done
+            : > "${RUNNER_TEMP}/vout.txt"
+            set +e
+            out="$(env NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+              TEST_NODE_VERSION_INPUT='' TEST_NODE_VERSIONS_INPUT='' \
+              BUILD_TOOL_INPUT="${tool}" DETECTED_PACKAGE_MANAGER='' \
+              DETECTED_REQUIRES_NODE='' PATH_PREFIX="${dir}" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/vout.txt" \
+              bash "${resolver}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${rc}" != "0" ]; then
+              echo "${name}: resolver failed unexpectedly ❌"
+              printf '%s\n' "${out}" | tail -2
+              errors=1
+              return
+            fi
+            got="$(grep '^audit_package_manager=' \
+              "${RUNNER_TEMP}/vout.txt" | cut -d= -f2-)"
+            if [ "${got}" != "${want}" ]; then
+              echo "${name}: audit got '${got}', expected '${want}' ❌"
+              errors=1
+            fi
+          }
+          check_audit 'pnpm, package-lock.json' npm pnpm package-lock.json
+          check_audit 'pnpm, pnpm-lock.yaml' pnpm pnpm pnpm-lock.yaml
+          check_audit 'pnpm, no lockfile' npm pnpm
+          check_audit 'yarn, package-lock.json' npm yarn package-lock.json
+          check_audit 'yarn, yarn.lock' yarn yarn yarn.lock
+          check_audit 'yarn-berry, pnpm-lock.yaml' npm yarn-berry \
+            pnpm-lock.yaml
+          check_audit 'yarn-berry, yarn.lock' yarn yarn-berry yarn.lock
+          check_audit 'bun, package-lock.json' npm bun package-lock.json
+          check_audit 'bun, bun.lock' bun bun bun.lock
+          check_audit 'bun, bun.lockb' bun bun bun.lockb
+          check_audit 'npm, yarn.lock' npm npm yarn.lock
+          check_audit 'npm, package-lock.json' npm npm package-lock.json
+          check_audit 'npm, npm-shrinkwrap.json' npm npm \
+            npm-shrinkwrap.json
+          check_audit 'npm, no lockfile' npm npm
+
           if [ "${errors}" != "0" ]; then
             echo "Node.js version resolution tests failed ❌" \
               >> "$GITHUB_STEP_SUMMARY"
@@ -4657,12 +4730,10 @@ jobs:
 
           import yaml
 
-          # Split so Actions leaves the expression unexpanded
-          outputs = 'needs.node-metadata.outputs.'
+          # Split so Actions leaves the expression unexpanded; the
+          # resolver test exercises the choice itself
           WANT = (
-              '$' '{{ ' + outputs + "has_lock_file != 'true' && 'npm'"
-              ' || ' + outputs + "build_tool == 'yarn-berry' && 'yarn'"
-              ' || ' + outputs + 'build_tool }}'
+              '$' '{{ needs.node-metadata.outputs.audit_package_manager }}'
           )
           errors = []
           for name in ('build-test.yaml', 'build-test-release.yaml'):

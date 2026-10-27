@@ -517,7 +517,7 @@ jobs:
       build_node_version: ${{ steps.resolve.outputs.build_node_version }}
       test_matrix: ${{ steps.resolve.outputs.test_matrix }}
       # yamllint disable-line rule:line-length
-      has_lock_file: ${{ steps.build-metadata.outputs.javascript_has_lock_file }}
+      audit_package_manager: ${{ steps.resolve.outputs.audit_package_manager }}
     permissions:
       contents: read
     timeout-minutes: 5
@@ -575,6 +575,7 @@ jobs:
           TEST_NODE_VERSION_INPUT: ${{ inputs.test_node_version }}
           TEST_NODE_VERSIONS_INPUT: ${{ inputs.test_node_versions }}
           BUILD_TOOL_INPUT: ${{ inputs.build_tool }}
+          PATH_PREFIX: ${{ inputs.path_prefix }}
           # yamllint disable-line rule:line-length
           DETECTED_PACKAGE_MANAGER: ${{ steps.build-metadata.outputs.javascript_package_manager }}
           # yamllint disable-line rule:line-length
@@ -626,6 +627,25 @@ jobs:
               exit 1
               ;;
           esac
+          # node-audit-action reads the lockfile of the tool it runs,
+          # so audit natively only when the resolved tool's own
+          # lockfile sits in path_prefix. Any other project, including
+          # one holding another tool's lockfile, keeps npm, whose
+          # audit synthesizes a lockfile when it lacks one.
+          case "${build_tool}" in
+            pnpm) audit_lockfiles=(pnpm-lock.yaml) ;;
+            yarn|yarn-berry) audit_lockfiles=(yarn.lock) ;;
+            bun) audit_lockfiles=(bun.lock bun.lockb) ;;
+            *) audit_lockfiles=(package-lock.json npm-shrinkwrap.json) ;;
+          esac
+          audit_package_manager='npm'
+          for lockfile in "${audit_lockfiles[@]}"; do
+            if [ -f "${PATH_PREFIX:-.}/${lockfile}" ]; then
+              # The action takes 'yarn' for Yarn classic and Berry alike
+              audit_package_manager="${build_tool/#yarn-berry/yarn}"
+              break
+            fi
+          done
           # Jobs that run the project's own toolchain can need a
           # different Node.js from the pack/publish jobs, which only
           # need a modern npm and never rebuild. A legacy dependency
@@ -743,12 +763,14 @@ jobs:
           test_matrix="[${test_matrix}]"
           echo "Resolved Node.js version: ${node_version}"
           echo "Resolved build tool: ${build_tool}"
+          echo "Audit package manager: ${audit_package_manager}"
           echo "Build toolchain Node.js version: ${build_node_version}"
           echo "Test Node.js version: ${test_node_version}"
           echo "Test matrix: ${test_matrix}"
           {
             echo "node_version=${node_version}"
             echo "build_tool=${build_tool}"
+            echo "audit_package_manager=${audit_package_manager}"
             echo "build_node_version=${build_node_version}"
             echo "test_node_version=${test_node_version}"
             echo "test_matrix=${test_matrix}"
@@ -1125,10 +1147,11 @@ jobs:
           # The project's own package manager, so the audit reads the
           # lockfile it installs from. The action detects Yarn Berry
           # from the lockfile itself and takes 'yarn' for both. A
-          # project without a lockfile keeps npm, whose audit
-          # synthesizes one; the other tools' audits need theirs.
+          # project without that tool's own lockfile keeps npm, whose
+          # audit synthesizes one; the other tools' audits need
+          # theirs. node-metadata resolves the choice.
           # yamllint disable-line rule:line-length
-          package_manager: ${{ needs.node-metadata.outputs.has_lock_file != 'true' && 'npm' || needs.node-metadata.outputs.build_tool == 'yarn-berry' && 'yarn' || needs.node-metadata.outputs.build_tool }}
+          package_manager: ${{ needs.node-metadata.outputs.audit_package_manager }}
           # The NO_BLOCK/soft-fail pattern: setting the
           # audit_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
           # repository variable (an org/repo-wide override that

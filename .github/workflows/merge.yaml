@@ -651,7 +651,7 @@ jobs:
       # yamllint disable-line rule:line-length
       build_node_version: ${{ steps.resolve.outputs.build_node_version }}
       # yamllint disable-line rule:line-length
-      has_lock_file: ${{ steps.build-metadata.outputs.javascript_has_lock_file }}
+      audit_package_manager: ${{ steps.resolve.outputs.audit_package_manager }}
     permissions:
       contents: read
     timeout-minutes: 5
@@ -707,6 +707,7 @@ jobs:
           NODE_VERSION_INPUT: ${{ inputs.node_version }}
           BUILD_NODE_VERSION_INPUT: ${{ inputs.build_node_version }}
           BUILD_TOOL_INPUT: ${{ inputs.build_tool }}
+          PATH_PREFIX: ${{ inputs.path_prefix }}
           # yamllint disable-line rule:line-length
           DETECTED_PACKAGE_MANAGER: ${{ steps.build-metadata.outputs.javascript_package_manager }}
           # yamllint disable-line rule:line-length
@@ -758,6 +759,25 @@ jobs:
               exit 1
               ;;
           esac
+          # node-audit-action reads the lockfile of the tool it runs,
+          # so audit natively only when the resolved tool's own
+          # lockfile sits in path_prefix. Any other project, including
+          # one holding another tool's lockfile, keeps npm, whose
+          # audit synthesizes a lockfile when it lacks one.
+          case "${build_tool}" in
+            pnpm) audit_lockfiles=(pnpm-lock.yaml) ;;
+            yarn|yarn-berry) audit_lockfiles=(yarn.lock) ;;
+            bun) audit_lockfiles=(bun.lock bun.lockb) ;;
+            *) audit_lockfiles=(package-lock.json npm-shrinkwrap.json) ;;
+          esac
+          audit_package_manager='npm'
+          for lockfile in "${audit_lockfiles[@]}"; do
+            if [ -f "${PATH_PREFIX:-.}/${lockfile}" ]; then
+              # The action takes 'yarn' for Yarn classic and Berry alike
+              audit_package_manager="${build_tool/#yarn-berry/yarn}"
+              break
+            fi
+          done
           # Jobs that run the project's own toolchain can need a
           # different Node.js from the pack/publish jobs, which only
           # need a modern npm and never rebuild. A legacy dependency
@@ -778,10 +798,12 @@ jobs:
           fi
           echo "Resolved Node.js version: ${node_version}"
           echo "Resolved build tool: ${build_tool}"
+          echo "Audit package manager: ${audit_package_manager}"
           echo "Build toolchain Node.js version: ${build_node_version}"
           {
             echo "node_version=${node_version}"
             echo "build_tool=${build_tool}"
+            echo "audit_package_manager=${audit_package_manager}"
             echo "build_node_version=${build_node_version}"
           } >> "$GITHUB_OUTPUT"
 

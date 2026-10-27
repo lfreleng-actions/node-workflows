@@ -570,8 +570,12 @@ lockfile does not fail the build. A build script named in
 
 The dependency audit runs the tool's own audit through
 `node-audit-action`: `npm audit`, `yarn audit`, `yarn npm audit`,
-`pnpm audit` or `bun audit`. Those read the tool's lockfile, so a
-project without a lockfile keeps the npm audit, which synthesises one.
+`pnpm audit` or `bun audit`. Those read the tool's lockfile, so the
+tool's own audit needs its lockfile in `path_prefix`:
+`pnpm-lock.yaml` for pnpm, `yarn.lock` for either Yarn, `bun.lock` or
+`bun.lockb` for Bun. A project without one, such as a pnpm project whose
+one lockfile is `package-lock.json`, keeps the npm audit, which
+synthesises a lockfile when it lacks one.
 
 Both release lanes pack the release tarball with the same tool, so
 `workspace:` and `catalog:` dependency specifiers become the versions
