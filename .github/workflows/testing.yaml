@@ -66,7 +66,7 @@ jobs:
       - name: 'Report fixture commit'
         id: fixture
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/test-node-project@4338be2a2271f1246c88207a907aa257f67a2594  # v0.2.0
+        uses: lfreleng-actions/test-node-project@3a90b600be1c9b9462f838b788fbdd5799365b8d  # v0.2.1
       # The pin must name a release of the canonical repository. GitHub
       # resolves a commit pushed to any fork through the parent too, so
       # the reported repository alone cannot prove that; requiring a
