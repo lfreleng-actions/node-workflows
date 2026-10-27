@@ -4095,6 +4095,27 @@ jobs:
               if tool_block(body) != tool_ref:
                   sys.exit(f'build_tool block in {path} diverged')
 
+          # So is the audit package manager block, from its default to
+          # the loop over the resolved tool's lockfiles
+          def audit_block(body):
+              lines = body.split('\n')
+              start = next(
+                  i for i, line in enumerate(lines)
+                  if line.startswith('case "${build_tool}" in')
+                  and lines[i + 1].lstrip().startswith('pnpm) audit_')
+              )
+              end = next(
+                  i for i, line in enumerate(lines[start:], start)
+                  if line == 'done'
+              )
+              return lines[start:end + 1]
+
+          audit_ref = audit_block(reference)
+          for path, body in bodies.items():
+              if audit_block(body) != audit_ref:
+                  sys.exit(f'audit package manager block in {path} '
+                           'diverged')
+
           sys.stdout.write(reference)
           EXTRACT
           # Fail loudly rather than silently testing nothing if the
@@ -4379,6 +4400,58 @@ jobs:
           check_tool 'multiline build_tool' reject \
             "$(printf 'npm\n::warning::forged')" ''
 
+          # The audit runs the resolved tool natively only beside that
+          # tool's own lockfile. $1 case, $2 the expected package
+          # manager, $3 the build tool, then the lockfiles path_prefix
+          # holds
+          check_audit() {
+            local name="$1" want="$2" tool="$3"
+            shift 3
+            local dir
+            dir="$(mktemp -d "${RUNNER_TEMP}/audit.XXXXXX")"
+            for lockfile in "$@"; do
+              : > "${dir}/${lockfile}"
+            done
+            : > "${RUNNER_TEMP}/vout.txt"
+            set +e
+            out="$(env NODE_VERSION_INPUT='' BUILD_NODE_VERSION_INPUT='' \
+              TEST_NODE_VERSION_INPUT='' TEST_NODE_VERSIONS_INPUT='' \
+              BUILD_TOOL_INPUT="${tool}" DETECTED_PACKAGE_MANAGER='' \
+              DETECTED_REQUIRES_NODE='' PATH_PREFIX="${dir}" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/vout.txt" \
+              bash "${resolver}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${rc}" != "0" ]; then
+              echo "${name}: resolver failed unexpectedly ❌"
+              printf '%s\n' "${out}" | tail -2
+              errors=1
+              return
+            fi
+            got="$(grep '^audit_package_manager=' \
+              "${RUNNER_TEMP}/vout.txt" | cut -d= -f2-)"
+            if [ "${got}" != "${want}" ]; then
+              echo "${name}: audit got '${got}', expected '${want}' ❌"
+              errors=1
+            fi
+          }
+          check_audit 'pnpm, package-lock.json' npm pnpm package-lock.json
+          check_audit 'pnpm, pnpm-lock.yaml' pnpm pnpm pnpm-lock.yaml
+          check_audit 'pnpm, no lockfile' npm pnpm
+          check_audit 'yarn, package-lock.json' npm yarn package-lock.json
+          check_audit 'yarn, yarn.lock' yarn yarn yarn.lock
+          check_audit 'yarn-berry, pnpm-lock.yaml' npm yarn-berry \
+            pnpm-lock.yaml
+          check_audit 'yarn-berry, yarn.lock' yarn yarn-berry yarn.lock
+          check_audit 'bun, package-lock.json' npm bun package-lock.json
+          check_audit 'bun, bun.lock' bun bun bun.lock
+          check_audit 'bun, bun.lockb' bun bun bun.lockb
+          check_audit 'npm, yarn.lock' npm npm yarn.lock
+          check_audit 'npm, package-lock.json' npm npm package-lock.json
+          check_audit 'npm, npm-shrinkwrap.json' npm npm \
+            npm-shrinkwrap.json
+          check_audit 'npm, no lockfile' npm npm
+
           if [ "${errors}" != "0" ]; then
             echo "Node.js version resolution tests failed ❌" \
               >> "$GITHUB_STEP_SUMMARY"
@@ -4657,12 +4730,10 @@ jobs:
 
           import yaml
 
-          # Split so Actions leaves the expression unexpanded
-          outputs = 'needs.node-metadata.outputs.'
+          # Split so Actions leaves the expression unexpanded; the
+          # resolver test exercises the choice itself
           WANT = (
-              '$' '{{ ' + outputs + "has_lock_file != 'true' && 'npm'"
-              ' || ' + outputs + "build_tool == 'yarn-berry' && 'yarn'"
-              ' || ' + outputs + 'build_tool }}'
+              '$' '{{ needs.node-metadata.outputs.audit_package_manager }}'
           )
           errors = []
           for name in ('build-test.yaml', 'build-test-release.yaml'):
@@ -4784,9 +4855,9 @@ jobs:
   # The release lanes pack with the project's own tool, so a pnpm
   # workspace package publishes resolved versions rather than
   # workspace:*. Neither release lane can run in CI, so this runs
-  # their shared Corepack and pack steps against the fixture's
-  # variants, after asserting the two workflows carry identical
-  # copies.
+  # their shared Corepack and pack steps, and merge.yaml's pnpm
+  # workspace link step, against the fixture's variants, after
+  # asserting the two workflows carry identical copies.
   release-pack:
     name: 'Test: release pack with the project tool'
     needs: node-fixture-ref
@@ -4857,6 +4928,43 @@ jobs:
               sys.exit('The pack steps in merge.yaml and '
                        'build-test-release.yaml diverged')
           corepack, _, pack = copies['merge.yaml']
+          # merge.yaml alone packs from the build artefact, which
+          # carries no node_modules, so it relinks a pnpm workspace
+          # between setting up pnpm and packing
+          with open('.github/workflows/merge.yaml') as handle:
+              merge_jobs = yaml.safe_load(handle)['jobs']
+          # That relink downloads what the build's install did, so
+          # pack-release takes the build's egress policy, which honours
+          # build_permit_egress_traffic; every other job ignores it
+          policies = {}
+          for job_name, job in merge_jobs.items():
+              for step in job.get('steps', []):
+                  if step.get('name') == 'Harden runner':
+                      policies[job_name] = step['with']['egress-policy']
+          for job_name in ('build', 'pack-release'):
+              if job_name not in policies:
+                  sys.exit(f'merge.yaml {job_name} lacks Harden runner')
+          if policies['pack-release'] != policies['build']:
+              sys.exit('merge.yaml pack-release and build use different '
+                       'egress policies')
+          permitted = sorted(job_name
+                             for job_name, policy in policies.items()
+                             if 'build_permit_egress_traffic' in policy)
+          if permitted != ['build', 'pack-release']:
+              sys.exit('merge.yaml applies build_permit_egress_traffic '
+                       'to ' + ', '.join(permitted) + '; expected build '
+                       'and pack-release alone')
+          steps = merge_jobs['pack-release']['steps']
+          names = [step.get('name') for step in steps]
+          link = 'Link pnpm workspace for packing'
+          if link not in names:
+              sys.exit(f'merge.yaml pack-release lacks {link}')
+          if not (names.index(SHARED[0]) < names.index(link)
+                  < names.index(SHARED[2])):
+              sys.exit(f'merge.yaml pack-release does not run {link} '
+                       'between setting up pnpm and packing')
+          with open(f'{out}/link.sh', 'w') as handle:
+              handle.write(steps[names.index(link)]['run'])
           with open(f'{out}/corepack.sh', 'w') as handle:
               handle.write(corepack['run'])
           with open(f'{out}/corepack-version', 'w') as handle:
@@ -4864,8 +4972,9 @@ jobs:
           with open(f'{out}/pack.sh', 'w') as handle:
               handle.write(pack['run'])
           EXTRACT
-          if ! grep -q 'pack-dist' "${RUNNER_TEMP}/pack.sh"; then
-            echo "Could not extract the pack step ❌"
+          if ! grep -q 'pack-dist' "${RUNNER_TEMP}/pack.sh" ||
+            ! grep -q 'frozen-lockfile' "${RUNNER_TEMP}/link.sh"; then
+            echo "Could not extract the pack steps ❌"
             echo "Update the extraction in this job to match"
             exit 1
           fi
@@ -4900,16 +5009,34 @@ jobs:
               GITHUB_OUTPUT="${RUNNER_TEMP}/pack-out.txt" \
               bash -eo pipefail "${RUNNER_TEMP}/pack.sh"
           }
+          # $1 path; runs merge.yaml's pnpm workspace link step
+          link() {
+            PATH_PREFIX="$1" COREPACK_BIN="${bin:-}" \
+              bash -eo pipefail "${RUNNER_TEMP}/link.sh"
+          }
           output() {
             grep "^$1=" "${RUNNER_TEMP}/pack-out.txt" | cut -d= -f2-
           }
 
           # A pnpm workspace member whose dependency on its sibling is
-          # workspace:*, installed at the workspace root first
+          # workspace:*, packed the way merge.yaml packs it: after the
+          # build artefact hand-off has dropped every node_modules.
+          # pnpm 10, unlike later releases, cannot resolve workspace:
+          # without the installed links, so pin it in this copy of the
+          # fixture.
           root='fixture/variants/pnpm-workspace'
           app="${root}/packages/app"
+          jq '.packageManager = "pnpm@10.34.6"' "${root}/package.json" \
+            > "${RUNNER_TEMP}/package.json"
+          mv "${RUNNER_TEMP}/package.json" "${root}/package.json"
           setup pnpm "${app}"
+          if [[ "$(cd "${app}" && "${bin}/pnpm" --version)" != 10.* ]]; then
+            fail "pnpm: the fixture copy does not run pnpm 10"
+          fi
           (cd "${root}" && "${bin}/pnpm" install --ignore-scripts)
+          find "${root}" -name node_modules -type d -prune \
+            -exec rm -rf {} +
+          link "${app}"
           pack pnpm "${app}"
           tarball="$(output tarball_name)"
           sha256="$(output tarball_sha256)"
@@ -4965,6 +5092,21 @@ jobs:
           if [ "${rc}" = '0' ] ||
             ! printf '%s' "${out}" | grep -q '^::error::'; then
             fail "Corepack step accepted yarn-berry without packageManager"
+          fi
+          # Relinking needs the lockfile the build left; without it a
+          # frozen install cannot run, so the step refuses
+          rm "${root}/pnpm-lock.yaml"
+          set +e
+          out="$(link "${app}" 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" = '0' ] ||
+            ! printf '%s' "${out}" | grep -q '^::error::'; then
+            fail "Link step accepted a pnpm workspace without a lockfile"
+          fi
+          # A package outside any pnpm workspace has nothing to link
+          if ! link 'fixture/variants/bun' > /dev/null; then
+            fail "Link step failed outside a pnpm workspace"
           fi
           set +e
           out="$(bin='' pack deno 'fixture/variants/bun' 2>&1)"
