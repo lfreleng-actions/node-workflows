@@ -4346,3 +4346,99 @@ jobs:
           fi
           echo "Node.js version wiring correct ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  # The workflows hand the resolved build tool to node-build-action,
+  # node-audit-action and their own pack steps. None of those reach
+  # the build-test self-test's job outputs, so the wiring is asserted
+  # from the workflow files themselves.
+  package-managers:
+    name: 'Test: package manager support'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # node-build-action v0.3.0 made frozen installs its default.
+      # Until #143 decides otherwise, every call keeps resolving
+      # installs, and every call has to use the same pin.
+      - name: 'Assert node-build-action wiring'
+        shell: bash
+        run: |
+          # Assert node-build-action wiring
+          if ! python3 - <<'PY'
+          import sys
+
+          import yaml
+
+          EXPECTED = {
+              ('build-test.yaml', 'build', 'Build project'),
+              ('build-test.yaml', 'tests', 'Run tests'),
+              ('build-test-release.yaml', 'build', 'Build project'),
+              ('build-test-release.yaml', 'tests', 'Run tests'),
+              ('merge.yaml', 'build', 'Build project'),
+          }
+          found = {}
+          for name in (
+              'build-test.yaml',
+              'build-test-release.yaml',
+              'merge.yaml',
+          ):
+              with open(f'.github/workflows/{name}') as handle:
+                  doc = yaml.safe_load(handle)
+              for job_id, job in doc['jobs'].items():
+                  for step in job.get('steps') or []:
+                      uses = str(step.get('uses', ''))
+                      if uses.startswith(
+                          'lfreleng-actions/node-build-action@'
+                      ):
+                          key = (name, job_id, step.get('name'))
+                          found[key] = step
+
+          errors = []
+          for key in sorted(EXPECTED ^ found.keys()):
+              where = '/'.join(key)
+              if key in EXPECTED:
+                  errors.append(f'{where} no longer calls node-build-action')
+              else:
+                  errors.append(f'{where} calls node-build-action but is '
+                                'absent from the table in this step')
+          pins = {step['uses'] for step in found.values()}
+          if len(pins) != 1:
+              errors.append('node-build-action pins differ: '
+                            + ', '.join(sorted(pins)))
+          for key, step in sorted(found.items()):
+              mode = (step.get('with') or {}).get('install_mode')
+              if mode != 'install':
+                  errors.append(f'{"/".join(key)} passes install_mode '
+                                f'{mode!r}, expected \'install\'')
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('node-build-action wiring incorrect ❌')
+          print(f'node-build-action wiring correct ✅ ({len(found)} sites)')
+          PY
+          then
+            echo "node-build-action wiring incorrect ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "node-build-action wiring correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
