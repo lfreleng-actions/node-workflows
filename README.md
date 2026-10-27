@@ -469,36 +469,37 @@ All `build-test.yaml` inputs above except `grype_gate_when` (with
 
 <!-- markdownlint-disable MD013 -->
 
-| Input                      | Type    | Default      | Description                                                                                                                      |
-| -------------------------- | ------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| `repository`               | string  | `''`         | Repository to check out (owner/name); empty uses the caller                                                                      |
-| `ref`                      | string  | `''`         | Checkout ref (empty = event ref; other repos: default branch)                                                                    |
-| `path_prefix`              | string  | `'.'`        | Path to the project root directory                                                                                               |
-| `node_version`             | string  | `''`         | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
-| `build_node_version`       | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
-| `build_tool`               | string  | `''`         | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                                                                 |
-| `build_scripts`            | string  | `'build'`    | package.json script(s) the build job runs                                                                                        |
-| `attestations`             | boolean | `true`       | SLSA build provenance for the packed release tarball (release publishes)                                                         |
-| `sigstore_sign`            | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
-| `sbom_enabled`             | boolean | `true`       | Generate the release SBOM (`sbom-files-node-merge` artefact); a failure blocks the release publish                               |
-| `grype_enabled`            | boolean | `true`       | Run the informational Grype scan over the release SBOM; never fails the run                                                      |
-| `snapshot_targets`         | string  | `''`         | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
-| `release_targets`          | string  | `''`         | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
-| `snapshot_registry_url`    | string  | `''`         | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
-| `release_registry_url`     | string  | `''`         | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
-| `nexus_user`               | string  | `''`         | Nexus username override; empty derives it from the repository name                                                               |
-| `snapshot_dist_tag`        | string  | `'snapshot'` | npm dist-tag for snapshot publishes; never `latest`, which must name the newest release                                          |
-| `snapshot_environment`     | string  | `''`         | GitHub environment gating the snapshot publish jobs; empty uses none                                                             |
-| `release_environment`      | string  | `''`         | GitHub environment gating the release publish jobs, e.g. one requiring a reviewer; empty uses none                               |
-| `dry_run`                  | boolean | `false`      | Rehearse publishing without uploading; needs no secrets, and skips attestation and signing                                       |
-| `release_only`             | boolean | `false`      | Recovery: publish the release and skip the snapshot; see [Re-running a Release](#re-running-a-release)                           |
-| `harden_runner_egress`     | string  | `'block'`    | Harden-runner egress policy: `block` or `audit`                                                                                  |
-| `harden_runner_allowlist`  | string  | (pinned)     | Out-of-band harden-runner allow-list configuration                                                                               |
-| `gerrit_refspec`           | string  | `''`         | Gerrit refspec: the branch ref, or a merged change's ref to re-run it; resolved once for every job                               |
-| `gerrit_patchset_revision` | string  | `''`         | Triggering change revision (`GERRIT_PATCHSET_REVISION`); pins the run to the commit that merged it                               |
-| `gerrit_project`           | string  | `''`         | Gerrit project name                                                                                                              |
-| `gerrit_branch`            | string  | `''`         | Gerrit target branch                                                                                                             |
-| `gerrit_url`               | string  | `''`         | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                                                                 |
+| Input                         | Type    | Default      | Description                                                                                                                      |
+| ----------------------------- | ------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `repository`                  | string  | `''`         | Repository to check out (owner/name); empty uses the caller                                                                      |
+| `ref`                         | string  | `''`         | Checkout ref (empty = event ref; other repos: default branch)                                                                    |
+| `path_prefix`                 | string  | `'.'`        | Path to the project root directory                                                                                               |
+| `node_version`                | string  | `''`         | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
+| `build_node_version`          | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
+| `build_tool`                  | string  | `''`         | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                                                                 |
+| `build_scripts`               | string  | `'build'`    | package.json script(s) the build job runs                                                                                        |
+| `attestations`                | boolean | `true`       | SLSA build provenance for the packed release tarball (release publishes)                                                         |
+| `sigstore_sign`               | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
+| `sbom_enabled`                | boolean | `true`       | Generate the release SBOM (`sbom-files-node-merge` artefact); a failure blocks the release publish                               |
+| `grype_enabled`               | boolean | `true`       | Run the informational Grype scan over the release SBOM; never fails the run                                                      |
+| `snapshot_targets`            | string  | `''`         | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
+| `release_targets`             | string  | `''`         | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
+| `snapshot_registry_url`       | string  | `''`         | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
+| `release_registry_url`        | string  | `''`         | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
+| `nexus_user`                  | string  | `''`         | Nexus username override; empty derives it from the repository name                                                               |
+| `snapshot_dist_tag`           | string  | `'snapshot'` | npm dist-tag for snapshot publishes; never `latest`, which must name the newest release                                          |
+| `snapshot_environment`        | string  | `''`         | GitHub environment gating the snapshot publish jobs; empty uses none                                                             |
+| `release_environment`         | string  | `''`         | GitHub environment gating the release publish jobs, e.g. one requiring a reviewer; empty uses none                               |
+| `dry_run`                     | boolean | `false`      | Rehearse publishing without uploading; needs no secrets, and skips attestation and signing                                       |
+| `release_only`                | boolean | `false`      | Recovery: publish the release and skip the snapshot; see [Re-running a Release](#re-running-a-release)                           |
+| `harden_runner_egress`        | string  | `'block'`    | Harden-runner egress policy: `block` or `audit`                                                                                  |
+| `build_permit_egress_traffic` | boolean | `false`      | Audit egress for the `build` and `pack-release` jobs alone, for dependency CDNs; `pack-release` reinstalls a pnpm workspace      |
+| `harden_runner_allowlist`     | string  | (pinned)     | Out-of-band harden-runner allow-list configuration                                                                               |
+| `gerrit_refspec`              | string  | `''`         | Gerrit refspec: the branch ref, or a merged change's ref to re-run it; resolved once for every job                               |
+| `gerrit_patchset_revision`    | string  | `''`         | Triggering change revision (`GERRIT_PATCHSET_REVISION`); pins the run to the commit that merged it                               |
+| `gerrit_project`              | string  | `''`         | Gerrit project name                                                                                                              |
+| `gerrit_branch`               | string  | `''`         | Gerrit target branch                                                                                                             |
+| `gerrit_url`                  | string  | `''`         | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                                                                 |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -588,7 +589,13 @@ apply:
   artefact, which holds the `path_prefix` tree alone. A workspace
   member whose workspace root lies above `path_prefix` cannot resolve
   `workspace:` there, and the pack fails. `build-test-release.yaml`
-  packs in the full checkout, so it can release such a package.
+  packs in the full checkout, so it can release such a package. The
+  artefact also leaves `node_modules` behind, which pnpm 10 needs to
+  resolve `workspace:`, so for a pnpm workspace `pack-release` first
+  runs `pnpm install --frozen-lockfile --ignore-scripts` at the
+  workspace root, from the `pnpm-lock.yaml` the build left. That
+  install downloads what the build's did, so `pack-release` honours
+  `build_permit_egress_traffic` as the `build` job does.
 - The snapshot lane publishes through `node-publish-action`, which
   packs with npm and leaves those specifiers in place. For a pnpm,
   Yarn Berry or Bun project whose `package.json` uses `workspace:` or

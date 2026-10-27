@@ -230,11 +230,13 @@ on:
         default: 'block'
       build_permit_egress_traffic:
         description: >
-          Run harden-runner in audit mode for the build job only,
-          permitting unrestricted egress. Use when the build fetches
-          dependencies from CDNs that are impractical to enumerate in the
-          allow-list. Other jobs stay governed by harden_runner_egress;
-          left unset, the build job follows it too.
+          Run harden-runner in audit mode for the build and pack-release
+          jobs only, permitting unrestricted egress. Use when the build
+          fetches dependencies from CDNs that are impractical to
+          enumerate in the allow-list; pack-release reinstalls a pnpm
+          workspace's dependencies before packing, so it needs the same
+          access. Other jobs stay governed by harden_runner_egress; left
+          unset, both jobs follow it too.
         required: false
         type: boolean
         default: false
@@ -966,6 +968,8 @@ jobs:
       # The build job can opt into audit egress independently of the
       # other jobs via build_permit_egress_traffic, for dependency
       # fetches from CDNs impractical to enumerate in the allow-list.
+      # pack-release shares this policy, since it reinstalls a pnpm
+      # workspace's dependencies; testing.yaml asserts they match.
       # Left unset it follows harden_runner_egress like every other job.
       #
       # One harden-runner step with the policy computed, rather than
@@ -1032,8 +1036,9 @@ jobs:
       # or re-checking-out: the project builds once, and the exact
       # built tree (including gitignored build output such as lib/ or
       # dist/, which a fresh checkout would lack) is what publishes.
-      # node_modules stays behind: npm pack excludes it and the
-      # publish jobs run no install. Hidden files (.npmignore,
+      # node_modules stays behind: npm pack excludes it, and the
+      # publish jobs run no install; pack-release relinks a pnpm
+      # workspace from its lockfile. Hidden files (.npmignore,
       # .npmrc templates) ship so npm packs the intended content.
       - name: 'Upload built project'
         # yamllint disable-line rule:line-length
@@ -2268,6 +2273,9 @@ jobs:
     # Headroom for the SBOM step's syft download and scan
     timeout-minutes: 15
     steps:
+      # The same policy as the build job's: the pnpm workspace relink
+      # below downloads the dependencies the build's install fetched,
+      # so build_permit_egress_traffic covers it too.
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
@@ -2279,7 +2287,7 @@ jobs:
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           # yamllint disable-line rule:line-length
-          egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
+          egress-policy: ${{ (inputs.build_permit_egress_traffic || inputs.harden_runner_egress == 'audit') && 'audit' || 'block' }}
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
@@ -2349,9 +2357,9 @@ jobs:
       # npm does not rewrite workspace: or catalog: specifiers, so a
       # pnpm, Yarn Berry or Bun project packs with its own tool, or
       # the published manifest names versions nobody can install.
-      # This job installs nothing and holds only the path_prefix
-      # tree, so a member package whose workspace root lies outside
-      # it cannot resolve those specifiers, and the pack fails.
+      # This job holds only the path_prefix tree, so a member package
+      # whose workspace root lies outside it cannot resolve those
+      # specifiers, and the pack fails.
       # These steps are identical copies of the build job's in
       # build-test-release.yaml, which testing.yaml asserts.
       - name: 'Set up Corepack for packing'
@@ -2424,6 +2432,55 @@ jobs:
           no-cache: true
           # An exact version needs no GitHub API lookup, so no token
           token: ''
+
+      # pnpm 10 resolves a workspace: specifier through the installed
+      # link to the sibling package, and the build artefact leaves
+      # every node_modules behind, so the pack fails with
+      # ERR_PNPM_CANNOT_RESOLVE_WORKSPACE_PROTOCOL. Restore the links
+      # with a frozen install at the workspace root, from the lockfile
+      # the build left in the artefact. Scripts stay off: nothing
+      # here rebuilds, and the pack takes no node_modules content.
+      # build-test-release.yaml packs in its build job, where the
+      # build's own install is still present, so needs no such step.
+      - name: 'Link pnpm workspace for packing'
+        if: needs.node-metadata.outputs.build_tool == 'pnpm'
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          COREPACK_BIN: ${{ steps.corepack.outputs.bin }}
+        run: |
+          # Link pnpm workspace for packing
+          if [[ ! "${PATH_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || [[ "${PATH_PREFIX}" =~ (^|/)\.\.(/|$) ]]; then
+            echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
+            exit 1
+          fi
+          # The nearest workspace root at or above path_prefix, within
+          # the job's working directory
+          root=''
+          dir="${PATH_PREFIX}"
+          while :; do
+            if [ -f "${dir}/pnpm-workspace.yaml" ]; then
+              root="${dir}"
+              break
+            fi
+            if [ "${dir}" = '.' ]; then
+              break
+            fi
+            dir="$(dirname "${dir}")"
+          done
+          if [ -z "${root}" ]; then
+            echo "No pnpm workspace holds ${PATH_PREFIX}; nothing to link"
+            exit 0
+          fi
+          if [ ! -f "${root}/pnpm-lock.yaml" ]; then
+            echo "::error::pnpm workspace ${root} has no pnpm-lock.yaml;" \
+              "cannot link its packages for packing"
+            exit 1
+          fi
+          cd "${root}"
+          "${COREPACK_BIN}/pnpm" install --frozen-lockfile --ignore-scripts
+          echo "Linked pnpm workspace ${root} for packing"
 
       # The archive is the release artefact: attest and sign-artefacts
       # cover it, and the publish job hands it to npm rather than
