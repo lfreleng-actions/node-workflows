@@ -272,7 +272,9 @@ jobs:
     if: ${{ !cancelled() }}
     permissions:
       actions: read  # list this run's jobs and download its artefacts
-    timeout-minutes: 5
+    # Four job listings at up to 90s each with retries, three artefact
+    # listings at up to 45s each, plus downloads and runner hardening
+    timeout-minutes: 10
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
@@ -284,6 +286,36 @@ jobs:
           egress-policy: 'block'
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # The steps below source this helper for their read-only listings,
+      # so one transient 5xx cannot fail the job. It buffers each
+      # attempt and prints only a complete one, so a page that failed
+      # mid-pagination is never half-printed; after the third failure
+      # it returns non-zero, having shown gh's own error each time.
+      # Worst case per call: three attempts plus 15s of backoff.
+      - name: 'Define gh_api retry helper'
+        shell: bash
+        run: |
+          # Define gh_api retry helper
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/gh-api.sh" << 'EOF'
+          gh_api() {
+            local attempt delay out
+            for attempt in 1 2 3; do
+              if out="$(gh api "$@")"; then
+                printf '%s\n' "${out}"
+                return 0
+              fi
+              if [ "${attempt}" -eq 3 ]; then
+                return 1
+              fi
+              delay="$((attempt * 5))"
+              echo "::warning::gh api failed, attempt ${attempt} of 3;" \
+                "retrying in ${delay}s" >&2
+              sleep "${delay}"
+            done
+          }
+          EOF
 
       # A called workflow's job verdicts never reach the caller, so
       # read them from the run. Both legs keep audit and Grype at
@@ -305,8 +337,12 @@ jobs:
           set -euo pipefail
           status=0
           fail() { echo "::error::$1"; status=1; }
+          # shellcheck source=/dev/null
+          . "${RUNNER_TEMP}/gh-api.sh"
           api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
-          jobs="$(gh api --paginate "${api}/jobs?filter=latest&per_page=100" \
+          # Small pages: each job carries its steps, and a page of 100
+          # outruns the API gateway timeout and answers 502
+          jobs="$(gh_api --paginate "${api}/jobs?filter=latest&per_page=30" \
             --jq '.jobs[] | [.name, (.conclusion // .status)] | @tsv')"
           for leg in ${LEGS}; do
             for job in 'Audit' 'Grype Audit SBOM'; do
@@ -342,10 +378,14 @@ jobs:
           set -euo pipefail
           status=0
           fail() { echo "::error::$1"; status=1; }
+          # shellcheck source=/dev/null
+          . "${RUNNER_TEMP}/gh-api.sh"
           api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
           # One row per job: its name, verdict and the verdict of its
           # 'Lint project' step, or 'absent' when it has no such step
-          jobs="$(gh api --paginate "${api}/jobs?filter=latest&per_page=100" \
+          # Small pages: each job carries its steps, and a page of 100
+          # outruns the API gateway timeout and answers 502
+          jobs="$(gh_api --paginate "${api}/jobs?filter=latest&per_page=30" \
             --jq '.jobs[] | [.name, (.conclusion // .status),
               ([.steps[]? | select(.name == "Lint project")
                 | (.conclusion // .status)] | first // "absent")] | @tsv')"
@@ -393,8 +433,12 @@ jobs:
           set -euo pipefail
           status=0
           fail() { echo "::error::$1"; status=1; }
+          # shellcheck source=/dev/null
+          . "${RUNNER_TEMP}/gh-api.sh"
           api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
-          jobs="$(gh api --paginate "${api}/jobs?filter=latest&per_page=100" \
+          # Small pages: each job carries its steps, and a page of 100
+          # outruns the API gateway timeout and answers 502
+          jobs="$(gh_api --paginate "${api}/jobs?filter=latest&per_page=30" \
             --jq '.jobs[] | [.name, (.conclusion // .status)] | @tsv')"
           for leg in ${LEGS}; do
             for job in 'Node.js Build' 'Tests'; do
@@ -408,7 +452,7 @@ jobs:
               fi
             done
           done
-          uploads="$(gh api --paginate "${api}/artifacts?per_page=100" \
+          uploads="$(gh_api --paginate "${api}/artifacts?per_page=100" \
             --jq '.artifacts[] | select(.expired | not) | .name')"
           for leg in ${OUTPUTS}; do
             if grep -qxF "node-build-output-${leg}" <<< "${uploads}"; then
@@ -439,14 +483,18 @@ jobs:
           set -euo pipefail
           status=0
           fail() { echo "::error::$1"; status=1; }
+          # shellcheck source=/dev/null
+          . "${RUNNER_TEMP}/gh-api.sh"
           api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
           # Keep the prefix in step with the grype job's download step
-          scans="$(gh api --paginate "${api}/jobs?filter=latest&per_page=100" \
+          # Small pages: each job carries its steps, and a page of 100
+          # outruns the API gateway timeout and answers 502
+          scans="$(gh_api --paginate "${api}/jobs?filter=latest&per_page=30" \
             --jq '.jobs[] | [.name] + [.steps[]? | .name
                 | select(startswith("Download SBOM artefact "))
                 | ltrimstr("Download SBOM artefact ")]
               | select(length > 1) | @tsv')"
-          uploads="$(gh api --paginate "${api}/artifacts?per_page=100" \
+          uploads="$(gh_api --paginate "${api}/artifacts?per_page=100" \
             --jq '.artifacts[] | select(.expired | not)
               | select(.name | startswith("sbom-files-"))
               | [.name, (.id | tostring)] | @tsv')"
@@ -481,12 +529,14 @@ jobs:
         run: |
           # Download build-test artefacts
           set -euo pipefail
+          # shellcheck source=/dev/null
+          . "${RUNNER_TEMP}/gh-api.sh"
           api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
           # Each leg suffixes its artefacts, and a tests matrix
           # suffixes node-test-results again per version
           # (node-test-results-node-22-test-node-project), so match
           # the families by name rather than asking for exact names
-          artefacts="$(gh api --paginate "${api}/artifacts?per_page=100" \
+          artefacts="$(gh_api --paginate "${api}/artifacts?per_page=100" \
             --jq '.artifacts[] | select(.expired | not)
               | select(.name | test("^(sbom-files|node-test-results)(-|$)"))
               | "\(.name) \(.id)"')"
