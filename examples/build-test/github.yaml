@@ -52,6 +52,9 @@ jobs:
     #   build_scripts: 'build'        # package.json build script(s)
     #   test_script: 'test'           # package.json test script
     #   test_permit_fail: false       # soft-fail tests
+    #   lint_enabled: true            # false skips the lint job
+    #   lint_hooks: ''                # empty runs the ci.skip hooks
+    #   lint_permit_fail: false       # soft-fail lint
     #   audit_level: 'low'            # npm audit severity gate
     #   production_only: false        # audit production dependencies only
     #   audit_permit_fail: false      # soft-fail dependency audit
