@@ -1953,7 +1953,7 @@ jobs:
         id: read-npmrc
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-create-npmrc-action@e0ff8adfc0591c86d8d07828bffab10f43096155  # v0.2.0
+        uses: lfreleng-actions/node-create-npmrc-action@19f8a252515c4fd850fd0edbdd7ff9ccf7f9f03c  # v0.2.1
         with:
           registry_url: ${{ matrix.target.registry_url }}
           nexus_user: ${{ steps.publish-params.outputs.nexus_user }}
