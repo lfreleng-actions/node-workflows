@@ -335,46 +335,49 @@ it with `dry_run: true` to rehearse first.
 
 <!-- markdownlint-disable MD013 -->
 
-| Input                     | Type    | Default    | Description                                                                    |
-| ------------------------- | ------- | ---------- | ------------------------------------------------------------------------------ |
-| `repository`              | string  | `''`       | Repository to check out (owner/name); empty uses the caller                    |
-| `ref`                     | string  | `''`       | Checkout ref (empty = event ref; other repos: default branch)                  |
-| `path_prefix`             | string  | `'.'`      | Path to the project root directory                                             |
-| `node_version`            | string  | `''`       | Node.js version; empty auto-detects `engines.node`, then 22                    |
-| `build_node_version`      | string  | `''`       | Node.js for jobs running the project's toolchain; empty follows `node_version` |
-| `test_node_version`       | string  | `''`       | Node.js for the tests job; empty follows `node_version`                        |
-| `test_node_versions`      | string  | `''`       | Node.js versions to test on, one leg each; JSON array or list, at most 10      |
-| `build_tool`              | string  | `''`       | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects               |
-| `build_scripts`           | string  | `'build'`  | package.json script(s) the build job runs                                      |
-| `lockfile_required`       | boolean | `false`    | Require the build tool's lockfile; see [Lockfiles](#lockfiles)                 |
-| `tests_enabled`           | boolean | `true`     | Run the tests job (set false to skip tests)                                    |
-| `test_script`             | string  | `'test'`   | package.json test script(s); comma/space/newline separated list                |
-| `test_permit_fail`        | boolean | `false`    | Permit test failures without failing the workflow                              |
-| `test_artifact_path`      | string  | `''`       | Test output/report path uploaded as an artefact; empty disables                |
-| `junit_report_path`       | string  | `''`       | JUnit XML glob summarised in the tests job and uploaded; empty disables        |
-| `coverage_path`           | string  | `''`       | `lcov.info`/`coverage-summary.json` (or their directory) summarised and kept   |
-| `artifact_suffix`         | string  | `''`       | Appended to every artefact name; give each call in one run its own             |
-| `lint_enabled`            | boolean | `true`     | Run the lint job (set false to skip); see [Lint](#lint)                        |
-| `lint_hooks`              | string  | `''`       | Hook ids or aliases to lint with; empty runs the configuration's `ci.skip`     |
-| `lint_permit_fail`        | boolean | `false`    | Permit lint failures without failing the workflow                              |
-| `audit_enabled`           | boolean | `true`     | Run the dependency audit job (set false to skip)                               |
-| `audit_level`             | string  | `'high'`   | npm audit severity threshold that fails the audit                              |
-| `production_only`         | boolean | `false`    | Restrict the audit to production dependencies                                  |
-| `audit_permit_fail`       | boolean | `false`    | Permit dependency audit failures (the NO_BLOCK pattern)                        |
-| `sbom_enabled`            | boolean | `true`     | Generate an SBOM (set false to skip; Grype then has nothing to scan)           |
-| `grype_enabled`           | boolean | `true`     | Run the Grype scan (set false to keep the SBOM but skip the scan)              |
-| `grype_fail_on`           | string  | `'medium'` | Severity threshold that fails the Grype scan                                   |
-| `grype_permit_fail`       | boolean | `false`    | Permit Grype findings without failing the job                                  |
-| `grype_gate_when`         | string  | `'always'` | `always`, or `dependencies-changed`; see [Grype gating](#grype-gating)         |
-| `build_timeout_minutes`   | number  | `15`       | Timeout (minutes) for the build job                                            |
-| `test_timeout_minutes`    | number  | `10`       | Timeout (minutes) for the tests and lint jobs                                  |
-| `audit_timeout_minutes`   | number  | `10`       | Timeout (minutes) for the audit, SBOM and Grype jobs                           |
-| `harden_runner_egress`    | string  | `'block'`  | Harden-runner egress policy: `block` or `audit`                                |
-| `harden_runner_allowlist` | string  | (pinned)   | Out-of-band harden-runner allow-list configuration                             |
-| `gerrit_refspec`          | string  | `''`       | Gerrit refspec of the change under test                                        |
-| `gerrit_project`          | string  | `''`       | Gerrit project name                                                            |
-| `gerrit_branch`           | string  | `''`       | Gerrit target branch                                                           |
-| `gerrit_url`              | string  | `''`       | Gerrit server URL; empty falls back to the `GERRIT_URL` variable               |
+| Input                                  | Type    | Default    | Description                                                                            |
+| -------------------------------------- | ------- | ---------- | -------------------------------------------------------------------------------------- |
+| `repository`                           | string  | `''`       | Repository to check out (owner/name); empty uses the caller                            |
+| `ref`                                  | string  | `''`       | Checkout ref (empty = event ref; other repos: default branch)                          |
+| `path_prefix`                          | string  | `'.'`      | Path to the project root directory                                                     |
+| `node_version`                         | string  | `''`       | Node.js version; empty auto-detects `engines.node`, then 22                            |
+| `build_node_version`                   | string  | `''`       | Node.js for jobs running the project's toolchain; empty follows `node_version`         |
+| `test_node_version`                    | string  | `''`       | Node.js for the tests job; empty follows `node_version`                                |
+| `test_node_versions`                   | string  | `''`       | Node.js versions to test on, one leg each; JSON array or list, at most 10              |
+| `build_tool`                           | string  | `''`       | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                       |
+| `build_scripts`                        | string  | `'build'`  | package.json script(s) the build job runs                                              |
+| `lockfile_required`                    | boolean | `false`    | Require the build tool's lockfile; see [Lockfiles](#lockfiles)                         |
+| `tests_enabled`                        | boolean | `true`     | Run the tests job (set false to skip tests)                                            |
+| `test_script`                          | string  | `'test'`   | package.json test script(s); comma/space/newline separated list                        |
+| `test_permit_fail`                     | boolean | `false`    | Permit test failures without failing the workflow                                      |
+| `test_artifact_path`                   | string  | `''`       | Test output/report path uploaded as an artefact; empty disables                        |
+| `junit_report_path`                    | string  | `''`       | JUnit XML glob summarised in the tests job and uploaded; empty disables                |
+| `coverage_path`                        | string  | `''`       | `lcov.info`/`coverage-summary.json` (or their directory) summarised and kept           |
+| `artifact_suffix`                      | string  | `''`       | Appended to every artefact name; give each call in one run its own                     |
+| `lint_enabled`                         | boolean | `true`     | Run the lint job (set false to skip); see [Lint](#lint)                                |
+| `lint_hooks`                           | string  | `''`       | Hook ids or aliases to lint with; empty runs the configuration's `ci.skip`             |
+| `lint_permit_fail`                     | boolean | `false`    | Permit lint failures without failing the workflow                                      |
+| `audit_enabled`                        | boolean | `true`     | Run the dependency audit job (set false to skip)                                       |
+| `audit_level`                          | string  | `'high'`   | npm audit severity threshold that fails the audit                                      |
+| `production_only`                      | boolean | `false`    | Restrict the audit to production dependencies                                          |
+| `audit_permit_fail`                    | boolean | `false`    | Permit dependency audit failures (the NO_BLOCK pattern)                                |
+| `sbom_enabled`                         | boolean | `true`     | Generate an SBOM (set false to skip; Grype then has nothing to scan)                   |
+| `grype_enabled`                        | boolean | `true`     | Run the Grype scan (set false to keep the SBOM but skip the scan)                      |
+| `grype_fail_on`                        | string  | `'medium'` | Severity threshold that fails the Grype scan                                           |
+| `grype_permit_fail`                    | boolean | `false`    | Permit Grype findings without failing the job                                          |
+| `grype_gate_when`                      | string  | `'always'` | `always`, or `dependencies-changed`; see [Grype gating](#grype-gating)                 |
+| `build_timeout_minutes`                | number  | `15`       | Timeout (minutes) for the build job                                                    |
+| `test_timeout_minutes`                 | number  | `10`       | Timeout (minutes) for the tests and lint jobs                                          |
+| `audit_timeout_minutes`                | number  | `10`       | Timeout (minutes) for the audit, SBOM and Grype jobs                                   |
+| `harden_runner_egress`                 | string  | `'block'`  | Harden-runner egress policy: `block` or `audit`                                        |
+| `harden_runner_allowlist`              | string  | (pinned)   | Out-of-band harden-runner allow-list configuration                                     |
+| `harden_runner_supplemental_allowlist` | string  | `''`       | Extra allow-list merged with the baseline; see [Egress allow-list](#egress-allow-list) |
+| `harden_runner_supplemental_unpinned`  | boolean | `false`    | Let a supplemental list in the caller's organisation follow its default branch         |
+| `harden_runner_extra_endpoints`        | string  | `''`       | Inline `host[:port]` endpoints for a short-term fix                                    |
+| `gerrit_refspec`                       | string  | `''`       | Gerrit refspec of the change under test                                                |
+| `gerrit_project`                       | string  | `''`       | Gerrit project name                                                                    |
+| `gerrit_branch`                        | string  | `''`       | Gerrit target branch                                                                   |
+| `gerrit_url`                           | string  | `''`       | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                       |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -503,38 +506,41 @@ All `build-test.yaml` inputs above except `grype_gate_when` (with
 
 <!-- markdownlint-disable MD013 -->
 
-| Input                         | Type    | Default      | Description                                                                                                                      |
-| ----------------------------- | ------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| `repository`                  | string  | `''`         | Repository to check out (owner/name); empty uses the caller                                                                      |
-| `ref`                         | string  | `''`         | Checkout ref (empty = event ref; other repos: default branch)                                                                    |
-| `path_prefix`                 | string  | `'.'`        | Path to the project root directory                                                                                               |
-| `node_version`                | string  | `''`         | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
-| `build_node_version`          | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
-| `build_tool`                  | string  | `''`         | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                                                                 |
-| `build_scripts`               | string  | `'build'`    | package.json script(s) the build job runs                                                                                        |
-| `lockfile_required`           | boolean | `true`       | Require the build tool's lockfile and install from it frozen; see [Lockfiles](#lockfiles)                                        |
-| `attestations`                | boolean | `true`       | SLSA build provenance for the packed release tarball (release publishes)                                                         |
-| `sigstore_sign`               | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
-| `sbom_enabled`                | boolean | `true`       | Generate the release SBOM (`sbom-files-node-merge` artefact); a failure blocks the release publish                               |
-| `grype_enabled`               | boolean | `true`       | Run the informational Grype scan over the release SBOM; never fails the run                                                      |
-| `snapshot_targets`            | string  | `''`         | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
-| `release_targets`             | string  | `''`         | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
-| `snapshot_registry_url`       | string  | `''`         | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
-| `release_registry_url`        | string  | `''`         | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
-| `nexus_user`                  | string  | `''`         | Nexus username override; empty derives it from the repository name                                                               |
-| `snapshot_dist_tag`           | string  | `'snapshot'` | npm dist-tag for snapshot publishes; never `latest`, which must name the newest release                                          |
-| `snapshot_environment`        | string  | `''`         | GitHub environment gating the snapshot publish jobs; empty uses none                                                             |
-| `release_environment`         | string  | `''`         | GitHub environment gating the release publish jobs, e.g. one requiring a reviewer; empty uses none                               |
-| `dry_run`                     | boolean | `false`      | Rehearse publishing without uploading; needs no secrets, and skips attestation and signing                                       |
-| `release_only`                | boolean | `false`      | Recovery: publish the release and skip the snapshot; see [Re-running a Release](#re-running-a-release)                           |
-| `harden_runner_egress`        | string  | `'block'`    | Harden-runner egress policy: `block` or `audit`                                                                                  |
-| `build_permit_egress_traffic` | boolean | `false`      | Audit egress for the `build` and `pack-release` jobs alone, for dependency CDNs; `pack-release` reinstalls a pnpm workspace      |
-| `harden_runner_allowlist`     | string  | (pinned)     | Out-of-band harden-runner allow-list configuration                                                                               |
-| `gerrit_refspec`              | string  | `''`         | Gerrit refspec: the branch ref, or a merged change's ref to re-run it; resolved once for every job                               |
-| `gerrit_patchset_revision`    | string  | `''`         | Triggering change revision (`GERRIT_PATCHSET_REVISION`); pins the run to the commit that merged it                               |
-| `gerrit_project`              | string  | `''`         | Gerrit project name                                                                                                              |
-| `gerrit_branch`               | string  | `''`         | Gerrit target branch                                                                                                             |
-| `gerrit_url`                  | string  | `''`         | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                                                                 |
+| Input                                  | Type    | Default      | Description                                                                                                                      |
+| -------------------------------------- | ------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `repository`                           | string  | `''`         | Repository to check out (owner/name); empty uses the caller                                                                      |
+| `ref`                                  | string  | `''`         | Checkout ref (empty = event ref; other repos: default branch)                                                                    |
+| `path_prefix`                          | string  | `'.'`        | Path to the project root directory                                                                                               |
+| `node_version`                         | string  | `''`         | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
+| `build_node_version`                   | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
+| `build_tool`                           | string  | `''`         | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                                                                 |
+| `build_scripts`                        | string  | `'build'`    | package.json script(s) the build job runs                                                                                        |
+| `lockfile_required`                    | boolean | `true`       | Require the build tool's lockfile and install from it frozen; see [Lockfiles](#lockfiles)                                        |
+| `attestations`                         | boolean | `true`       | SLSA build provenance for the packed release tarball (release publishes)                                                         |
+| `sigstore_sign`                        | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
+| `sbom_enabled`                         | boolean | `true`       | Generate the release SBOM (`sbom-files-node-merge` artefact); a failure blocks the release publish                               |
+| `grype_enabled`                        | boolean | `true`       | Run the informational Grype scan over the release SBOM; never fails the run                                                      |
+| `snapshot_targets`                     | string  | `''`         | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
+| `release_targets`                      | string  | `''`         | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
+| `snapshot_registry_url`                | string  | `''`         | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
+| `release_registry_url`                 | string  | `''`         | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
+| `nexus_user`                           | string  | `''`         | Nexus username override; empty derives it from the repository name                                                               |
+| `snapshot_dist_tag`                    | string  | `'snapshot'` | npm dist-tag for snapshot publishes; never `latest`, which must name the newest release                                          |
+| `snapshot_environment`                 | string  | `''`         | GitHub environment gating the snapshot publish jobs; empty uses none                                                             |
+| `release_environment`                  | string  | `''`         | GitHub environment gating the release publish jobs, e.g. one requiring a reviewer; empty uses none                               |
+| `dry_run`                              | boolean | `false`      | Rehearse publishing without uploading; needs no secrets, and skips attestation and signing                                       |
+| `release_only`                         | boolean | `false`      | Recovery: publish the release and skip the snapshot; see [Re-running a Release](#re-running-a-release)                           |
+| `harden_runner_egress`                 | string  | `'block'`    | Harden-runner egress policy: `block` or `audit`                                                                                  |
+| `build_permit_egress_traffic`          | boolean | `false`      | Audit egress for the `build` and `pack-release` jobs alone, for dependency CDNs; `pack-release` reinstalls a pnpm workspace      |
+| `harden_runner_allowlist`              | string  | (pinned)     | Out-of-band harden-runner allow-list configuration                                                                               |
+| `harden_runner_supplemental_allowlist` | string  | `''`         | Extra allow-list merged with the baseline; see [Egress allow-list](#egress-allow-list)                                           |
+| `harden_runner_supplemental_unpinned`  | boolean | `false`      | Let a supplemental list in the caller's organisation follow its default branch                                                   |
+| `harden_runner_extra_endpoints`        | string  | `''`         | Inline `host[:port]` endpoints for a short-term fix                                                                              |
+| `gerrit_refspec`                       | string  | `''`         | Gerrit refspec: the branch ref, or a merged change's ref to re-run it; resolved once for every job                               |
+| `gerrit_patchset_revision`             | string  | `''`         | Triggering change revision (`GERRIT_PATCHSET_REVISION`); pins the run to the commit that merged it                               |
+| `gerrit_project`                       | string  | `''`         | Gerrit project name                                                                                                              |
+| `gerrit_branch`                        | string  | `''`         | Gerrit target branch                                                                                                             |
+| `gerrit_url`                           | string  | `''`         | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                                                                 |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -583,6 +589,64 @@ targets.
 | `attestation_url`        | URL of the tarball's build provenance; `''` with `attestations` off, on a dry run, or with no release                              |
 
 <!-- markdownlint-enable MD013 -->
+
+### Egress allow-list
+
+Every job runs `step-security/harden-runner`, which in `block` mode
+lets a job reach the endpoints on its allow-list and nothing else.
+`lfreleng-actions/harden-runner-block-action` builds that list.
+`build-test.yaml`, `build-test-release.yaml` and `merge.yaml` take
+the same five inputs to shape it, and pass each one to every job:
+
+<!-- markdownlint-disable MD013 -->
+
+| Input                                  | Type    | Default   | Passed to the action as                                                                     |
+| -------------------------------------- | ------- | --------- | ------------------------------------------------------------------------------------------- |
+| `harden_runner_egress`                 | string  | `'block'` | harden-runner's `egress-policy`; `audit` logs connections instead of blocking them          |
+| `harden_runner_allowlist`              | string  | (pinned)  | `config`: the organisation list, pinned to a release                                        |
+| `harden_runner_supplemental_allowlist` | string  | `''`      | `supplemental_config`, merged with the baseline; naming a list sets `supplemental_required` |
+| `harden_runner_supplemental_unpinned`  | boolean | `false`   | `supplemental_unpinned`: let the supplemental list omit `@ref`                              |
+| `harden_runner_extra_endpoints`        | string  | `''`      | `extra_endpoints`: `host[:port]` tokens merged into the list                                |
+
+<!-- markdownlint-enable MD013 -->
+
+An organisation whose builds need endpoints beyond the baseline keeps
+its own list and names it in `harden_runner_supplemental_allowlist`,
+in the same coordinate grammar as `harden_runner_allowlist`. ONAP,
+whose builds reach `registry.nordix.org`, can follow its own list on
+that list's default branch:
+
+```yaml
+    with:
+      harden_runner_supplemental_allowlist: 'onap//'
+      harden_runner_supplemental_unpinned: true
+```
+
+The action follows an unpinned list from the caller's own
+organisation alone. A list in any other organisation must carry an
+`@ref` pinning it to a commit, as in `'<org>//<path>@<commit SHA>'`,
+and the job fails without one.
+
+Naming a list makes the job depend on it. The workflows set
+`supplemental_required` whenever
+`harden_runner_supplemental_allowlist` is not empty, so a list the
+action cannot find fails the job when the list loads, rather than at
+the first blocked connection.
+
+An unpinned list can change between two runs. The action's
+`supplemental_source` and `supplemental_sha` outputs record the file
+and the commit each job loaded, and form the audit trail for it.
+
+`harden_runner_extra_endpoints` takes `host[:port]` tokens, separated
+by spaces or newlines, and merges them into the list for the calls
+that pass them. Use it as a short-term fix, to unblock a job while the
+endpoint goes onto the organisation or supplemental list, which is the
+lasting fix:
+
+```yaml
+    with:
+      harden_runner_extra_endpoints: 'registry.nordix.org:443'
+```
 
 ## Package Managers
 
@@ -1163,6 +1227,13 @@ their passing verdicts. Each leg passes its name as
 - each leg's Grype job downloaded, by the artefact ID its download
   step names, the SBOM its own leg uploaded, so legs that cross over
   fail the check.
+
+Every leg also passes the [Egress allow-list](#egress-allow-list)
+inputs in `block` mode: `lfreleng-actions//` as an unpinned
+supplemental list and `github.com:443` inline. Neither grants
+anything new, since the first resolves to the organisation list the
+baseline loads and the second is already on it, so the legs prove the
+workflow passes the inputs through.
 
 Neither npm fixture emits `dist/`, so the check makes no claim about
 their `node-build-output` artefact. The `lint` job in `testing.yaml`
