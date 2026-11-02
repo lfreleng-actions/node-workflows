@@ -250,6 +250,14 @@ jobs:
       # Every leg uploads in this run, so each names its artefacts
       # apart, as any caller of the workflow more than once must
       artifact_suffix: '-${{ matrix.name }}'
+      # Exercise the allow-list inputs without granting anything new.
+      # A same-organisation list may follow its default branch, and
+      # 'lfreleng-actions//' resolves to the organisation list itself,
+      # which de-duplication absorbs. The organisation list already
+      # carries github.com:443, so the action reports it as redundant.
+      harden_runner_supplemental_allowlist: 'lfreleng-actions//'
+      harden_runner_supplemental_unpinned: true
+      harden_runner_extra_endpoints: 'github.com:443'
 
   # Proves build-test produced something, not just that its job graph
   # went green: an empty SBOM, or an audit or Grype job that never
