@@ -67,6 +67,7 @@ node-metadata -> build
 { check-release | resolve-version | build } -> pack-release (stamp, pack, SBOM)
 pack-release -> { attest | sign-artefacts | grype }
 { pack-release | attest | sign-artefacts } -> release-publish
+{ pack-release | attest | sign-artefacts } -> release-publish-oidc
 ```
 
 ## Release Models
@@ -276,7 +277,10 @@ leg (`merge.yaml`'s `release-publish`, and `build-test-release.yaml`'s
 `nexus-publish`) asks its registry for the version
 (`npm view <package>@<version> dist`), reading with the leg's own
 credential, and compares what it finds with the tarball it would
-publish:
+publish. `release-publish-oidc`, which serves
+[OIDC targets](#oidc-trusted-publishing), has no stored credential to
+read with and leaves the same comparison to node-publish-action's
+`if_exists: skip-if-identical`:
 
 <!-- markdownlint-disable MD013 -->
 
@@ -526,6 +530,7 @@ All `build-test.yaml` inputs above except `grype_gate_when` (with
 | `release_registry_url`                 | string  | `''`         | REQUIRED unless you set `release_targets`: single release registry URL; deprecated, prefer `release_targets`                     |
 | `nexus_user`                           | string  | `''`         | Nexus username override; empty derives it from the repository name                                                               |
 | `snapshot_dist_tag`                    | string  | `'snapshot'` | npm dist-tag for snapshot publishes; never `latest`, which must name the newest release                                          |
+| `oidc_node_version`                    | string  | `'24'`       | Node.js for release targets with `auth: oidc`; must ship npm 11.5.2 or later, which Node.js 22 does not                          |
 | `snapshot_environment`                 | string  | `''`         | GitHub environment gating the snapshot publish jobs; empty uses none                                                             |
 | `release_environment`                  | string  | `''`         | GitHub environment gating the release publish jobs, e.g. one requiring a reviewer; empty uses none                               |
 | `dry_run`                              | boolean | `false`      | Rehearse publishing without uploading; needs no secrets, and skips attestation and signing                                       |
@@ -885,7 +890,7 @@ a single publish lane, and `snapshot_targets` / `release_targets` in
 | ----------------- | -------- | -------------------------------------------------------------------------------- |
 | `name`            | Yes      | Labels the matrix leg, so a failed check names the registry. Unique per list     |
 | `registry_url`    | Yes      | Absolute `https` URL ending in `/`. Unique per list                              |
-| `auth`            | Yes      | `nexus` for Basic auth, `token` for a bearer token                               |
+| `auth`            | Yes      | `nexus` (Basic auth), `token` (bearer token) or `oidc` (trusted publishing)      |
 | `credential_name` | No       | 1Password item holding the credential; empty derives it from the repository name |
 
 <!-- markdownlint-enable MD013 -->
@@ -908,10 +913,68 @@ refuses duplicate names and duplicate registry URLs: two legs
 publishing the same version to one registry cannot both succeed, and
 the loser fails with `EPUBLISHCONFLICT` on a version that did publish.
 
-> [!NOTE]
-> OIDC trusted publishing is not available as an `auth` mode yet. It
-> needs `id-token: write`, which GitHub cannot grant per matrix leg,
-> so issue #54 tracks it separately.
+### OIDC trusted publishing
+
+`merge.yaml` release targets can publish to npmjs.org through
+[npm trusted publishing](https://docs.npmjs.com/trusted-publishers)
+with `"auth": "oidc"`. npm exchanges the job's GitHub OIDC token for
+a short-lived publish token, so nothing stores an npm token, and npm
+attaches provenance itself:
+
+```yaml
+    release_targets: |
+      [
+        {"name": "nexus",
+         "registry_url": "https://nexus3.example.org/repository/npm.release/",
+         "auth": "nexus"},
+        {"name": "npmjs",
+         "registry_url": "https://registry.npmjs.org/",
+         "auth": "oidc"}
+      ]
+```
+
+GitHub grants `id-token: write` per job, not per matrix leg, so OIDC
+targets publish from a job of their own,
+`release-publish-oidc`, the one publish job holding that grant, and
+the Nexus and token legs in `release-publish` never receive it. The
+OIDC job loads no 1Password credential and publishes the same
+attested archive. A target with `auth: oidc` takes no
+`credential_name`.
+
+The snapshot lane and `build-test-release.yaml` reject `oidc`: npm
+never overwrites a version, and every merge republishes the same
+snapshot.
+
+The calling repository has to meet npm's conditions too:
+
+- **Grant `id-token: write` on the job that calls `merge.yaml`.**
+  GitHub issues no token unless both the calling job and the called
+  job allow it. The examples in `examples/merge/` already grant it
+  for attestation and signing.
+- **Register the trusted publisher against the calling workflow's
+  filename**, such as `gerrit-merge.yaml` or `merge.yaml` in your
+  repository's `.github/workflows/`, not this repository's
+  `merge.yaml`. npm checks the workflow that started the run. If you
+  set `release_environment`, give the same environment name in the
+  trusted publisher, or leave that field empty.
+- **Match `repository.url` in `package.json` to the GitHub
+  repository** the run executes in, character for character. For a
+  Gerrit project that is the GitHub mirror.
+- **Expect no provenance from a private repository.** npm generates
+  it for public repositories, and a private one still publishes.
+- **Publish the first version another way.** A package has to exist
+  on npmjs.org before it can have a trusted publisher.
+
+The leg runs Node.js `oidc_node_version`, `24` by default. Trusted
+publishing needs npm 11.5.2 or later and Node.js 22.14.0 or later.
+No Node.js 22 release ships such an npm, and npm 11.5.1 fails a
+restricted publish outright
+([npm/cli#8467](https://github.com/npm/cli/pull/8467)).
+node-publish-action checks the npm floor before publishing and fails
+with the remedy otherwise. The leg publishes the packed tarball and
+runs no project scripts, so this version need not match the
+project's own. Without a token endpoint, the leg fails before
+publishing and names the grant the caller is missing.
 
 ### Migrating from the single-URL inputs
 
@@ -951,7 +1014,8 @@ branches, or keep the secrets as environment secrets:
 - `build-test-release.yaml`: `publish_environment` gates
   `nexus-publish`.
 - `merge.yaml`: `snapshot_environment` gates `snapshot-publish` and
-  `release_environment` gates `release-publish`. They are separate
+  `release_environment` gates `release-publish` and
+  `release-publish-oidc`. They are separate
   because a reviewer suits a release, whereas on the snapshot, which
   publishes on every merge, one would hold every run.
 

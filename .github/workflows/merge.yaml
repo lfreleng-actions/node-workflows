@@ -12,6 +12,10 @@
 #   resolve-version -> check-release -> release-publish (only when a
 #   release file merged, and its version matches version.properties)
 #
+# Release targets using npm OIDC trusted publishing ('auth': 'oidc')
+# publish from release-publish-oidc instead, the one publish job that
+# holds 'id-token: write'; Nexus and token legs never receive it.
+#
 # A release run also generates a CycloneDX SBOM of the stamped release
 # tree in pack-release, which an informational Grype job scans.
 #
@@ -159,9 +163,11 @@ on:
       release_targets:
         description: >-
           JSON array of release publish targets, in the same shape as
-          snapshot_targets. Leave unset to fall back to
-          release_registry_url; an empty array [] is rejected, not a
-          fallback.
+          snapshot_targets. Release targets may also use auth 'oidc'
+          (npm trusted publishing), which loads no credential and
+          needs 'id-token: write' on the calling job. Leave unset to
+          fall back to release_registry_url; an empty array [] is
+          rejected, not a fallback.
         required: false
         type: string
         default: ''
@@ -196,6 +202,16 @@ on:
         required: false
         type: string
         default: 'snapshot'
+      oidc_node_version:
+        description: >-
+          Node.js version for release targets using auth 'oidc'. npm
+          trusted publishing needs npm 11.5.2 or later, which no
+          Node.js 22 release ships, so this defaults to the current
+          Node.js 24. The leg publishes the packed release tarball and
+          runs no project scripts, so it need not match node_version.
+        required: false
+        type: string
+        default: '24'
       snapshot_environment:
         description: >-
           GitHub environment for the snapshot publish jobs, and those
@@ -393,9 +409,11 @@ on:
           'false' when no release was requested, any leg failed, the
           lane was skipped or cancelled, or on a dry run. The legs
           run independently, so after a failed leg other targets may
-          still hold the release.
+          still hold the release. Credential and OIDC targets publish
+          from separate jobs; one with no targets skips and counts as
+          done, but at least one of them always has targets.
         # yamllint disable-line rule:line-length
-        value: ${{ fromJSON(toJSON(jobs.release-publish)).result == 'success' && !inputs.dry_run }}
+        value: ${{ fromJSON(toJSON(jobs.resolve-release-targets)).result == 'success' && (fromJSON(toJSON(jobs.release-publish)).result == 'success' || (fromJSON(toJSON(jobs.release-publish)).result == 'skipped' && jobs.resolve-release-targets.outputs.credential_count == '0')) && (fromJSON(toJSON(jobs.release-publish-oidc)).result == 'success' || (fromJSON(toJSON(jobs.release-publish-oidc)).result == 'skipped' && jobs.resolve-release-targets.outputs.oidc_count == '0')) && !inputs.dry_run }}
       release_target_names:
         description: >-
           Comma-separated names of the resolved release targets,
@@ -1193,6 +1211,11 @@ jobs:
       label: 'release'
       targets_json: ${{ inputs.release_targets }}
       registry_url: ${{ inputs.release_registry_url }}
+      # OIDC targets publish from release-publish-oidc, the one job
+      # granted 'id-token: write'. The snapshot lane stays without it:
+      # npmjs.org never overwrites a version, and every merge
+      # republishes the same snapshot.
+      allow_oidc: true
 
   # Every merge publishes the same X.Y.Z-SNAPSHOT, and the last publish
   # wins. Re-running an old run rebuilds its pinned commit and would
@@ -1861,8 +1884,10 @@ jobs:
       # and a partial publish is easier to complete than to redo.
       fail-fast: false
       matrix:
+        # OIDC targets go to release-publish-oidc, which holds the
+        # id-token grant this job must not.
         # yamllint disable-line rule:line-length
-        target: ${{ fromJSON(needs.resolve-release-targets.outputs.matrix) }}
+        target: ${{ fromJSON(needs.resolve-release-targets.outputs.credential_matrix) }}
     # Publishing waits on attestation and signing so that an enabled
     # record which fails blocks the publish rather than trailing it.
     # Hosted npm repositories are typically write-once, so a version
@@ -1887,6 +1912,7 @@ jobs:
       && needs.resolve-version.result == 'success'
       && needs.build.result == 'success'
       && needs.resolve-release-targets.result == 'success'
+      && needs.resolve-release-targets.outputs.credential_count != '0'
       && needs.pack-release.result == 'success'
       && (needs.attest.result == 'success'
       || needs.attest.result == 'skipped')
@@ -2371,6 +2397,159 @@ jobs:
           nexus_password: ${{ matrix.target.auth == 'nexus' && steps.load-credential.outputs.credential || '' }}
           # yamllint disable-line rule:line-length
           auth_token: ${{ matrix.target.auth == 'token' && steps.load-credential.outputs.credential || '' }}
+
+  # npm OIDC trusted publishing (#54). A job of its own because
+  # 'id-token: write' is granted per job, not per matrix leg, and the
+  # Nexus and token legs in release-publish must not hold it: npm
+  # attempts a trusted-publish exchange whenever the token endpoint
+  # is there. The same isolation keeps attest and sign-artefacts
+  # apart.
+  #
+  # No 1Password credential loads here, so the leg needs neither
+  # secret. It publishes the archive pack-release produced, as
+  # release-publish does, and node-publish-action enforces the rest:
+  # npm 11.5.2 or later, the token endpoint, and no stored credential
+  # that could stand in for the exchange. A re-run skips a registry
+  # already holding identical bytes through if_exists, where
+  # release-publish has its own registry check: under OIDC there is
+  # no stored credential for that check to read with, and npmjs.org
+  # answers anonymous reads.
+  release-publish-oidc:
+    name: 'Publish Release (${{ matrix.target.name }})'
+    runs-on: ubuntu-latest
+    # Empty runs the job outside any environment.
+    environment: ${{ inputs.release_environment }}
+    needs:
+      - 'check-release'
+      - 'resolve-version'
+      - 'build'
+      - 'pack-release'
+      - 'attest'
+      - 'sign-artefacts'
+      - 'resolve-release-targets'
+    strategy:
+      fail-fast: false
+      matrix:
+        # yamllint disable-line rule:line-length
+        target: ${{ fromJSON(needs.resolve-release-targets.outputs.oidc_matrix) }}
+    # The same gates as release-publish; see the reasoning there.
+    if: >-
+      ${{ !cancelled()
+      && needs.check-release.result == 'success'
+      && needs.check-release.outputs.has_release == 'true'
+      && needs.resolve-version.result == 'success'
+      && needs.build.result == 'success'
+      && needs.resolve-release-targets.result == 'success'
+      && needs.resolve-release-targets.outputs.oidc_count != '0'
+      && needs.pack-release.result == 'success'
+      && (needs.attest.result == 'success'
+      || needs.attest.result == 'skipped')
+      && (needs.sign-artefacts.result == 'success'
+      || needs.sign-artefacts.result == 'skipped') }}
+    # GitHub issues the token only when the calling job grants
+    # 'id-token: write' as well; see examples/merge/.
+    permissions:
+      contents: read
+      id-token: write  # npm OIDC trusted publishing
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+          # yamllint disable-line rule:line-length
+          supplemental_config: ${{ inputs.harden_runner_supplemental_allowlist }}
+          # A caller naming a list depends on it, so its absence fails
+          # here rather than at the first blocked connection.
+          # yamllint disable-line rule:line-length
+          supplemental_required: ${{ inputs.harden_runner_supplemental_allowlist != '' && 'true' || 'false' }}
+          # yamllint disable-line rule:line-length
+          supplemental_unpinned: ${{ inputs.harden_runner_supplemental_unpinned && 'true' || 'false' }}
+          extra_endpoints: ${{ inputs.harden_runner_extra_endpoints }}
+          allow_list_summary: 'false'
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          # yamllint disable-line rule:line-length
+          egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # node-publish-action resolves the destination registry from the
+      # project's own configuration, so the project tree has to be
+      # present even though npm receives the packed archive.
+      - name: 'Download built project'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: node-build-content
+          path: ${{ inputs.path_prefix }}
+
+      # The archive attest and sign-artefacts covered, as in
+      # release-publish.
+      - name: 'Download release tarball'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: node-release-package
+          path: pack-dist
+
+      - name: 'Verify release version matches version.properties'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+          RESOLVED_VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          # Cross-check the release file against version.properties
+          if [ "${RELEASE_VERSION}" != "${RESOLVED_VERSION}" ]; then
+            echo "::error::Release file version" \
+              "(${RELEASE_VERSION}) does not match" \
+              "version.properties (${RESOLVED_VERSION})"
+            exit 1
+          fi
+          echo "Release version verified: ${RELEASE_VERSION}"
+
+      # node-publish-action fails without the endpoint too, but cannot
+      # know this leg runs inside a reusable workflow, where the remedy
+      # is on the caller's side. A dry run exchanges nothing and needs
+      # no token.
+      - name: 'Check the OIDC token endpoint'
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        env:
+          TARGET_NAME: ${{ matrix.target.name }}
+        run: |
+          # Check the OIDC token endpoint
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] \
+            || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::No GitHub OIDC token endpoint for" \
+              "${TARGET_NAME}. Grant 'id-token: write' on the job that" \
+              "calls merge.yaml, and run on a GitHub-hosted runner;" \
+              "npm trusted publishing needs both."
+            exit 1
+          fi
+          echo "OIDC token endpoint available for ${TARGET_NAME}." \
+            "npm matches the trusted publisher against the calling" \
+            "workflow's filename, not merge.yaml."
+
+      # Provenance is left to npm, which attaches it under trusted
+      # publishing for a public package from a public repository;
+      # node-publish-action refuses the provenance input with oidc.
+      - name: 'Publish release'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/node-publish-action@1aba0ee5d24837780fccd3f830b12d41e183e8fb  # v0.4.0
+        with:
+          publish_version: ${{ needs.resolve-version.outputs.version }}
+          registry_url: ${{ matrix.target.registry_url }}
+          path_prefix: ${{ inputs.path_prefix }}
+          # yamllint disable-line rule:line-length
+          tarball_path: pack-dist/${{ needs.pack-release.outputs.tarball_name }}
+          node_version: ${{ inputs.oidc_node_version }}
+          dry_run: ${{ inputs.dry_run }}
+          oidc: 'true'
+          if_exists: 'skip-if-identical'
 
   # Pack the release tarball.
   #
