@@ -635,6 +635,41 @@ jobs:
           done
           exit "${status}"
 
+      # test-node-project runs the dependencies-changed gate against a
+      # fixture at a pinned commit, which dependency-change-action
+      # cannot resolve: it writes no sidecar, the SBOM upload has to
+      # succeed without one, and the Grype job then finds no manifest
+      # and keeps the gate on. Every other leg runs the always gate and
+      # never calls the action, so none may carry a sidecar either.
+      - name: 'Assert the unresolved change uploaded no sidecar'
+        shell: bash
+        env:
+          # Keep in step with the build-test matrix names
+          LEGS: >-
+            test-node-project sdc-onap-ui-common variant-pnpm
+            variant-pnpm-workspace variant-yarn-berry variant-yarn-classic
+            variant-bun
+        run: |
+          # Assert the unresolved change uploaded no sidecar
+          set -euo pipefail
+          shopt -s nullglob
+          status=0
+          fail() { echo "::error::$1"; status=1; }
+          for leg in ${LEGS}; do
+            dirs=("sbom-files-${leg}"/*/)
+            if [ "${#dirs[@]}" -ne 1 ]; then
+              fail "Found ${#dirs[@]} sbom-files-${leg} artefacts, expected 1"
+              continue
+            fi
+            sidecar="${dirs[0]}dependency-change.json"
+            if [ -e "${sidecar}" ]; then
+              fail "sbom-files-${leg} carries a sidecar: $(cat "${sidecar}")"
+            else
+              echo "sbom-files-${leg}: no sidecar, the gate stays on ✅"
+            fi
+          done
+          exit "${status}"
+
       # test-node-project fans its tests out over test_node_versions,
       # so each version must upload under its own suffixed name, and
       # nothing else in the family may appear (sdc-onap-ui-common
@@ -3107,17 +3142,19 @@ jobs:
           echo "Release schema validation correct ✅" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # build-test's dependencies-changed Grype gate trusts a manifest the
-  # sbom job writes from git history. Extract the shipped step and
-  # drive it against local repositories: a wrong 'false' downgrades
-  # real findings to warnings, so every unresolvable shape must write
-  # no manifest and leave the gate on.
-  dependency-change-detection:
-    name: 'Test: dependency change detection'
+  # build-test's dependencies-changed Grype gate trusts a sidecar that
+  # dependency-change-action writes in the sbom job and the Grype job
+  # reads from the SBOM artefact. The action's own suite proves what it
+  # writes; this job proves the wiring around it: the pinned call, the
+  # checkout depth it needs, the sidecar's path through the artefact,
+  # and that no inline detection or job-output route survives beside
+  # it, where the two could drift apart.
+  dependency-change-wiring:
+    name: 'Test: dependency change wiring'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
@@ -3136,237 +3173,328 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: 'Exercise dependency change detection'
+      - name: 'Assert dependency change wiring'
         shell: bash
         run: |
-          # Exercise dependency change detection
-          detect="${RUNNER_TEMP}/dependency-change.sh"
-          writer="${RUNNER_TEMP}/dependency-manifest.sh"
-          python3 - <<'EXTRACT'
-          import os
+          # Assert dependency change wiring
+          python3 - <<'PY'
+          import sys
 
           import yaml
 
+          ACTION = 'lfreleng-actions/dependency-change-action'
+          PIN = '257928b15e4e6a5cc5a888435be59b058055c4e1'
+          SIDECAR = 'dependency-change.json'
+          # Split so Actions leaves the expressions in this script
+          # unexpanded
+          OPEN = '$' + '{{ '
+          CLOSE = ' }' + '}'
+
           with open('.github/workflows/build-test.yaml') as handle:
               doc = yaml.safe_load(handle)
-          for job, key, value, name in (
-              ('sbom', 'id', 'dependency-change', 'dependency-change.sh'),
-              ('grype', 'name', 'Write dependency-change manifest',
-               'dependency-manifest.sh'),
+          jobs = doc['jobs']
+          sbom = jobs['sbom']
+          grype = jobs['grype']
+          errors = []
+
+          def step(job, key, value):
+              found = [s for s in job['steps'] if s.get(key) == value]
+              return found[0] if found else None
+
+          # The sbom job's signal comes from the pinned action alone:
+          # no run step in either job may detect or write it, where a
+          # second implementation would drift from the tested one
+          for name, job in (('sbom', sbom), ('grype', grype)):
+              for s in job['steps']:
+                  run = s.get('run') or ''
+                  if 'changed=' in run or SIDECAR in run:
+                      errors.append(
+                          f"build-test.yaml/{name} step {s.get('name')!r}"
+                          ' carries inline dependency change handling')
+          if 'dependency_changed' in (sbom.get('outputs') or {}):
+              errors.append('build-test.yaml/sbom still publishes the '
+                            'dependency_changed output')
+          if step(grype, 'name', 'Write dependency-change manifest'):
+              errors.append('build-test.yaml/grype still writes the '
+                            'manifest from a job output')
+
+          detect = step(sbom, 'id', 'dependency-change')
+          if detect is None:
+              errors.append('build-test.yaml/sbom has no dependency-change '
+                            'step')
+          else:
+              uses = str(detect.get('uses', ''))
+              if uses != f'{ACTION}@{PIN}':
+                  errors.append(f'dependency-change step uses {uses!r}, '
+                                f'expected {ACTION}@{PIN}')
+              want = {
+                  'ecosystems': 'node',
+                  'path-prefix': OPEN + 'inputs.path_prefix' + CLOSE,
+                  'gerrit-refspec': OPEN + 'inputs.gerrit_refspec' + CLOSE,
+                  'output': SIDECAR,
+              }
+              got = detect.get('with') or {}
+              for key, value in want.items():
+                  if got.get(key) != value:
+                      errors.append(f'dependency-change input {key} is '
+                                    f'{got.get(key)!r}, expected {value!r}')
+              cond = str(detect.get('if', ''))
+              if ('inputs.grype_enabled' not in cond
+                      or "inputs.grype_gate_when == 'dependencies-changed'"
+                      not in cond):
+                  errors.append('dependency-change step does not run only '
+                                'for the dependencies-changed gate')
+
+          # The action compares HEAD with its parent, so both checkouts
+          # must fetch at least two commits. actions/checkout defaults
+          # to 1; checkout-gerrit-change-action defaults to 2, so an
+          # unset depth is fine there and a set one must still reach 2
+          for name, default in (
+              ('actions/checkout', 1),
+              ('lfreleng-actions/checkout-gerrit-change-action', 2),
           ):
+              found = [s for s in sbom['steps']
+                       if str(s.get('uses', '')).startswith(f'{name}@')]
+              if len(found) != 1:
+                  errors.append(f'build-test.yaml/sbom has {len(found)} '
+                                f'{name} steps, expected 1')
+                  continue
+              depth = (found[0].get('with') or {}).get('fetch-depth',
+                                                        default)
+              # 0 fetches all history, which also holds the parent
+              if not isinstance(depth, int) or 0 < depth < 2:
+                  errors.append(f'build-test.yaml/sbom {name} fetch-depth '
+                                f'is {depth!r}; the dependency change '
+                                'base needs 2 or more')
+
+          # The sidecar travels in the SBOM artefact, beside the SBOM,
+          # so the Grype job reads its own call's signal and a matrix
+          # job would carry one per leg. The SBOM always matches, so
+          # an unresolved run with no sidecar still uploads and the
+          # error setting stays a guard on the SBOM alone
+          upload = step(sbom, 'id', 'upload-sbom')
+          if upload is None:
+              errors.append('build-test.yaml/sbom has no upload-sbom step')
+          else:
+              with_ = upload.get('with') or {}
+              paths = str(with_.get('path', '')).split()
+              if paths[:1] != ['sbom-cyclonedx.*'] or SIDECAR not in paths:
+                  errors.append(f'upload-sbom uploads {paths!r}, expected '
+                                f"['sbom-cyclonedx.*', {SIDECAR!r}]")
+              if with_.get('if-no-files-found') != 'error':
+                  errors.append('upload-sbom does not fail on a missing '
+                                'SBOM')
+
+          # A single artefact downloaded by ID lands in the working
+          # directory, so the sidecar sits beside the SBOM where the
+          # scan step names both by bare file name
+          download = step(grype, 'id', 'download-sbom')
+          if download is None:
+              errors.append('build-test.yaml/grype has no download-sbom '
+                            'step')
+          else:
+              with_ = download.get('with') or {}
+              if (with_.get('artifact-ids')
+                      != OPEN + 'needs.sbom.outputs.sbom_artifact_id' + CLOSE
+                      or 'path' in with_ or 'name' in with_):
+                  errors.append('download-sbom does not fetch the sbom '
+                                "job's artefact by ID into the working "
+                                'directory')
+          scan = step(grype, 'id', 'grype-audit')
+          if scan is None:
+              errors.append('build-test.yaml/grype has no grype-audit step')
+          else:
+              with_ = scan.get('with') or {}
+              if with_.get('dependency-change-manifest') != SIDECAR:
+                  errors.append('grype-audit reads '
+                                f"{with_.get('dependency-change-manifest')!r}"
+                                f', expected {SIDECAR!r}')
+              if with_.get('sbom') != 'sbom-cyclonedx.json':
+                  errors.append('grype-audit does not scan '
+                                'sbom-cyclonedx.json')
+              if with_.get('dependencies-changed'):
+                  errors.append('grype-audit sets dependencies-changed, '
+                                'which overrides the sidecar')
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('Dependency change wiring incorrect \u274c')
+          print('Dependency change wiring correct \u2705')
+          PY
+          echo "Dependency change wiring correct ✅" >> "$GITHUB_STEP_SUMMARY"
+
+  # The Grype policy inputs reach grype-scan-action only after the
+  # build and SBOM jobs have run, so gerrit-validate rejects a bad
+  # value first. Both workflows must declare the inputs alike, pass
+  # each through, and share one validation step; that step is then
+  # extracted and driven against every value it must reject.
+  grype-policy-inputs:
+    name: 'Test: Grype policy inputs'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Exercise the Grype policy inputs'
+        shell: bash
+        run: |
+          # Exercise the Grype policy inputs
+          validate="${RUNNER_TEMP}/validate-grype-policy.sh"
+          python3 - "${validate}" <<'PY'
+          import sys
+
+          import yaml
+
+          out = sys.argv[1]
+          # Split so Actions leaves the expressions in this script
+          # unexpanded
+          OPEN = '$' + '{{ '
+          CLOSE = ' }' + '}'
+          INPUTS = {
+              'grype_dependency_policy': ('string', 'declared',
+                                          'dependency-policy'),
+              'grype_transitive_fail_on': ('string', 'critical',
+                                           'transitive-fail-on'),
+              'grype_only_fixed': ('boolean', True, 'only-fixed'),
+          }
+          PATHS = (
+              '.github/workflows/build-test.yaml',
+              '.github/workflows/build-test-release.yaml',
+          )
+
+          def step(doc, job, step_id):
               steps = doc['jobs'][job]['steps']
-              run = [s for s in steps if s.get(key) == value]
-              with open(os.path.join(os.environ['RUNNER_TEMP'], name),
-                        'w') as handle:
-                  handle.write(run[0]['run'] if run else '')
-          EXTRACT
-          # Fail loudly rather than silently testing nothing if a
-          # step is renamed or loses its output or manifest
-          if ! grep -q 'changed=' "${detect}" \
-            || ! grep -q 'EVENT_BEFORE' "${detect}" \
-            || ! grep -q 'dependency-change.json' "${writer}"; then
-            echo "Could not extract dependency change detection ❌"
-            echo "Update the extraction in this job to match"
-            exit 1
-          fi
+              found = [s for s in steps if s.get('id') == step_id]
+              return found[0] if found else None
 
-          # Local repositories only: an identity, no signing, and none
-          # of the runner's own git settings
-          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-          export GIT_AUTHOR_NAME='Dependency Change'
-          export GIT_AUTHOR_EMAIL='dependency-change@example.org'
-          export GIT_COMMITTER_NAME="${GIT_AUTHOR_NAME}"
-          export GIT_COMMITTER_EMAIL="${GIT_AUTHOR_EMAIL}"
+          errors = []
+          docs = {}
+          for path in PATHS:
+              with open(path) as handle:
+                  docs[path] = yaml.safe_load(handle)
+          for path, doc in docs.items():
+              # PyYAML reads the bare 'on' key as True
+              inputs = doc[True]['workflow_call']['inputs']
+              scan = step(doc, 'grype', 'grype-audit')
+              with_ = (scan or {}).get('with') or {}
+              for name, (kind, default, passed) in INPUTS.items():
+                  spec = inputs.get(name)
+                  if spec is None:
+                      errors.append(f'{path} lacks the {name} input')
+                  elif (spec.get('type') != kind
+                          or spec.get('default') != default
+                          or type(spec.get('default')) is not type(default)):
+                      errors.append(f'{path} {name} is {spec.get("type")!r}'
+                                    f' defaulting to {spec.get("default")!r}'
+                                    f', expected {kind} defaulting to '
+                                    f'{default!r}')
+                  want = OPEN + f'inputs.{name}' + CLOSE
+                  if with_.get(passed) != want:
+                      errors.append(f'{path} grype-audit passes {passed} as '
+                                    f'{with_.get(passed)!r}, expected '
+                                    f'{want!r}')
+              if step(doc, 'gerrit-validate', 'validate-grype-policy') is None:
+                  errors.append(f'{path} gerrit-validate has no '
+                                'validate-grype-policy step')
 
-          src="${RUNNER_TEMP}/src"
-          git init -q -b main "${src}"
-          echo '{}' > "${src}/package.json"
-          echo 'fixture' > "${src}/README.md"
-          # Projects for path_prefix to name; it must exist to match
-          for project in app web packages/app packages/web; do
-            mkdir -p "${src}/${project}"
-            echo 'project' > "${src}/${project}/README.md"
+          ref = docs[PATHS[0]]
+          check = step(ref, 'gerrit-validate', 'validate-grype-policy')
+          for path, doc in docs.items():
+              other = step(doc, 'gerrit-validate', 'validate-grype-policy')
+              if check is not None and other != check:
+                  errors.append(f'validate-grype-policy step in {path} '
+                                'diverged from build-test.yaml')
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('Grype policy inputs incorrect \u274c')
+          with open(out, 'w') as handle:
+              handle.write(check['run'])
+          PY
+          # Fail loudly rather than silently testing nothing if the
+          # step loses an input
+          for var in GRYPE_DEPENDENCY_POLICY GRYPE_TRANSITIVE_FAIL_ON \
+            GRYPE_ONLY_FIXED; do
+            if ! grep -q "${var}" "${validate}"; then
+              echo "Could not extract the Grype policy validation ❌"
+              echo "Update the extraction in this job to match"
+              exit 1
+            fi
           done
-          ln -s packages/app "${src}/linked"
-          git -C "${src}" add .
-          git -C "${src}" commit -q -m 'Initial commit'
-          base=$(git -C "${src}" rev-parse HEAD)
-
-          # $1 branch, $2 base revision, then path=content pairs to
-          # write and commit as one commit
-          commit_on() {
-            local branch="$1" from="$2"
-            shift 2
-            git -C "${src}" switch -q -c "${branch}" "${from}"
-            for pair in "$@"; do
-              mkdir -p "$(dirname "${src}/${pair%%=*}")"
-              printf '%s\n' "${pair#*=}" > "${src}/${pair%%=*}"
-              git -C "${src}" add "${pair%%=*}"
-            done
-            git -C "${src}" commit -q -m "${branch}"
-          }
-          # $1 branch, $2 first parent, $3 merged branch: the shape
-          # of GitHub's pull request merge commit
-          merge_on() {
-            git -C "${src}" switch -q -c "$1" "$2"
-            git -C "${src}" merge -q --no-ff -m "$1" "$3"
-          }
-          commit_on lock "${base}" 'package-lock.json={}'
-          commit_on docs "${base}" 'README.md=docs only'
-          commit_on lookalike "${base}" 'notes/package.json.orig=x' \
-            'yarn.lock.md=x'
-          commit_on sibling "${base}" 'web/package.json={}'
-          commit_on inner "${base}" 'app/lib/pnpm-lock.yaml=x'
-          # The base branch moved on with its own dependency change
-          commit_on moved "${base}" 'package.json={"b": 1}'
-          merge_on pr-docs moved docs
-          merge_on pr-lock moved lock
-          # A two-commit push whose last commit is unrelated
-          commit_on push-deps "${base}" 'yarn.lock=x'
-          commit_on push-docs push-deps 'README.md=after the bump'
-          # Git permits a newline in a path
-          commit_on newline "${base}" $'x\n::warning::forged/package.json=x'
-          # Retarget the symlinked project at a different project
-          git -C "${src}" switch -q -c retarget "${base}"
-          ln -sfn packages/web "${src}/linked"
-          git -C "${src}" add linked
-          git -C "${src}" commit -q -m retarget
 
           errors=0
-          # $1 case, $2 branch, $3 depth (0 = full history), $4 want
-          # (true, false, or none for no 'changed' output). EVENT, SHA,
-          # BEFORE, PREFIX and REFSPEC override the run context.
+          # $1 case, $2 accept|reject, $3 dependency policy, $4
+          # transitive fail-on, $5 only-fixed
           check() {
-            local work out rc head got depth=()
-            work=$(mktemp -d)
-            git init -q "${work}"
-            if [ "$3" != '0' ]; then
-              depth=(--depth="$3")
-            fi
-            git -C "${work}" fetch -q "${depth[@]}" \
-              "file://${src}" "refs/heads/$2"
-            git -C "${work}" checkout -q FETCH_HEAD
-            head=$(git -C "${work}" rev-parse HEAD)
-            : > "${work}.out"
+            local out rc
             set +e
-            out="$(cd "${work}" && GITHUB_OUTPUT="${work}.out" \
-              GITHUB_EVENT_NAME="${EVENT:-pull_request}" \
-              GITHUB_SHA="${SHA:-${head}}" EVENT_BEFORE="${BEFORE:-}" \
-              PATH_PREFIX="${PREFIX:-.}" GERRIT_REFSPEC="${REFSPEC:-}" \
-              bash -eo pipefail "${detect}" 2>&1)"
+            out="$(GRYPE_DEPENDENCY_POLICY="$3" \
+              GRYPE_TRANSITIVE_FAIL_ON="$4" GRYPE_ONLY_FIXED="$5" \
+              bash -eo pipefail "${validate}" 2>&1)"
             rc=$?
             set -e
-            if [ "${rc}" != '0' ]; then
-              echo "$1: detection failed (${rc}) ❌"
-              printf '%s\n' "${out}" | tail -n 3
-              errors=1
-              return
-            fi
-            if printf '%s\n' "${out}" | grep -q '^::'; then
-              echo "$1: output carries a workflow command ❌"
-              errors=1
-            fi
-            got=$(sed -n 's/^changed=//p' "${work}.out")
-            got="${got:-none}"
-            if [ "${got}" != "$4" ]; then
-              echo "$1: changed '${got}', expected '$4' ❌"
+            if [ "$2" = 'accept' ] && [ "${rc}" != '0' ]; then
+              echo "$1: rejected, expected accepted ❌"
               printf '%s\n' "${out}"
               errors=1
-            elif ! grep -q '^result=' "${work}.out"; then
-              echo "$1: no result output ❌"
+            elif [ "$2" = 'reject' ] && { [ "${rc}" = '0' ] \
+              || ! printf '%s' "${out}" | grep -q "^::error::Invalid $1 "; }
+            then
+              echo "$1: accepted, or rejected without naming it ❌"
+              printf '%s\n' "${out}"
+              errors=1
+            fi
+            # A rejected value reaches the log; a newline in it must
+            # not start a second workflow command
+            if printf '%s\n' "${out}" | grep -q '^::warning::forged'; then
+              echo "$1: a newline in a rejected value forged a command ❌"
               errors=1
             fi
           }
-
-          check 'lockfile changed' lock 2 true
-          check 'unrelated change' docs 2 false
-          check 'lookalike names' lookalike 2 false
-          check 'no parent fetched' lock 1 none
-          EVENT=workflow_dispatch check 'other event' docs 2 none
-          SHA="${base}" check 'not the triggering commit' lock 2 none
-          # The merge commit's first parent is the base branch, so its
-          # own dependency change is not the PR's
-          check 'merge, PR touches docs' pr-docs 2 false
-          check 'merge, PR touches lockfile' pr-lock 2 true
-          # Every recognised name counts at any depth
-          i=0
-          for name in package.json package-lock.json \
-            npm-shrinkwrap.json yarn.lock .yarnrc.yml pnpm-lock.yaml \
-            pnpm-workspace.yaml bun.lock bun.lockb; do
-            i=$((i + 1))
-            commit_on "nested-${i}" "${base}" "packages/app/${name}=x"
-            check "nested ${name}" "nested-${i}" 2 true
+          check 'defaults' accept declared critical true
+          for policy in all declared; do
+            check "policy ${policy}" accept "${policy}" critical true
           done
-          # path_prefix scopes the match to the project and the
-          # directories above it, where a workspace root lockfile lives
-          PREFIX=app check 'prefix, root lockfile' lock 2 true
-          PREFIX=app check 'prefix, nested in project' inner 2 true
-          PREFIX=app check 'prefix, sibling project' sibling 2 false
-          PREFIX=./packages/app/ check 'prefix, normalised' nested-1 2 \
-            true
-          PREFIX=packages/./app check 'prefix, interior dot' nested-1 2 \
-            true
-          # A symlink on the way to the project can be retargeted by
-          # the change itself, so the answer is left unresolved
-          PREFIX=linked check 'prefix, symlink' nested-1 2 none
-          PREFIX=linked check 'prefix, retargeted symlink' retarget 2 \
-            none
-          PREFIX=missing check 'prefix, missing' nested-1 2 none
-          PREFIX=packages/web check 'prefix, sibling in workspace' \
-            nested-1 2 false
-          check 'path with a newline' newline 2 true
-          # A push compares against 'before', not the last commit
-          EVENT=push BEFORE="${base}" check 'push, full history' \
-            push-docs 0 true
-          EVENT=push BEFORE="${base}" check 'push, before not fetched' \
-            push-docs 2 none
-          EVENT=push BEFORE=0000000000000000000000000000000000000000 \
-            check 'push, new branch' push-docs 0 none
-          # A Gerrit change is its own commit, whatever GITHUB_SHA says
-          REFSPEC=refs/changes/01/1/1 SHA="${base}" \
-            check 'Gerrit change' lock 2 true
-
-          # The Grype job turns its own sbom job's output into the
-          # manifest: $1 case, $2 output, $3 want (manifest content,
-          # or none). A stale file is always present beforehand, so
-          # every case also proves it is replaced or removed.
-          manifest_check() {
-            local work out rc got
-            work=$(mktemp -d)
-            echo '{"changed": false}' > "${work}/dependency-change.json"
-            set +e
-            out="$(cd "${work}" && CHANGED="$2" \
-              bash -eo pipefail "${writer}" 2>&1)"
-            rc=$?
-            set -e
-            if [ "${rc}" != '0' ]; then
-              echo "$1: manifest step failed (${rc}) ❌"
-              printf '%s\n' "${out}"
-              errors=1
-              return
-            fi
-            got=none
-            if [ -e "${work}/dependency-change.json" ]; then
-              got=$(cat "${work}/dependency-change.json")
-            fi
-            if [ "${got}" != "$3" ]; then
-              echo "$1: manifest '${got}', expected '$3' ❌"
-              errors=1
-            fi
-          }
-          manifest_check 'manifest, changed' true '{"changed": true}'
-          manifest_check 'manifest, unchanged' false \
-            '{"changed": false}'
-          manifest_check 'manifest, unresolved' '' none
-          manifest_check 'manifest, unexpected value' 'True' none
+          for severity in none negligible low medium high critical; do
+            check "transitive ${severity}" accept declared "${severity}" true
+          done
+          check 'only-fixed false' accept declared critical false
+          # One bad value per input, each named in the error
+          check grype_dependency_policy reject declare critical true
+          check grype_dependency_policy reject 'all declared' critical true
+          check grype_dependency_policy reject '' critical true
+          check grype_dependency_policy reject Declared critical true
+          check grype_transitive_fail_on reject declared Critical true
+          check grype_transitive_fail_on reject declared '' true
+          check grype_transitive_fail_on reject declared 'low medium' true
+          check grype_only_fixed reject declared critical yes
+          check grype_only_fixed reject declared critical ''
+          check grype_dependency_policy reject \
+            "$(printf 'x\n::warning::forged')" critical true
 
           if [ "${errors}" != '0' ]; then
-            echo "Dependency change detection incorrect ❌" \
-              >> "$GITHUB_STEP_SUMMARY"
+            echo "Grype policy inputs incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          echo "Dependency change detection correct ✅" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Grype policy inputs correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # resolve-commit picks the one commit a Gerrit merge run builds, and
   # refuses one that is not on the target branch (#119). Its resolve
