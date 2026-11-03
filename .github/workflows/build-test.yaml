@@ -245,6 +245,30 @@ on:
         required: false
         type: string
         default: 'always'
+      grype_dependency_policy:
+        description: >-
+          Which Grype findings gate: 'all', or 'declared' to gate only
+          on packages the project declares and report inherited ones
+          as warnings. Inert for Node until the SBOM carries a
+          dependency graph; see the README.
+        required: false
+        type: string
+        default: 'declared'
+      grype_transitive_fail_on:
+        description: >-
+          Minimum severity at which an inherited package still gates
+          under grype_dependency_policy 'declared': 'none',
+          'negligible', 'low', 'medium', 'high' or 'critical'
+        required: false
+        type: string
+        default: 'critical'
+      grype_only_fixed:
+        description: >-
+          Gate only on findings with a published fix; one nobody can
+          act on yet is reported as a warning instead
+        required: false
+        type: boolean
+        default: true
 
       # --- Job timeouts ---
       build_timeout_minutes:
@@ -340,8 +364,8 @@ jobs:
   gerrit-validate:
     name: 'Validate Workflow Inputs'
     # Fails fast with a clear message on invalid workflow inputs: the
-    # test artefact path, job timeouts, the Grype gate mode, and the
-    # Gerrit parameters (when
+    # test artefact path, job timeouts, the Grype gate mode and policy,
+    # and the Gerrit parameters (when
     # gerrit_refspec is set without the project/branch the Gerrit
     # checkout path also requires). The build-chain root job depends on
     # this, so invalid inputs stop the pipeline early and cleanly. This
@@ -480,6 +504,38 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: 'Validate Grype policy inputs'
+        id: validate-grype-policy
+        shell: bash
+        env:
+          GRYPE_DEPENDENCY_POLICY: ${{ inputs.grype_dependency_policy }}
+          GRYPE_TRANSITIVE_FAIL_ON: ${{ inputs.grype_transitive_fail_on }}
+          GRYPE_ONLY_FIXED: ${{ inputs.grype_only_fixed }}
+        run: |
+          # grype-scan-action rejects other values too, but only after
+          # the build and SBOM jobs have run
+          errors=0
+          # $1 input name, $2 its value, then the values it may take
+          check() {
+            local name="$1" value="$2" allowed
+            shift 2
+            for allowed in "$@"; do
+              if [ "${value}" = "${allowed}" ]; then
+                return 0
+              fi
+            done
+            # A newline in the value could forge a workflow command
+            echo "::error::Invalid ${name} input:" \
+              "$(printf '%s' "${value}" | tr -d '\r\n')"
+            errors=1
+          }
+          check grype_dependency_policy "${GRYPE_DEPENDENCY_POLICY}" \
+            all declared
+          check grype_transitive_fail_on "${GRYPE_TRANSITIVE_FAIL_ON}" \
+            none negligible low medium high critical
+          check grype_only_fixed "${GRYPE_ONLY_FIXED}" true false
+          exit "${errors}"
 
       - name: 'Require Gerrit project, branch and URL'
         if: inputs.gerrit_refspec != ''
@@ -1598,6 +1654,9 @@ jobs:
         with:
           sbom: 'sbom-cyclonedx.json'
           fail-on: ${{ inputs.grype_fail_on }}
+          only-fixed: ${{ inputs.grype_only_fixed }}
+          dependency-policy: ${{ inputs.grype_dependency_policy }}
+          transitive-fail-on: ${{ inputs.grype_transitive_fail_on }}
           artifact-name: 'grype-scan-results${{ inputs.artifact_suffix }}'
           gate-when: ${{ inputs.grype_gate_when }}
           # Downloaded beside the SBOM when the sbom job resolved the

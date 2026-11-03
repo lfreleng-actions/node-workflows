@@ -339,49 +339,52 @@ it with `dry_run: true` to rehearse first.
 
 <!-- markdownlint-disable MD013 -->
 
-| Input                                  | Type    | Default    | Description                                                                            |
-| -------------------------------------- | ------- | ---------- | -------------------------------------------------------------------------------------- |
-| `repository`                           | string  | `''`       | Repository to check out (owner/name); empty uses the caller                            |
-| `ref`                                  | string  | `''`       | Checkout ref (empty = event ref; other repos: default branch)                          |
-| `path_prefix`                          | string  | `'.'`      | Path to the project root directory                                                     |
-| `node_version`                         | string  | `''`       | Node.js version; empty auto-detects `engines.node`, then 22                            |
-| `build_node_version`                   | string  | `''`       | Node.js for jobs running the project's toolchain; empty follows `node_version`         |
-| `test_node_version`                    | string  | `''`       | Node.js for the tests job; empty follows `node_version`                                |
-| `test_node_versions`                   | string  | `''`       | Node.js versions to test on, one leg each; JSON array or list, at most 10              |
-| `build_tool`                           | string  | `''`       | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                       |
-| `build_scripts`                        | string  | `'build'`  | package.json script(s) the build job runs                                              |
-| `lockfile_required`                    | boolean | `false`    | Require the build tool's lockfile; see [Lockfiles](#lockfiles)                         |
-| `tests_enabled`                        | boolean | `true`     | Run the tests job (set false to skip tests)                                            |
-| `test_script`                          | string  | `'test'`   | package.json test script(s); comma/space/newline separated list                        |
-| `test_permit_fail`                     | boolean | `false`    | Permit test failures without failing the workflow                                      |
-| `test_artifact_path`                   | string  | `''`       | Test output/report path uploaded as an artefact; empty disables                        |
-| `junit_report_path`                    | string  | `''`       | JUnit XML glob summarised in the tests job and uploaded; empty disables                |
-| `coverage_path`                        | string  | `''`       | `lcov.info`/`coverage-summary.json` (or their directory) summarised and kept           |
-| `artifact_suffix`                      | string  | `''`       | Appended to every artefact name; give each call in one run its own                     |
-| `lint_enabled`                         | boolean | `true`     | Run the lint job (set false to skip); see [Lint](#lint)                                |
-| `lint_hooks`                           | string  | `''`       | Hook ids or aliases to lint with; empty runs the configuration's `ci.skip`             |
-| `lint_permit_fail`                     | boolean | `false`    | Permit lint failures without failing the workflow                                      |
-| `audit_enabled`                        | boolean | `true`     | Run the dependency audit job (set false to skip)                                       |
-| `audit_level`                          | string  | `'high'`   | npm audit severity threshold that fails the audit                                      |
-| `production_only`                      | boolean | `false`    | Restrict the audit to production dependencies                                          |
-| `audit_permit_fail`                    | boolean | `false`    | Permit dependency audit failures (the NO_BLOCK pattern)                                |
-| `sbom_enabled`                         | boolean | `true`     | Generate an SBOM (set false to skip; Grype then has nothing to scan)                   |
-| `grype_enabled`                        | boolean | `true`     | Run the Grype scan (set false to keep the SBOM but skip the scan)                      |
-| `grype_fail_on`                        | string  | `'medium'` | Severity threshold that fails the Grype scan                                           |
-| `grype_permit_fail`                    | boolean | `false`    | Permit Grype findings without failing the job                                          |
-| `grype_gate_when`                      | string  | `'always'` | `always`, or `dependencies-changed`; see [Grype gating](#grype-gating)                 |
-| `build_timeout_minutes`                | number  | `15`       | Timeout (minutes) for the build job                                                    |
-| `test_timeout_minutes`                 | number  | `10`       | Timeout (minutes) for the tests and lint jobs                                          |
-| `audit_timeout_minutes`                | number  | `10`       | Timeout (minutes) for the audit, SBOM and Grype jobs                                   |
-| `harden_runner_egress`                 | string  | `'block'`  | Harden-runner egress policy: `block` or `audit`                                        |
-| `harden_runner_allowlist`              | string  | (pinned)   | Out-of-band harden-runner allow-list configuration                                     |
-| `harden_runner_supplemental_allowlist` | string  | `''`       | Extra allow-list merged with the baseline; see [Egress allow-list](#egress-allow-list) |
-| `harden_runner_supplemental_unpinned`  | boolean | `false`    | Let a supplemental list in the caller's organisation follow its default branch         |
-| `harden_runner_extra_endpoints`        | string  | `''`       | Inline `host[:port]` endpoints for a short-term fix                                    |
-| `gerrit_refspec`                       | string  | `''`       | Gerrit refspec of the change under test                                                |
-| `gerrit_project`                       | string  | `''`       | Gerrit project name                                                                    |
-| `gerrit_branch`                        | string  | `''`       | Gerrit target branch                                                                   |
-| `gerrit_url`                           | string  | `''`       | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                       |
+| Input                                  | Type    | Default      | Description                                                                                |
+| -------------------------------------- | ------- | ------------ | ------------------------------------------------------------------------------------------ |
+| `repository`                           | string  | `''`         | Repository to check out (owner/name); empty uses the caller                                |
+| `ref`                                  | string  | `''`         | Checkout ref (empty = event ref; other repos: default branch)                              |
+| `path_prefix`                          | string  | `'.'`        | Path to the project root directory                                                         |
+| `node_version`                         | string  | `''`         | Node.js version; empty auto-detects `engines.node`, then 22                                |
+| `build_node_version`                   | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`             |
+| `test_node_version`                    | string  | `''`         | Node.js for the tests job; empty follows `node_version`                                    |
+| `test_node_versions`                   | string  | `''`         | Node.js versions to test on, one leg each; JSON array or list, at most 10                  |
+| `build_tool`                           | string  | `''`         | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                           |
+| `build_scripts`                        | string  | `'build'`    | package.json script(s) the build job runs                                                  |
+| `lockfile_required`                    | boolean | `false`      | Require the build tool's lockfile; see [Lockfiles](#lockfiles)                             |
+| `tests_enabled`                        | boolean | `true`       | Run the tests job (set false to skip tests)                                                |
+| `test_script`                          | string  | `'test'`     | package.json test script(s); comma/space/newline separated list                            |
+| `test_permit_fail`                     | boolean | `false`      | Permit test failures without failing the workflow                                          |
+| `test_artifact_path`                   | string  | `''`         | Test output/report path uploaded as an artefact; empty disables                            |
+| `junit_report_path`                    | string  | `''`         | JUnit XML glob summarised in the tests job and uploaded; empty disables                    |
+| `coverage_path`                        | string  | `''`         | `lcov.info`/`coverage-summary.json` (or their directory) summarised and kept               |
+| `artifact_suffix`                      | string  | `''`         | Appended to every artefact name; give each call in one run its own                         |
+| `lint_enabled`                         | boolean | `true`       | Run the lint job (set false to skip); see [Lint](#lint)                                    |
+| `lint_hooks`                           | string  | `''`         | Hook ids or aliases to lint with; empty runs the configuration's `ci.skip`                 |
+| `lint_permit_fail`                     | boolean | `false`      | Permit lint failures without failing the workflow                                          |
+| `audit_enabled`                        | boolean | `true`       | Run the dependency audit job (set false to skip)                                           |
+| `audit_level`                          | string  | `'high'`     | npm audit severity threshold that fails the audit                                          |
+| `production_only`                      | boolean | `false`      | Restrict the audit to production dependencies                                              |
+| `audit_permit_fail`                    | boolean | `false`      | Permit dependency audit failures (the NO_BLOCK pattern)                                    |
+| `sbom_enabled`                         | boolean | `true`       | Generate an SBOM (set false to skip; Grype then has nothing to scan)                       |
+| `grype_enabled`                        | boolean | `true`       | Run the Grype scan (set false to keep the SBOM but skip the scan)                          |
+| `grype_fail_on`                        | string  | `'medium'`   | Severity threshold that fails the Grype scan                                               |
+| `grype_permit_fail`                    | boolean | `false`      | Permit Grype findings without failing the job                                              |
+| `grype_gate_when`                      | string  | `'always'`   | `always`, or `dependencies-changed`; see [Grype gating](#grype-gating)                     |
+| `grype_dependency_policy`              | string  | `'declared'` | `all`, or `declared` to gate on declared packages alone; see [Grype gating](#grype-gating) |
+| `grype_transitive_fail_on`             | string  | `'critical'` | Severity at which an inherited package still gates under `declared`                        |
+| `grype_only_fixed`                     | boolean | `true`       | Gate on findings with a published fix alone; others become warnings                        |
+| `build_timeout_minutes`                | number  | `15`         | Timeout (minutes) for the build job                                                        |
+| `test_timeout_minutes`                 | number  | `10`         | Timeout (minutes) for the tests and lint jobs                                              |
+| `audit_timeout_minutes`                | number  | `10`         | Timeout (minutes) for the audit, SBOM and Grype jobs                                       |
+| `harden_runner_egress`                 | string  | `'block'`    | Harden-runner egress policy: `block` or `audit`                                            |
+| `harden_runner_allowlist`              | string  | (pinned)     | Out-of-band harden-runner allow-list configuration                                         |
+| `harden_runner_supplemental_allowlist` | string  | `''`         | Extra allow-list merged with the baseline; see [Egress allow-list](#egress-allow-list)     |
+| `harden_runner_supplemental_unpinned`  | boolean | `false`      | Let a supplemental list in the caller's organisation follow its default branch             |
+| `harden_runner_extra_endpoints`        | string  | `''`         | Inline `host[:port]` endpoints for a short-term fix                                        |
+| `gerrit_refspec`                       | string  | `''`         | Gerrit refspec of the change under test                                                    |
+| `gerrit_project`                       | string  | `''`         | Gerrit project name                                                                        |
+| `gerrit_branch`                        | string  | `''`         | Gerrit target branch                                                                       |
+| `gerrit_url`                           | string  | `''`         | Gerrit server URL; empty falls back to the `GERRIT_URL` variable                           |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -460,13 +463,36 @@ commit, and a push of commits the shallow checkout did not fetch. Both
 `sbom` checkouts fetch two commits so the parent the comparison needs
 is present; `testing.yaml` asserts that depth.
 
+Three inputs shape what an armed gate blocks on, in both
+`build-test.yaml` and `build-test-release.yaml`. Each reaches
+`grype-scan-action` under its own name less the `grype_` prefix, with
+hyphens for underscores, and `gerrit-validate` rejects a value outside
+each list before the build runs:
+
+- `grype_only_fixed` (`true`): the gate blocks on a finding with a
+  known, published fix version, and nothing else. A finding nobody
+  can act on yet appears as a warning, not a failure.
+- `grype_dependency_policy` (`declared`): `declared` gates on packages
+  the project declares and reports inherited ones as warnings; `all`
+  gates on every finding.
+- `grype_transitive_fail_on` (`critical`): the severity at which an
+  inherited package gates anyway under `declared`, from `none`,
+  `negligible`, `low`, `medium`, `high` or `critical`.
+
+`dependency-policy: declared` changes nothing for Node today: syft
+emits no dependency graph in the SBOM
+([`sbom-action#45`](https://github.com/lfreleng-actions/sbom-action/issues/45)),
+so `grype-scan-action` counts every package as declared, and the
+relief comes from `grype_gate_when` alone. The default means the
+policy takes effect once the graph arrives, without a caller change.
+
 `grype_permit_fail` and the `NO_BLOCK_AUDIT_FAIL` variable apply on top
 of the gate: either passes the job even when the gate blocks. A
 repository that sets `grype_permit_fail: true` to tolerate inherited
 advisories can instead set `grype_gate_when: dependencies-changed`, and
 still block a change that adds a vulnerable dependency.
-`build-test-release.yaml` does not take this input: a release always
-gates.
+`build-test-release.yaml` does not take `grype_gate_when`: a release
+always gates.
 
 ### build-test-release.yaml
 
