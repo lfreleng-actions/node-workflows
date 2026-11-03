@@ -3324,11 +3324,12 @@ jobs:
           PY
           echo "Dependency change wiring correct ✅" >> "$GITHUB_STEP_SUMMARY"
 
-  # The Grype policy inputs reach grype-scan-action only after the
-  # build and SBOM jobs have run, so gerrit-validate rejects a bad
-  # value first. Both workflows must declare the inputs alike, pass
-  # each through, and share one validation step; that step is then
-  # extracted and driven against every value it must reject.
+  # The Grype policy and remediation window inputs reach
+  # grype-scan-action only after the build and SBOM jobs have run, so
+  # gerrit-validate rejects a bad value first. Both workflows must
+  # declare the inputs alike, pass each through, and share one
+  # validation step; that step is then extracted and driven against
+  # every value it must reject.
   grype-policy-inputs:
     name: 'Test: Grype policy inputs'
     runs-on: ubuntu-latest
@@ -3374,6 +3375,10 @@ jobs:
               'grype_transitive_fail_on': ('string', 'critical',
                                            'transitive-fail-on'),
               'grype_only_fixed': ('boolean', True, 'only-fixed'),
+              'grype_remediation_window_days': ('string', '',
+                                                'remediation-window-days'),
+              'grype_remediation_window_start': ('string', '',
+                                                 'remediation-window-start'),
           }
           PATHS = (
               '.github/workflows/build-test.yaml',
@@ -3432,7 +3437,8 @@ jobs:
           # Fail loudly rather than silently testing nothing if the
           # step loses an input
           for var in GRYPE_DEPENDENCY_POLICY GRYPE_TRANSITIVE_FAIL_ON \
-            GRYPE_ONLY_FIXED; do
+            GRYPE_ONLY_FIXED GRYPE_REMEDIATION_WINDOW_DAYS \
+            GRYPE_REMEDIATION_WINDOW_START; do
             if ! grep -q "${var}" "${validate}"; then
               echo "Could not extract the Grype policy validation ❌"
               echo "Update the extraction in this job to match"
@@ -3442,12 +3448,15 @@ jobs:
 
           errors=0
           # $1 case, $2 accept|reject, $3 dependency policy, $4
-          # transitive fail-on, $5 only-fixed
+          # transitive fail-on, $5 only-fixed, $6 remediation window
+          # days and $7 its start, both empty when omitted
           check() {
             local out rc
             set +e
             out="$(GRYPE_DEPENDENCY_POLICY="$3" \
               GRYPE_TRANSITIVE_FAIL_ON="$4" GRYPE_ONLY_FIXED="$5" \
+              GRYPE_REMEDIATION_WINDOW_DAYS="${6-}" \
+              GRYPE_REMEDIATION_WINDOW_START="${7-}" \
               bash -eo pipefail "${validate}" 2>&1)"
             rc=$?
             set -e
@@ -3477,6 +3486,12 @@ jobs:
             check "transitive ${severity}" accept declared "${severity}" true
           done
           check 'only-fixed false' accept declared critical false
+          for days in 0 7 30 365; do
+            check "window ${days} days" accept declared critical true "${days}"
+          done
+          check 'window start' accept declared critical true 30 2026-01-01
+          check 'window start alone' accept declared critical true '' \
+            2026-01-01
           # One bad value per input, each named in the error
           check grype_dependency_policy reject declare critical true
           check grype_dependency_policy reject 'all declared' critical true
@@ -3487,8 +3502,27 @@ jobs:
           check grype_transitive_fail_on reject declared 'low medium' true
           check grype_only_fixed reject declared critical yes
           check grype_only_fixed reject declared critical ''
+          check grype_remediation_window_days reject declared critical true -1
+          check grype_remediation_window_days reject declared critical true 7d
+          check grype_remediation_window_days reject declared critical true \
+            1.5
+          check grype_remediation_window_days reject declared critical true \
+            ' 7'
+          check grype_remediation_window_start reject declared critical true \
+            30 2026-1-1
+          check grype_remediation_window_start reject declared critical true \
+            30 01-01-2026
+          check grype_remediation_window_start reject declared critical true \
+            30 2026-01-01T00:00:00Z
+          check grype_remediation_window_start reject declared critical true \
+            30 today
           check grype_dependency_policy reject \
             "$(printf 'x\n::warning::forged')" critical true
+          # A regex anchored per line would pass the first line here
+          check grype_remediation_window_days reject declared critical true \
+            "$(printf '7\n::warning::forged')"
+          check grype_remediation_window_start reject declared critical true \
+            30 "$(printf '2026-01-01\n::warning::forged')"
 
           if [ "${errors}" != '0' ]; then
             echo "Grype policy inputs incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
