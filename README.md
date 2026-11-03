@@ -373,6 +373,8 @@ it with `dry_run: true` to rehearse first.
 | `grype_dependency_policy`              | string  | `'declared'` | `all`, or `declared` to gate on declared packages alone; see [Grype gating](#grype-gating) |
 | `grype_transitive_fail_on`             | string  | `'critical'` | Severity at which an inherited package still gates under `declared`                        |
 | `grype_only_fixed`                     | boolean | `true`       | Gate on findings with a published fix alone; others become warnings                        |
+| `grype_remediation_window_days`        | string  | `''`         | Days a fix may wait before an unarmed gate blocks; see [Grype gating](#grype-gating)       |
+| `grype_remediation_window_start`       | string  | `''`         | `YYYY-MM-DD` the window counts from at the earliest; empty counts from each fix            |
 | `build_timeout_minutes`                | number  | `15`         | Timeout (minutes) for the build job                                                        |
 | `test_timeout_minutes`                 | number  | `10`         | Timeout (minutes) for the tests and lint jobs                                              |
 | `audit_timeout_minutes`                | number  | `10`         | Timeout (minutes) for the audit, SBOM and Grype jobs                                       |
@@ -486,13 +488,27 @@ so `grype-scan-action` counts every package as declared, and the
 relief comes from `grype_gate_when` alone. The default means the
 policy takes effect once the graph arrives, without a caller change.
 
+Two more inputs bound that relief in time. With `grype_gate_when:
+dependencies-changed` and a change that left the dependency chain
+alone, a finding stays a warning for `grype_remediation_window_days`
+days after its fix became available, then gates as in an armed run.
+The window does nothing on `always` runs, and a finding with no fix
+never gates through it. `grype_remediation_window_start`, a
+`YYYY-MM-DD` date, floors the clock: no finding's window opens before
+that date, so an existing backlog gets the full window when a
+repository adopts the setting. Both default to empty, which leaves the
+window off, as in the action. `gerrit-validate` rejects a days value
+other than a whole number and a start outside that date form, and
+leaves a start in the future to the action.
+
 `grype_permit_fail` and the `NO_BLOCK_AUDIT_FAIL` variable apply on top
 of the gate: either passes the job even when the gate blocks. A
 repository that sets `grype_permit_fail: true` to tolerate inherited
 advisories can instead set `grype_gate_when: dependencies-changed`, and
 still block a change that adds a vulnerable dependency.
 `build-test-release.yaml` does not take `grype_gate_when`: a release
-always gates.
+always gates. It takes the remediation window inputs for parity, but
+they have no effect on a gate that is always armed.
 
 ### build-test-release.yaml
 
