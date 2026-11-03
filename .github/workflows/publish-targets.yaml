@@ -23,9 +23,10 @@ on:
       targets_json:
         description: >-
           JSON array of publish targets. Each entry needs 'name',
-          'registry_url' and 'auth' ('nexus' or 'token'), and may
-          carry 'credential_name' to select a specific 1Password item.
-          Empty falls back to registry_url below.
+          'registry_url' and 'auth' ('nexus', 'token', or 'oidc' where
+          allow_oidc is true), and may carry 'credential_name' to
+          select a specific 1Password item. Empty falls back to
+          registry_url below.
         required: false
         type: string
         default: ''
@@ -44,6 +45,15 @@ on:
         required: false
         type: string
         default: 'publish'
+      allow_oidc:
+        description: >-
+          Accept auth 'oidc' (npm trusted publishing). Only a lane
+          that publishes its oidc_matrix from a job holding
+          'id-token: write' may set this; elsewhere an OIDC target
+          fails here, naming it, rather than mid-publish.
+        required: false
+        type: boolean
+        default: false
     outputs:
       matrix:
         description: 'JSON array of validated targets, for fromJSON()'
@@ -51,6 +61,24 @@ on:
       count:
         description: 'Number of resolved targets'
         value: ${{ jobs.resolve.outputs.count }}
+      credential_matrix:
+        description: >-
+          The targets of matrix that publish with a stored credential
+          ('nexus' or 'token'), for fromJSON(). '[]' when none do, so
+          gate the job on credential_count.
+        value: ${{ jobs.resolve.outputs.credential_matrix }}
+      credential_count:
+        description: 'Number of targets in credential_matrix'
+        value: ${{ jobs.resolve.outputs.credential_count }}
+      oidc_matrix:
+        description: >-
+          The targets of matrix that publish through OIDC trusted
+          publishing, for fromJSON(). '[]' when none do, so gate the
+          job on oidc_count.
+        value: ${{ jobs.resolve.outputs.oidc_matrix }}
+      oidc_count:
+        description: 'Number of targets in oidc_matrix'
+        value: ${{ jobs.resolve.outputs.oidc_count }}
       deprecated_scalar:
         description: >-
           'true' when the result came from registry_url rather than
@@ -69,6 +97,10 @@ jobs:
     outputs:
       matrix: ${{ steps.resolve.outputs.matrix }}
       count: ${{ steps.resolve.outputs.count }}
+      credential_matrix: ${{ steps.resolve.outputs.credential_matrix }}
+      credential_count: ${{ steps.resolve.outputs.credential_count }}
+      oidc_matrix: ${{ steps.resolve.outputs.oidc_matrix }}
+      oidc_count: ${{ steps.resolve.outputs.oidc_count }}
       deprecated_scalar: ${{ steps.resolve.outputs.deprecated_scalar }}
     steps:
       # No checkout: this job reads its inputs and nothing from the
@@ -80,6 +112,7 @@ jobs:
           TARGETS_JSON: ${{ inputs.targets_json }}
           REGISTRY_URL: ${{ inputs.registry_url }}
           LABEL: ${{ inputs.label }}
+          ALLOW_OIDC: ${{ inputs.allow_oidc }}
         run: |
           # Resolve publish targets
           #
@@ -96,8 +129,11 @@ jobs:
           label = os.environ.get('LABEL') or 'publish'
           raw = (os.environ.get('TARGETS_JSON') or '').strip()
           scalar = (os.environ.get('REGISTRY_URL') or '').strip()
+          allow_oidc = os.environ.get('ALLOW_OIDC') == 'true'
 
           AUTH_MODES = {'nexus', 'token'}
+          if allow_oidc:
+              AUTH_MODES.add('oidc')
           # GitHub expands at most 256 jobs from a matrix. A longer list
           # passes every rule below and then fails during expansion,
           # with a platform error rather than this job's actionable one
@@ -275,9 +311,12 @@ jobs:
                   supported = ', '.join(sorted(AUTH_MODES))
                   extra = ''
                   if auth == 'oidc':
+                      # Only a job granted 'id-token: write' can
+                      # publish through OIDC, and only lanes that
+                      # route oidc_matrix to such a job opt in.
                       extra = (
-                          " OIDC trusted publishing is not wired up yet; "
-                          'see issue #54.'
+                          ' OIDC trusted publishing is available in '
+                          "merge.yaml's release_targets only."
                       )
                   fail(
                       f"{where} ({name}) has auth {auth!r}; expected one of "
@@ -291,6 +330,14 @@ jobs:
                   fail(
                       f'{where} ({name}) credential_name contains characters '
                       'outside A-Z a-z 0-9 . _ -'
+                  )
+              # Trusted publishing loads no credential, so a name here
+              # would be inert; refuse it rather than let the caller
+              # believe a stored token backs the publish.
+              if auth == 'oidc' and credential_name:
+                  fail(
+                      f"{where} ({name}) has auth 'oidc', which loads no "
+                      'credential; remove credential_name.'
                   )
 
               # Duplicates are always a mistake and the failure they
@@ -344,11 +391,22 @@ jobs:
                   }
               )
 
-          matrix = json.dumps(resolved, separators=(',', ':'))
+          # Split by whether the leg needs 'id-token: write', so the
+          # grant reaches the OIDC legs and nothing else.
+          stored = [t for t in resolved if t['auth'] != 'oidc']
+          oidc = [t for t in resolved if t['auth'] == 'oidc']
+
+          def as_json(value: list) -> str:
+              return json.dumps(value, separators=(',', ':'))
+
           output = os.environ['GITHUB_OUTPUT']
           with open(output, 'a', encoding='utf-8') as handle:
-              handle.write(f'matrix={matrix}\n')
+              handle.write(f'matrix={as_json(resolved)}\n')
               handle.write(f'count={len(resolved)}\n')
+              handle.write(f'credential_matrix={as_json(stored)}\n')
+              handle.write(f'credential_count={len(stored)}\n')
+              handle.write(f'oidc_matrix={as_json(oidc)}\n')
+              handle.write(f'oidc_count={len(oidc)}\n')
               handle.write(f'deprecated_scalar={str(deprecated).lower()}\n')
 
           names = ', '.join(t['name'] for t in resolved)

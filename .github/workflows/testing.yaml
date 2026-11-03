@@ -1041,6 +1041,19 @@ jobs:
       label: 'self-test'
       registry_url: 'https://nexus3.example.org/repository/npm.release/'
 
+  # The lane that opts in to OIDC splits its targets, so the
+  # 'id-token: write' grant reaches the OIDC legs and nothing else.
+  publish-targets-oidc:
+    name: 'Test: publish targets (OIDC split)'
+    permissions:
+      contents: read
+    uses: $/.github/workflows/publish-targets.yaml
+    with:
+      label: 'self-test'
+      allow_oidc: true
+      # yamllint disable-line rule:line-length
+      targets_json: '[{"name":"nexus","registry_url":"https://nexus3.example.org/repository/npm.release/","auth":"nexus"},{"name":"npmjs","registry_url":"https://registry.npmjs.org/","auth":"oidc"}]'
+
   # Confirms the resolver produces what the publish jobs consume: a
   # matrix of the expected length, and the scalar path flagged as
   # deprecated so the notice cannot silently stop firing.
@@ -1050,6 +1063,7 @@ jobs:
     needs:
       - 'publish-targets-valid'
       - 'publish-targets-scalar'
+      - 'publish-targets-oidc'
     permissions:
       contents: read
     timeout-minutes: 5
@@ -1077,6 +1091,16 @@ jobs:
           SCALAR_MATRIX: ${{ needs.publish-targets-scalar.outputs.matrix }}
           # yamllint disable-line rule:line-length
           SCALAR_DEPRECATED: ${{ needs.publish-targets-scalar.outputs.deprecated_scalar }}
+          # yamllint disable-line rule:line-length
+          LIST_CREDENTIAL: ${{ needs.publish-targets-valid.outputs.credential_matrix }}
+          LIST_OIDC: ${{ needs.publish-targets-valid.outputs.oidc_matrix }}
+          LIST_OIDC_COUNT: ${{ needs.publish-targets-valid.outputs.oidc_count }}
+          # yamllint disable-line rule:line-length
+          SPLIT_CREDENTIAL: ${{ needs.publish-targets-oidc.outputs.credential_matrix }}
+          # yamllint disable-line rule:line-length
+          SPLIT_CREDENTIAL_COUNT: ${{ needs.publish-targets-oidc.outputs.credential_count }}
+          SPLIT_OIDC: ${{ needs.publish-targets-oidc.outputs.oidc_matrix }}
+          SPLIT_OIDC_COUNT: ${{ needs.publish-targets-oidc.outputs.oidc_count }}
         run: |
           # Assert resolved targets
           errors=0
@@ -1131,6 +1155,36 @@ jobs:
             printf 'want: %s\n' "${scalar_want}"
             errors=1
           fi
+          # The split decides which legs hold 'id-token: write'. An
+          # OIDC target among the credential legs could not publish,
+          # and a stored-credential target among the OIDC legs would
+          # run with a grant it does not need.
+          # $1 label, $2 got, $3 want
+          same() {
+            if ! printf '%s' "$2" \
+              | jq -e --argjson want "$3" '. == $want' > /dev/null; then
+              echo "$1 does not match ❌"
+              printf 'got:  %s\n' "$2"
+              printf 'want: %s\n' "$3"
+              errors=1
+            fi
+          }
+          same 'List credential_matrix' "${LIST_CREDENTIAL}" "${expected}"
+          same 'List oidc_matrix' "${LIST_OIDC}" '[]'
+          if [ "${LIST_OIDC_COUNT}" != "0" ]; then
+            echo "List form counted ${LIST_OIDC_COUNT} OIDC targets ❌"
+            errors=1
+          fi
+          same 'Split credential_matrix' "${SPLIT_CREDENTIAL}" \
+            '[{"name":"nexus","registry_url":"https://nexus3.example.org/repository/npm.release/","auth":"nexus","credential_name":""}]'
+          same 'Split oidc_matrix' "${SPLIT_OIDC}" \
+            '[{"name":"npmjs","registry_url":"https://registry.npmjs.org/","auth":"oidc","credential_name":""}]'
+          if [ "${SPLIT_CREDENTIAL_COUNT}" != "1" ] \
+            || [ "${SPLIT_OIDC_COUNT}" != "1" ]; then
+            echo "Split counts ${SPLIT_CREDENTIAL_COUNT}/${SPLIT_OIDC_COUNT}," \
+              "expected 1/1 ❌"
+            errors=1
+          fi
           if [ "${errors}" != "0" ]; then
             echo "Publish target resolution failed ❌" \
               >> "$GITHUB_STEP_SUMMARY"
@@ -1175,6 +1229,7 @@ jobs:
               'merge.yaml': {
                   'snapshot-publish': 'snapshot_environment',
                   'release-publish': 'release_environment',
+                  'release-publish-oidc': 'release_environment',
               },
               'build-test-release.yaml': {
                   'nexus-publish': 'publish_environment',
@@ -1242,11 +1297,25 @@ jobs:
               'merge.yaml': {
                   'snapshot-publish': 'resolve-snapshot-targets',
                   'release-publish': 'resolve-release-targets',
+                  'release-publish-oidc': 'resolve-release-targets',
               },
               'build-test-release.yaml': {
                   'nexus-publish': 'resolve-publish-targets',
               },
           }
+
+          # The release lane splits its targets by whether a leg needs
+          # 'id-token: write' (#54), so each of its jobs expands its
+          # own share. Expanding the whole matrix would hand the
+          # credential job an OIDC leg it cannot publish, or the OIDC
+          # job a credential leg that would run holding the grant.
+          MATRIX_OUTPUT = {
+              ('merge.yaml', 'release-publish'): 'credential_matrix',
+              ('merge.yaml', 'release-publish-oidc'): 'oidc_matrix',
+          }
+          # Legs publishing through OIDC load no credential; the rest
+          # route one per target.
+          OIDC_JOBS = {('merge.yaml', 'release-publish-oidc')}
 
           # Publishing is opt-in in build-test-release.yaml, so its
           # resolver carries a gate the merge lanes do not need.
@@ -1277,6 +1346,9 @@ jobs:
               ('merge.yaml', 'release-publish'):
                   'pack-dist/' + OPEN
                   + 'needs.pack-release.outputs.tarball_name' + CLOSE,
+              ('merge.yaml', 'release-publish-oidc'):
+                  'pack-dist/' + OPEN
+                  + 'needs.pack-release.outputs.tarball_name' + CLOSE,
               ('build-test-release.yaml', 'nexus-publish'):
                   OPEN + 'needs.build.outputs.artefact_path' + CLOSE
                   + '/' + OPEN + 'needs.build.outputs.tarball_name'
@@ -1303,9 +1375,10 @@ jobs:
                   # 'needs.X.outputs.matrix' alone is a JSON string,
                   # not a list: it satisfies a substring test while
                   # expanding to no legs at all.
+                  field = MATRIX_OUTPUT.get((name, job_id), 'matrix')
                   wanted = (
                       OPEN
-                      + f'fromJSON(needs.{resolver}.outputs.matrix)'
+                      + f'fromJSON(needs.{resolver}.outputs.{field})'
                       + CLOSE
                   )
                   if target != wanted:
@@ -1385,6 +1458,54 @@ jobs:
                       errors.append(
                           f'{where} never reads matrix.target.registry_url'
                       )
+                  # A split matrix can be empty, and GitHub fails a job
+                  # expanding an empty matrix, so each split job skips
+                  # on its own count.
+                  if field != 'matrix':
+                      count = field.replace('_matrix', '_count')
+                      gate = (f'needs.{resolver}.outputs.{count}'
+                              " != '0'")
+                      if gate not in str(job.get('if', '')):
+                          errors.append(f'{where} does not gate on {gate}')
+                  # Only an OIDC job may hold the token grant, and it
+                  # must: without it npm has nothing to exchange.
+                  grant = (job.get('permissions') or {}).get('id-token')
+                  if (name, job_id) in OIDC_JOBS:
+                      if grant != 'write':
+                          errors.append(
+                              f'{where} lacks id-token: write, which OIDC '
+                              'trusted publishing needs'
+                          )
+                      publish = [
+                          s.get('with') or {}
+                          for s in job.get('steps') or []
+                          if 'node-publish-action' in str(s.get('uses', ''))
+                      ]
+                      if len(publish) != 1 or str(
+                              publish[0].get('oidc', '')) != 'true':
+                          errors.append(
+                              f"{where} does not publish with oidc: 'true'"
+                          )
+                      else:
+                          for field_name in ('nexus_password', 'auth_token',
+                                             'load_credential',
+                                             'provenance'):
+                              if field_name in publish[0]:
+                                  errors.append(
+                                      f'{where} passes {field_name}, which '
+                                      'node-publish-action refuses with oidc'
+                                  )
+                      if 'credential-load-action' in blob:
+                          errors.append(
+                              f'{where} loads a credential; OIDC legs '
+                              'must not'
+                          )
+                      continue
+                  if grant is not None:
+                      errors.append(
+                          f'{where} holds id-token: {grant}; only the OIDC '
+                          'publish job may'
+                      )
                   # Per-target credential routing is the reason a
                   # single lane can reach registries with unrelated
                   # credentials. Each input is compared against its
@@ -1449,12 +1570,13 @@ jobs:
                       'release-publish needs its tarball whether or '
                       'not attestation and signing are enabled'
                   )
-          publish_if = str(merge_jobs['release-publish'].get('if', ''))
-          if "pack-release.result == 'skipped'" in publish_if:
-              errors.append(
-                  'merge.yaml/release-publish accepts a skipped '
-                  "pack-release, but publishes that job's tarball"
-              )
+          for job_id in ('release-publish', 'release-publish-oidc'):
+              publish_if = str(merge_jobs[job_id].get('if', ''))
+              if "pack-release.result == 'skipped'" in publish_if:
+                  errors.append(
+                      f'merge.yaml/{job_id} accepts a skipped '
+                      "pack-release, but publishes that job's tarball"
+                  )
 
           # The release SBOM (#127) has to scan the stamped project
           # directory: the packed tree holds no lockfile and yields no
@@ -1529,11 +1651,12 @@ jobs:
                   'merge.yaml/grype is not continue-on-error, so a '
                   'scanner failure would fail the merge run'
               )
-          if 'grype' in (merge_jobs['release-publish'].get('needs') or []):
-              errors.append(
-                  'merge.yaml/release-publish needs grype, so an '
-                  'informational scan would gate the publish'
-              )
+          for job_id in ('release-publish', 'release-publish-oidc'):
+              if 'grype' in (merge_jobs[job_id].get('needs') or []):
+                  errors.append(
+                      f'merge.yaml/{job_id} needs grype, so an '
+                      'informational scan would gate the publish'
+                  )
 
           # A release version that disagrees with version.properties
           # has to fail the run (#118). It used to be a version
@@ -1561,7 +1684,8 @@ jobs:
               errors.append(
                   'merge.yaml/check-release has no verify-version step'
               )
-          for job_id in ('pack-release', 'release-publish'):
+          for job_id in ('pack-release', 'release-publish',
+                         'release-publish-oidc'):
               job_if = str(merge_jobs[job_id].get('if', ''))
               if "needs.check-release.result == 'success'" not in job_if:
                   errors.append(
@@ -1728,7 +1852,8 @@ jobs:
                   'resolver to succeed, so release_only cannot skip it'
               )
           for job_id in ('resolve-release-targets', 'check-release',
-                         'pack-release', 'release-publish'):
+                         'pack-release', 'release-publish',
+                         'release-publish-oidc'):
               if 'release_only' in str(merge_jobs[job_id].get('if', '')):
                   errors.append(
                       f'merge.yaml/{job_id} is gated on release_only, '
@@ -1751,7 +1876,8 @@ jobs:
           # which has to keep naming the newest release (#122).
           # Releases keep that default.
           dist_tags = {}
-          for job_id in ('snapshot-publish', 'release-publish'):
+          for job_id in ('snapshot-publish', 'release-publish',
+                         'release-publish-oidc'):
               for step in merge_jobs[job_id].get('steps') or []:
                   if 'node-publish-action' in str(step.get('uses', '')):
                       dist_tags[job_id] = str(
@@ -1763,11 +1889,12 @@ jobs:
                   f"{dist_tags.get('snapshot-publish')!r}, expected "
                   f'{wanted_tag!r}; snapshots must not take latest'
               )
-          if dist_tags.get('release-publish'):
-              errors.append(
-                  'merge.yaml/release-publish overrides the dist-tag; '
-                  'releases keep latest'
-              )
+          for job_id in ('release-publish', 'release-publish-oidc'):
+              if dist_tags.get(job_id):
+                  errors.append(
+                      f'merge.yaml/{job_id} overrides the dist-tag; '
+                      'releases keep latest'
+                  )
 
           if errors:
               for message in errors:
@@ -1937,6 +2064,23 @@ jobs:
                   errors.append(
                       f'merge.yaml output {name} reports a dry run '
                       'as published'
+                  )
+          # The release lane publishes from two jobs (#54); a release
+          # is published only when both are done with their share.
+          release_value = str(
+              (outputs.get('release_published') or {}).get('value', ''))
+          for job_id, count in (('release-publish', 'credential_count'),
+                                ('release-publish-oidc', 'oidc_count')):
+              done = (
+                  f'({gate(job_id)} || '
+                  f"(fromJSON(toJSON(jobs.{job_id})).result == 'skipped'"
+                  f' && jobs.resolve-release-targets.outputs.{count}'
+                  " == '0'))"
+              )
+              if done not in release_value:
+                  errors.append(
+                      'merge.yaml output release_published does not '
+                      f'require {done}'
                   )
 
           # The Gerrit example reports these outputs on the change; a
@@ -2254,6 +2398,7 @@ jobs:
           check() {
             set +e
             out="$(LABEL='self-test' TARGETS_JSON="$3" REGISTRY_URL='' \
+              ALLOW_OIDC="${ALLOW_OIDC:-false}" \
               GITHUB_OUTPUT="${RUNNER_TEMP}/out.txt" \
               python3 "${validator}" 2>&1)"
             rc=$?
@@ -2324,9 +2469,15 @@ jobs:
             '[{"name":"a","registry_url":"https://a.example.org:abc/","auth":"nexus"}]'
           check 'port out of range' reject \
             '[{"name":"a","registry_url":"https://a.example.org:99999/","auth":"nexus"}]'
-          # OIDC is not wired up yet and must say so rather than pass
-          check 'oidc auth' reject \
-            "[{\"name\":\"a\",\"registry_url\":\"${nexus}\",\"auth\":\"oidc\"}]"
+          # OIDC needs 'id-token: write', which only a lane opting in
+          # grants, so every other lane refuses it up front
+          check 'oidc auth without opt-in' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${npmjs}\",\"auth\":\"oidc\"}]"
+          ALLOW_OIDC=true check 'oidc auth with opt-in' accept \
+            "[{\"name\":\"a\",\"registry_url\":\"${npmjs}\",\"auth\":\"oidc\"}]"
+          # Trusted publishing loads no credential, so a name is inert
+          ALLOW_OIDC=true check 'oidc auth with credential_name' reject \
+            "[{\"name\":\"a\",\"registry_url\":\"${npmjs}\",\"auth\":\"oidc\",\"credential_name\":\"x\"}]"
           check 'name with newline' reject \
             "[{\"name\":\"a\nb\",\"registry_url\":\"${nexus}\",\"auth\":\"nexus\"}]"
           check 'duplicate name' reject \
