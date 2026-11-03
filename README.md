@@ -443,22 +443,22 @@ lint: they build commits that already passed this one.
 With `grype_gate_when: dependencies-changed`, Grype still scans and
 reports every finding. Findings at or above `grype_fail_on` block the
 job when the change touched the dependency chain, and otherwise appear
-as warnings. The `sbom` job decides this by comparing the
-change with its base for any of `package.json`, `package-lock.json`,
-`npm-shrinkwrap.json`, `yarn.lock`, `.yarnrc.yml`, `pnpm-lock.yaml`,
-`pnpm-workspace.yaml`, `bun.lock` or `bun.lockb`, at any depth inside
-`path_prefix` or directly in a directory above it, where a workspace
-root keeps its lockfile.
+as warnings. The `sbom` job calls
+[`dependency-change-action`](https://github.com/lfreleng-actions/dependency-change-action)
+with its `node` preset to decide this, and uploads the
+`dependency-change.json` sidecar the action writes beside the SBOM, in
+the `sbom-files` artefact, for the `grype` job to read. The action's
+README lists the files the preset matches, how it chooses the base
+commit for each event, and why a symbolic link or submodule it cannot
+vouch for leaves the answer unresolved.
 
-The base is the first parent of GitHub's merge commit on
-`pull_request`, the parent of the change on Gerrit, and
-`github.event.before` on `push` when the checkout holds it: a push of
-one commit, such as a merged pull request. Anything else leaves the
-answer unresolved and the gate on. That covers scheduled and manual
-runs, other events, a `repository` or `ref` naming something other
-than the triggering commit, a push of commits the shallow checkout
-did not fetch, and a `path_prefix` that is missing or passes through a
-symlink, which a change could retarget.
+The action fails closed: whenever it cannot prove what the change
+touched, it writes no sidecar, and the `grype` job then finds no
+manifest and keeps the gate on. That covers scheduled and manual runs,
+a `repository` or `ref` naming something other than the triggering
+commit, and a push of commits the shallow checkout did not fetch. Both
+`sbom` checkouts fetch two commits so the parent the comparison needs
+is present; `testing.yaml` asserts that depth.
 
 `grype_permit_fail` and the `NO_BLOCK_AUDIT_FAIL` variable apply on top
 of the gate: either passes the job even when the gate blocks. A
@@ -1290,7 +1290,12 @@ their passing verdicts. Each leg passes its name as
   wrote as `node-build-output-<leg>`;
 - each leg's Grype job downloaded, by the artefact ID its download
   step names, the SBOM its own leg uploaded, so legs that cross over
-  fail the check.
+  fail the check;
+- no leg's SBOM artefact carries a `dependency-change.json` sidecar:
+  the `test-node-project` leg runs the `dependencies-changed` gate
+  against a fixture at a pinned commit, which the detection cannot
+  resolve, so the upload has to succeed without the sidecar and the
+  Grype job keeps its gate on.
 
 Every leg also passes the [Egress allow-list](#egress-allow-list)
 inputs in `block` mode: `lfreleng-actions//` as an unpinned
