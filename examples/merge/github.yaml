@@ -57,11 +57,14 @@ jobs:
     name: 'Merge/Publish'
     # The caller's permissions cap what the reusable workflow's jobs
     # can request, so id-token/attestations must be granted here or
-    # the attest and sign-artefacts jobs cannot run. Drop them if you
-    # set attestations and sigstore_sign to false.
+    # the attest and sign-artefacts jobs cannot run. npm trusted
+    # publishing ("auth": "oidc" below) needs id-token: write here
+    # too. Keep both: GitHub refuses to start the run when a called
+    # job declares a permission this job does not grant, even a job
+    # that would skip.
     permissions:
       contents: read
-      id-token: write       # OIDC for provenance and Sigstore signing
+      id-token: write       # Provenance, Sigstore, npm trusted publishing
       attestations: write   # Build provenance attestations
     # REPLACE the pinned SHA below with a node-workflows release SHA.
     # The all-zero SHA is a non-functional placeholder, NOT a real commit.
@@ -103,6 +106,26 @@ jobs:
       #        "auth": "token",
       #        "credential_name": "example-npmjs-publish-token"}
       #     ]
+      #
+      # Or publish to npmjs.org with npm trusted publishing (OIDC),
+      # which stores no npm token:
+      #
+      #   release_targets: |
+      #     [
+      #       {"name": "nexus",
+      #        "registry_url":
+      #          "https://nexus3.example.org/repository/npm.release/",
+      #        "auth": "nexus"},
+      #       {"name": "npmjs",
+      #        "registry_url": "https://registry.npmjs.org/",
+      #        "auth": "oidc"}
+      #     ]
+      #
+      # On npmjs.com, register THIS workflow's filename (for example
+      # merge.yaml) as the package's trusted publisher, not the
+      # reusable merge.yaml: npm checks the calling workflow. The
+      # package.json repository.url must match this GitHub repository
+      # exactly, and npm adds provenance only for a public repository.
       release_targets: |
         [
           {"name": "nexus",
@@ -119,6 +142,7 @@ jobs:
       # harden_runner_egress: 'block' # 'block' (default) or 'audit'
       # attestations: true            # SLSA provenance for releases
       # sigstore_sign: true           # Sigstore bundle for releases
+      # oidc_node_version: '24'       # Node.js for "auth": "oidc" legs
       # snapshot_environment: ''      # environment gating snapshots
       # release_environment: ''       # e.g. one requiring a reviewer
     secrets:
