@@ -143,6 +143,45 @@ on:
         required: false
         type: boolean
         default: true
+      # The policy inputs default to grype-scan-action's own values,
+      # and permit-fail stays on, so the scan reports and never gates
+      grype_fail_on:
+        description: >-
+          Severity at which Grype findings count as failures in the
+          report: 'none', 'negligible', 'low', 'medium', 'high' or
+          'critical'
+        required: false
+        type: string
+        default: 'medium'
+      grype_only_fixed:
+        description: >-
+          Count only findings with a published fix version as failures
+        required: false
+        type: boolean
+        default: false
+      grype_dependency_policy:
+        description: >-
+          Which Grype findings count as failures: 'all', or 'declared'
+          for packages the project declares
+        required: false
+        type: string
+        default: 'all'
+      grype_transitive_fail_on:
+        description: >-
+          Severity at which an inherited package counts anyway under
+          'declared': 'none', 'negligible', 'low', 'medium', 'high' or
+          'critical'
+        required: false
+        type: string
+        default: 'none'
+      grype_bypass_repository:
+        description: >-
+          Repository holding approved Grype bypass issues, as
+          owner/name. Empty uses the calling repository; name a shared
+          one for an organisation-wide bypass list
+        required: false
+        type: string
+        default: ''
 
       # --- Nexus/registry publishing ---
       #
@@ -474,6 +513,56 @@ jobs:
             exit 1
           fi
 
+      - name: 'Validate Grype policy inputs'
+        id: validate-grype-policy
+        shell: bash
+        env:
+          GRYPE_FAIL_ON: ${{ inputs.grype_fail_on }}
+          GRYPE_DEPENDENCY_POLICY: ${{ inputs.grype_dependency_policy }}
+          GRYPE_TRANSITIVE_FAIL_ON: ${{ inputs.grype_transitive_fail_on }}
+          GRYPE_ONLY_FIXED: ${{ inputs.grype_only_fixed }}
+          GRYPE_BYPASS_REPOSITORY: ${{ inputs.grype_bypass_repository }}
+        run: |
+          # grype-scan-action rejects other values too, but only after
+          # the build and pack jobs have run, and the Grype job
+          # continues on error, so the typo would go unseen
+          errors=0
+          # $1 input name, $2 the value it rejected
+          reject() {
+            # A newline in the value could forge a workflow command
+            echo "::error::Invalid $1 input:" \
+              "$(printf '%s' "$2" | tr -d '\r\n')"
+            errors=1
+          }
+          # $1 input name, $2 its value, then the values it may take
+          check() {
+            local name="$1" value="$2" allowed
+            shift 2
+            for allowed in "$@"; do
+              if [ "${value}" = "${allowed}" ]; then
+                return 0
+              fi
+            done
+            reject "${name}" "${value}"
+          }
+          # $1 input name, $2 its value, $3 the regex it must match
+          match() {
+            if [[ ! "$2" =~ $3 ]]; then
+              reject "$1" "$2"
+            fi
+          }
+          check grype_fail_on "${GRYPE_FAIL_ON}" \
+            none negligible low medium high critical
+          check grype_dependency_policy "${GRYPE_DEPENDENCY_POLICY}" \
+            all declared
+          check grype_transitive_fail_on "${GRYPE_TRANSITIVE_FAIL_ON}" \
+            none negligible low medium high critical
+          check grype_only_fixed "${GRYPE_ONLY_FIXED}" true false
+          # Empty reads bypasses from the calling repository
+          match grype_bypass_repository "${GRYPE_BYPASS_REPOSITORY}" \
+            '^([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?$'
+          exit "${errors}"
+
       - name: 'Require Gerrit project, branch and URL'
         if: inputs.gerrit_refspec != ''
         shell: bash
@@ -704,7 +793,7 @@ jobs:
       - name: 'Gather repository metadata'
         id: repo-metadata
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/repository-metadata-action@2206d754f65f1a90f57b49be546712c5f594def2  # v0.3.3
+        uses: lfreleng-actions/repository-metadata-action@18e5b7c5b16423b0e734891d103513826b324858  # v0.4.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           github_summary: 'true'
@@ -3194,7 +3283,11 @@ jobs:
         uses: lfreleng-actions/grype-scan-action@5c81b23afb2ea771b2d247807a12d90783328675  # v0.5.0
         with:
           sbom: 'sbom-cyclonedx.json'
-          fail-on: 'medium'
+          fail-on: ${{ inputs.grype_fail_on }}
+          only-fixed: ${{ inputs.grype_only_fixed }}
+          dependency-policy: ${{ inputs.grype_dependency_policy }}
+          transitive-fail-on: ${{ inputs.grype_transitive_fail_on }}
+          bypass-repository: ${{ inputs.grype_bypass_repository }}
           permit-fail: 'true'
           github-token: ${{ secrets.GITHUB_TOKEN }}
           # Distinct from the verify lane's default name, which a

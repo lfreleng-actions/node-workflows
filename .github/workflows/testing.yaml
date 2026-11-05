@@ -280,9 +280,9 @@ jobs:
     if: ${{ !cancelled() }}
     permissions:
       actions: read  # list this run's jobs and download its artefacts
-    # Four job listings at up to 90s each with retries, three artefact
+    # Five job listings at up to 90s each with retries, three artefact
     # listings at up to 45s each, plus downloads and runner hardening
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
@@ -636,36 +636,46 @@ jobs:
           exit "${status}"
 
       # test-node-project runs the dependencies-changed gate against a
-      # fixture at a pinned commit, which dependency-change-action
-      # cannot resolve: it writes no sidecar, the SBOM upload has to
-      # succeed without one, and the Grype job then finds no manifest
-      # and keeps the gate on. Every other leg runs the always gate and
-      # never calls the action, so none may carry a sidecar either.
-      - name: 'Assert the unresolved change uploaded no sidecar'
+      # fixture at a pinned commit, which the detection in its
+      # repository-metadata job cannot resolve. That job passes an
+      # empty verdict, and the Grype job has to keep its gate on. The
+      # gate summary step names the reason grype-scan-action gave.
+      # The dependency-change-resolved job covers a resolved verdict.
+      - name: 'Assert the unresolved change kept the gate on'
         shell: bash
         env:
-          # Keep in step with the build-test matrix names
-          LEGS: >-
-            test-node-project sdc-onap-ui-common variant-pnpm
-            variant-pnpm-workspace variant-yarn-berry variant-yarn-classic
-            variant-bun
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          # Keep in step with the build-test matrix: every leg on the
+          # dependencies-changed gate
+          LEGS: 'test-node-project'
+          EXPECT: 'the dependency-change signal was unavailable'
         run: |
-          # Assert the unresolved change uploaded no sidecar
+          # Assert the unresolved change kept the gate on
           set -euo pipefail
-          shopt -s nullglob
           status=0
           fail() { echo "::error::$1"; status=1; }
+          # shellcheck source=/dev/null
+          . "${RUNNER_TEMP}/gh-api.sh"
+          api="repos/${REPOSITORY}/actions/runs/${RUN_ID}"
+          # Keep the prefix in step with the grype job's summary step
+          # Small pages: each job carries its steps, and a page of 100
+          # outruns the API gateway timeout and answers 502
+          gates="$(gh_api --paginate "${api}/jobs?filter=latest&per_page=30" \
+            --jq '.jobs[] | [.name] + [.steps[]? | .name
+                | select(startswith("Grype gate summary: "))
+                | ltrimstr("Grype gate summary: ")]
+              | select(length > 1) | @tsv')"
           for leg in ${LEGS}; do
-            dirs=("sbom-files-${leg}"/*/)
-            if [ "${#dirs[@]}" -ne 1 ]; then
-              fail "Found ${#dirs[@]} sbom-files-${leg} artefacts, expected 1"
-              continue
-            fi
-            sidecar="${dirs[0]}dependency-change.json"
-            if [ -e "${sidecar}" ]; then
-              fail "sbom-files-${leg} carries a sidecar: $(cat "${sidecar}")"
+            job="Build/Test (${leg}) / Grype Audit SBOM"
+            reason="$(awk -F'\t' -v n="${job}" '$1 == n { print $2 }' \
+              <<< "${gates}")"
+            if [ "${reason}" = "${EXPECT}" ]; then
+              echo "${job}: ${reason} ✅"
             else
-              echo "sbom-files-${leg}: no sidecar, the gate stays on ✅"
+              fail "${job}: gate reason '${reason//$'\n'/ }'," \
+                "expected '${EXPECT}'"
             fi
           done
           exit "${status}"
@@ -3142,13 +3152,14 @@ jobs:
           echo "Release schema validation correct ✅" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # build-test's dependencies-changed Grype gate trusts a sidecar that
-  # dependency-change-action writes in the sbom job and the Grype job
-  # reads from the SBOM artefact. The action's own suite proves what it
-  # writes; this job proves the wiring around it: the pinned call, the
-  # checkout depth it needs, the sidecar's path through the artefact,
-  # and that no inline detection or job-output route survives beside
-  # it, where the two could drift apart.
+  # build-test's dependencies-changed Grype gate reads a verdict that
+  # repository-metadata-action reaches in the repository-metadata job
+  # and hands the Grype job as a job output. The actions' own suites
+  # prove what each does; this job proves the wiring between them:
+  # one pin in every workflow, the detection inputs, the guarded job
+  # output reaching the scan, a Grype job that still runs when the
+  # metadata job fails, and that nothing of the sbom job's earlier
+  # detection route survives, where two routes could drift apart.
   dependency-change-wiring:
     name: 'Test: dependency change wiring'
     runs-on: ubuntu-latest
@@ -3182,139 +3193,126 @@ jobs:
 
           import yaml
 
-          ACTION = 'lfreleng-actions/dependency-change-action'
-          PIN = '257928b15e4e6a5cc5a888435be59b058055c4e1'
-          SIDECAR = 'dependency-change.json'
+          ACTION = 'lfreleng-actions/repository-metadata-action'
+          PIN = '18e5b7c5b16423b0e734891d103513826b324858'
+          # The sbom job's former route: a detection step, the sidecar
+          # it wrote and the scan input that read it
+          RETIRED = 'lfreleng-actions/dependency-change-action'
+          GONE = ('dependency-change.json', 'dependency-change-manifest')
+          PATHS = (
+              '.github/workflows/build-test.yaml',
+              '.github/workflows/build-test-release.yaml',
+              '.github/workflows/merge.yaml',
+          )
           # Split so Actions leaves the expressions in this script
           # unexpanded
           OPEN = '$' + '{{ '
           CLOSE = ' }' + '}'
-
-          with open('.github/workflows/build-test.yaml') as handle:
-              doc = yaml.safe_load(handle)
-          jobs = doc['jobs']
-          sbom = jobs['sbom']
-          grype = jobs['grype']
           errors = []
 
+          def steps(doc):
+              for name, job in doc['jobs'].items():
+                  for s in job.get('steps') or []:
+                      yield name, s
+
           def step(job, key, value):
-              found = [s for s in job['steps'] if s.get(key) == value]
+              found = [s for s in job.get('steps') or []
+                       if s.get(key) == value]
               return found[0] if found else None
 
-          # The sbom job's signal comes from the pinned action alone:
-          # no run step in either job may detect or write it, where a
-          # second implementation would drift from the tested one
-          for name, job in (('sbom', sbom), ('grype', grype)):
-              for s in job['steps']:
-                  run = s.get('run') or ''
-                  if 'changed=' in run or SIDECAR in run:
-                      errors.append(
-                          f"build-test.yaml/{name} step {s.get('name')!r}"
-                          ' carries inline dependency change handling')
-          if 'dependency_changed' in (sbom.get('outputs') or {}):
-              errors.append('build-test.yaml/sbom still publishes the '
-                            'dependency_changed output')
-          if step(grype, 'name', 'Write dependency-change manifest'):
-              errors.append('build-test.yaml/grype still writes the '
-                            'manifest from a job output')
+          docs = {}
+          for path in PATHS:
+              with open(path) as handle:
+                  text = handle.read()
+              docs[path] = yaml.safe_load(text)
+              for gone in GONE:
+                  if gone in text:
+                      errors.append(f'{path} still mentions {gone}')
+              calls = 0
+              for job, s in steps(docs[path]):
+                  uses = str(s.get('uses', ''))
+                  if uses.startswith(f'{RETIRED}@'):
+                      errors.append(f'{path}/{job} still calls {RETIRED}')
+                  if uses.startswith(f'{ACTION}@'):
+                      calls += 1
+                      if uses != f'{ACTION}@{PIN}':
+                          errors.append(f'{path}/{job} uses {uses!r}, '
+                                        f'expected {ACTION}@{PIN}')
+              if calls == 0:
+                  errors.append(f'{path} never calls {ACTION}')
 
-          detect = step(sbom, 'id', 'dependency-change')
+          jobs = docs[PATHS[0]]['jobs']
+          meta = jobs['repository-metadata']
+          detect = step(meta, 'id', 'repo-metadata')
           if detect is None:
-              errors.append('build-test.yaml/sbom has no dependency-change '
-                            'step')
+              errors.append('build-test.yaml/repository-metadata has no '
+                            'repo-metadata step')
           else:
-              uses = str(detect.get('uses', ''))
-              if uses != f'{ACTION}@{PIN}':
-                  errors.append(f'dependency-change step uses {uses!r}, '
-                                f'expected {ACTION}@{PIN}')
               want = {
-                  'ecosystems': 'node',
-                  'path-prefix': OPEN + 'inputs.path_prefix' + CLOSE,
-                  'gerrit-refspec': OPEN + 'inputs.gerrit_refspec' + CLOSE,
-                  'output': SIDECAR,
+                  'dependency_change': (
+                      'inputs.grype_enabled && inputs.grype_gate_when '
+                      "== 'dependencies-changed'"),
+                  'gerrit_refspec': 'inputs.gerrit_refspec',
+                  'dependency_ecosystems':
+                      'inputs.grype_dependency_ecosystems',
+                  'dependency_patterns': 'inputs.grype_dependency_patterns',
+                  'dependency_path_prefix': 'inputs.path_prefix',
               }
               got = detect.get('with') or {}
               for key, value in want.items():
+                  value = OPEN + value + CLOSE
                   if got.get(key) != value:
-                      errors.append(f'dependency-change input {key} is '
+                      errors.append(f'repo-metadata input {key} is '
                                     f'{got.get(key)!r}, expected {value!r}')
-              cond = str(detect.get('if', ''))
-              if ('inputs.grype_enabled' not in cond
-                      or "inputs.grype_gate_when == 'dependencies-changed'"
-                      not in cond):
-                  errors.append('dependency-change step does not run only '
-                                'for the dependencies-changed gate')
+          output = (meta.get('outputs') or {}).get('dependencies_changed')
+          value = (OPEN + 'steps.repo-metadata.outputs.dependencies_changed'
+                   + CLOSE)
+          if output != value:
+              errors.append('repository-metadata output '
+                            f'dependencies_changed is {output!r}, '
+                            f'expected {value!r}')
 
-          # The action compares HEAD with its parent, so both checkouts
-          # must fetch at least two commits. actions/checkout defaults
-          # to 1; checkout-gerrit-change-action defaults to 2, so an
-          # unset depth is fine there and a set one must still reach 2
-          for name, default in (
-              ('actions/checkout', 1),
-              ('lfreleng-actions/checkout-gerrit-change-action', 2),
-          ):
-              found = [s for s in sbom['steps']
-                       if str(s.get('uses', '')).startswith(f'{name}@')]
-              if len(found) != 1:
-                  errors.append(f'build-test.yaml/sbom has {len(found)} '
-                                f'{name} steps, expected 1')
-                  continue
-              depth = (found[0].get('with') or {}).get('fetch-depth',
-                                                        default)
-              # 0 fetches all history, which also holds the parent
-              if not isinstance(depth, int) or 0 < depth < 2:
-                  errors.append(f'build-test.yaml/sbom {name} fetch-depth '
-                                f'is {depth!r}; the dependency change '
-                                'base needs 2 or more')
-
-          # The sidecar travels in the SBOM artefact, beside the SBOM,
-          # so the Grype job reads its own call's signal and a matrix
-          # job would carry one per leg. The SBOM always matches, so
-          # an unresolved run with no sidecar still uploads and the
-          # error setting stays a guard on the SBOM alone
-          upload = step(sbom, 'id', 'upload-sbom')
-          if upload is None:
-              errors.append('build-test.yaml/sbom has no upload-sbom step')
-          else:
-              with_ = upload.get('with') or {}
-              paths = str(with_.get('path', '')).split()
-              if paths[:1] != ['sbom-cyclonedx.*'] or SIDECAR not in paths:
-                  errors.append(f'upload-sbom uploads {paths!r}, expected '
-                                f"['sbom-cyclonedx.*', {SIDECAR!r}]")
-              if with_.get('if-no-files-found') != 'error':
-                  errors.append('upload-sbom does not fail on a missing '
-                                'SBOM')
-
-          # A single artefact downloaded by ID lands in the working
-          # directory, so the sidecar sits beside the SBOM where the
-          # scan step names both by bare file name
-          download = step(grype, 'id', 'download-sbom')
-          if download is None:
-              errors.append('build-test.yaml/grype has no download-sbom '
-                            'step')
-          else:
-              with_ = download.get('with') or {}
-              if (with_.get('artifact-ids')
-                      != OPEN + 'needs.sbom.outputs.sbom_artifact_id' + CLOSE
-                      or 'path' in with_ or 'name' in with_):
-                  errors.append('download-sbom does not fetch the sbom '
-                                "job's artefact by ID into the working "
-                                'directory')
+          # The Grype job waits for the verdict but must not depend on
+          # it succeeding: a failed or skipped metadata job still scans,
+          # with an empty verdict, which gates
+          grype = jobs['grype']
+          needs = grype.get('needs') or []
+          if isinstance(needs, str):
+              needs = [needs]
+          for need in ('sbom', 'repository-metadata'):
+              if need not in needs:
+                  errors.append(f'build-test.yaml/grype does not need {need}')
+          cond = str(grype.get('if', ''))
+          if '!cancelled()' not in cond:
+              errors.append('build-test.yaml/grype lacks the !cancelled() '
+                            'guard, so a failed metadata job skips the scan')
+          if 'needs.repository-metadata' in cond:
+              errors.append('build-test.yaml/grype runs only on some '
+                            'repository-metadata results')
           scan = step(grype, 'id', 'grype-audit')
           if scan is None:
               errors.append('build-test.yaml/grype has no grype-audit step')
           else:
-              with_ = scan.get('with') or {}
-              if with_.get('dependency-change-manifest') != SIDECAR:
-                  errors.append('grype-audit reads '
-                                f"{with_.get('dependency-change-manifest')!r}"
-                                f', expected {SIDECAR!r}')
-              if with_.get('sbom') != 'sbom-cyclonedx.json':
-                  errors.append('grype-audit does not scan '
-                                'sbom-cyclonedx.json')
-              if with_.get('dependencies-changed'):
-                  errors.append('grype-audit sets dependencies-changed, '
-                                'which overrides the sidecar')
+              got = (scan.get('with') or {}).get('dependencies-changed')
+              value = (OPEN + "needs.repository-metadata.result == 'success'"
+                       ' && needs.repository-metadata.outputs.'
+                       "dependencies_changed || ''" + CLOSE)
+              if got != value:
+                  errors.append(f'grype-audit dependencies-changed is '
+                                f'{got!r}, expected {value!r}')
+          # build-test-assert reads the gate reason from this name
+          summary = OPEN + 'steps.grype-audit.outputs.gate-reason' + CLOSE
+          if step(grype, 'name', f'Grype gate summary: {summary}') is None:
+              errors.append('build-test.yaml/grype has no gate summary '
+                            'step named for the gate reason')
+
+          # Nothing else in the sbom job needs history, so its checkout
+          # keeps actions/checkout's single commit
+          for s in jobs['sbom']['steps']:
+              if str(s.get('uses', '')).startswith('actions/checkout@'):
+                  if 'fetch-depth' in (s.get('with') or {}):
+                      errors.append('build-test.yaml/sbom checkout still '
+                                    'sets fetch-depth')
 
           if errors:
               for message in errors:
@@ -3324,12 +3322,230 @@ jobs:
           PY
           echo "Dependency change wiring correct ✅" >> "$GITHUB_STEP_SUMMARY"
 
-  # The Grype policy and remediation window inputs reach
+      # The detector rejects an unknown preset too, but only in the
+      # repository-metadata job, so gerrit-validate catches a typo
+      # first. Its step is extracted and driven against each value it
+      # must accept or reject.
+      - name: 'Exercise the grype_dependency_ecosystems validation'
+        shell: bash
+        run: |
+          # Exercise the grype_dependency_ecosystems validation
+          validate="${RUNNER_TEMP}/validate-grype-ecosystems.sh"
+          python3 - "${validate}" <<'PY'
+          import sys
+
+          import yaml
+
+          with open('.github/workflows/build-test.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          found = [s for s in doc['jobs']['gerrit-validate']['steps']
+                   if s.get('id') == 'validate-grype-ecosystems']
+          if not found:
+              sys.exit('build-test.yaml gerrit-validate has no '
+                       'validate-grype-ecosystems step \u274c')
+          with open(sys.argv[1], 'w') as handle:
+              handle.write(found[0]['run'])
+          PY
+          if ! grep -q 'GRYPE_DEPENDENCY_ECOSYSTEMS' "${validate}"; then
+            echo "Could not extract the ecosystems validation ❌"
+            exit 1
+          fi
+
+          errors=0
+          # $1 accept|reject, $2 the value
+          check() {
+            local out rc
+            set +e
+            out="$(GRYPE_DEPENDENCY_ECOSYSTEMS="$2" \
+              bash -eo pipefail "${validate}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "$1" = 'accept' ] && [ "${rc}" != '0' ]; then
+              echo "'$2': rejected, expected accepted ❌"
+              printf '%s\n' "${out}"
+              errors=1
+            elif [ "$1" = 'reject' ] && { [ "${rc}" = '0' ] \
+              || ! printf '%s' "${out}" \
+                | grep -q '^::error::Invalid grype_dependency_ecosystems '; }
+            then
+              echo "'$2': accepted, or rejected without naming it ❌"
+              printf '%s\n' "${out}"
+              errors=1
+            fi
+            if printf '%s\n' "${out}" | grep -q '^::warning::forged'; then
+              echo "'$2': a newline in a rejected value forged a command ❌"
+              errors=1
+            fi
+          }
+          # Empty selects every preset
+          check accept ''
+          for name in node python go maven gradle rust docker; do
+            check accept "${name}"
+          done
+          check accept 'node,python,go,maven,gradle,rust,docker'
+          # Trimmed, and empty names skipped, as the detector does
+          check accept ' node , docker '
+          check accept 'node,'
+          check accept 'go,,rust'
+          check reject npm
+          check reject Node
+          check reject 'node,npm'
+          check reject 'node python'
+          check reject 'node;python'
+          # A value naming no preset would drop them all
+          check reject ' '
+          check reject ','
+          check reject "$(printf 'node\n::warning::forged')"
+
+          if [ "${errors}" != '0' ]; then
+            echo "Ecosystems validation incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Ecosystems validation correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Every build-test leg checks out a fixture at a pinned commit, which
+  # detection cannot resolve, so build-test-assert proves only that an
+  # unresolved verdict keeps the gate on. These two jobs prove the
+  # resolved side with the pins build-test.yaml uses: detection over
+  # this pull request's own merge commit, which resolves, reaching
+  # grype-scan-action through the same guarded job output. The wiring
+  # job above holds build-test.yaml to these expressions.
+  dependency-change-resolved:
+    name: 'Test: dependency change resolved'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read  # repository-metadata-action queries PR data
+    timeout-minutes: 5
+    outputs:
+      # yamllint disable-line rule:line-length
+      dependencies_changed: ${{ steps.repo-metadata.outputs.dependencies_changed }}
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # The merge commit GitHub built for this pull request, with the
+      # history build-test's metadata checkout fetches
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 'Gather repository metadata'
+        id: repo-metadata
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/repository-metadata-action@18e5b7c5b16423b0e734891d103513826b324858  # v0.4.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_summary: 'false'
+          artifact_upload: 'false'
+          dependency_change: 'true'
+          gerrit_refspec: ''
+
+  dependency-change-resolved-grype:
+    name: 'Test: dependency change reaches Grype'
+    runs-on: ubuntu-latest
+    needs: dependency-change-resolved
+    # As in build-test.yaml: run whatever the metadata job's result,
+    # so a failure there surfaces as a wrong gate reason here
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # The verdict is under test, not the package, so any SBOM Grype
+      # can scan serves
+      - name: 'Write a one-package SBOM'
+        shell: bash
+        run: |
+          # Write a one-package SBOM
+          cat > sbom-cyclonedx.json << 'EOF'
+          {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "components": [
+              {
+                "type": "library",
+                "name": "left-pad",
+                "version": "1.3.0",
+                "purl": "pkg:npm/left-pad@1.3.0"
+              }
+            ]
+          }
+          EOF
+
+      - name: 'Grype audit SBOM'
+        id: grype-audit
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/grype-scan-action@5c81b23afb2ea771b2d247807a12d90783328675  # v0.5.0
+        with:
+          sbom: 'sbom-cyclonedx.json'
+          gate-when: 'dependencies-changed'
+          # yamllint disable-line rule:line-length
+          dependencies-changed: ${{ needs.dependency-change-resolved.result == 'success' && needs.dependency-change-resolved.outputs.dependencies_changed || '' }}
+          # The gate reason is the result; a finding must not fail it
+          permit-fail: 'true'
+          bypass-enabled: 'false'
+          upload-artifact: 'false'
+          cache-db: 'restore-only'
+
+      - name: 'Assert the resolved verdict reached Grype'
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          RESULT: ${{ needs.dependency-change-resolved.result }}
+          # yamllint disable-line rule:line-length
+          VERDICT: ${{ needs.dependency-change-resolved.outputs.dependencies_changed }}
+          GATE_REASON: ${{ steps.grype-audit.outputs.gate-reason }}
+        run: |
+          # Assert the resolved verdict reached Grype
+          set -euo pipefail
+          case "${VERDICT}" in
+            true) want='this change touched the dependency chain' ;;
+            false) want='this change did not touch the dependency chain' ;;
+            *)
+              echo "::error::Detection did not resolve this pull request:" \
+                "metadata job ${RESULT}, verdict '${VERDICT}'"
+              exit 1
+              ;;
+          esac
+          if [ "${GATE_REASON}" != "${want}" ]; then
+            echo "::error::Verdict ${VERDICT} gave gate reason" \
+              "'${GATE_REASON}', expected '${want}'"
+            exit 1
+          fi
+          echo "Resolved verdict ${VERDICT} reached Grype ✅" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The Grype policy, bypass and remediation window inputs reach
   # grype-scan-action only after the build and SBOM jobs have run, so
-  # gerrit-validate rejects a bad value first. Both workflows must
-  # declare the inputs alike, pass each through, and share one
-  # validation step; that step is then extracted and driven against
-  # every value it must reject.
+  # gerrit-validate rejects a bad value first. The verify workflows
+  # must declare the inputs alike, pass each through, and share one
+  # validation step; merge.yaml declares its own defaults and its own
+  # step. Each step is then extracted and driven against every value
+  # it must accept or reject.
   grype-policy-inputs:
     name: 'Test: Grype policy inputs'
     runs-on: ubuntu-latest
@@ -3359,17 +3575,20 @@ jobs:
         run: |
           # Exercise the Grype policy inputs
           validate="${RUNNER_TEMP}/validate-grype-policy.sh"
-          python3 - "${validate}" <<'PY'
+          merge="${RUNNER_TEMP}/validate-grype-policy-merge.sh"
+          python3 - "${validate}" "${merge}" <<'PY'
           import sys
 
           import yaml
 
-          out = sys.argv[1]
+          out, merge_out = sys.argv[1], sys.argv[2]
           # Split so Actions leaves the expressions in this script
           # unexpanded
           OPEN = '$' + '{{ '
           CLOSE = ' }' + '}'
-          INPUTS = {
+          # Name: (type, default, grype-audit input it feeds)
+          VERIFY = {
+              'grype_fail_on': ('string', 'medium', 'fail-on'),
               'grype_dependency_policy': ('string', 'declared',
                                           'dependency-policy'),
               'grype_transitive_fail_on': ('string', 'critical',
@@ -3379,11 +3598,30 @@ jobs:
                                                 'remediation-window-days'),
               'grype_remediation_window_start': ('string', '',
                                                  'remediation-window-start'),
+              'grype_bypass_repository': ('string', '',
+                                          'bypass-repository'),
+          }
+          # The merge lane reports and never gates, so its policy
+          # defaults are grype-scan-action's own
+          MERGE = {
+              'grype_fail_on': ('string', 'medium', 'fail-on'),
+              'grype_dependency_policy': ('string', 'all',
+                                          'dependency-policy'),
+              'grype_transitive_fail_on': ('string', 'none',
+                                           'transitive-fail-on'),
+              'grype_only_fixed': ('boolean', False, 'only-fixed'),
+              'grype_bypass_repository': ('string', '',
+                                          'bypass-repository'),
           }
           PATHS = (
               '.github/workflows/build-test.yaml',
               '.github/workflows/build-test-release.yaml',
           )
+          MERGE_PATH = '.github/workflows/merge.yaml'
+          # Detection inputs, which feed the repository-metadata job;
+          # dependency-change-wiring asserts where they go
+          DETECTION = ('grype_dependency_ecosystems',
+                       'grype_dependency_patterns')
 
           def step(doc, job, step_id):
               steps = doc['jobs'][job]['steps']
@@ -3392,15 +3630,16 @@ jobs:
 
           errors = []
           docs = {}
-          for path in PATHS:
+          for path in PATHS + (MERGE_PATH,):
               with open(path) as handle:
                   docs[path] = yaml.safe_load(handle)
           for path, doc in docs.items():
+              table = MERGE if path == MERGE_PATH else VERIFY
               # PyYAML reads the bare 'on' key as True
               inputs = doc[True]['workflow_call']['inputs']
               scan = step(doc, 'grype', 'grype-audit')
               with_ = (scan or {}).get('with') or {}
-              for name, (kind, default, passed) in INPUTS.items():
+              for name, (kind, default, passed) in table.items():
                   spec = inputs.get(name)
                   if spec is None:
                       errors.append(f'{path} lacks the {name} input')
@@ -3420,9 +3659,17 @@ jobs:
                   errors.append(f'{path} gerrit-validate has no '
                                 'validate-grype-policy step')
 
+          inputs = docs[PATHS[0]][True]['workflow_call']['inputs']
+          for name in DETECTION:
+              spec = inputs.get(name) or {}
+              if spec.get('type') != 'string' or spec.get('default') != '':
+                  errors.append(f'{PATHS[0]} {name} is not a string '
+                                "input defaulting to ''")
+
           ref = docs[PATHS[0]]
           check = step(ref, 'gerrit-validate', 'validate-grype-policy')
-          for path, doc in docs.items():
+          for path in PATHS:
+              doc = docs[path]
               other = step(doc, 'gerrit-validate', 'validate-grype-policy')
               if check is not None and other != check:
                   errors.append(f'validate-grype-policy step in {path} '
@@ -3433,14 +3680,27 @@ jobs:
               sys.exit('Grype policy inputs incorrect \u274c')
           with open(out, 'w') as handle:
               handle.write(check['run'])
+          with open(merge_out, 'w') as handle:
+              handle.write(step(docs[MERGE_PATH], 'gerrit-validate',
+                                'validate-grype-policy')['run'])
           PY
-          # Fail loudly rather than silently testing nothing if the
-          # step loses an input
-          for var in GRYPE_DEPENDENCY_POLICY GRYPE_TRANSITIVE_FAIL_ON \
-            GRYPE_ONLY_FIXED GRYPE_REMEDIATION_WINDOW_DAYS \
-            GRYPE_REMEDIATION_WINDOW_START; do
+          # Fail loudly rather than silently testing nothing if a step
+          # loses an input
+          for var in GRYPE_FAIL_ON GRYPE_DEPENDENCY_POLICY \
+            GRYPE_TRANSITIVE_FAIL_ON GRYPE_ONLY_FIXED \
+            GRYPE_REMEDIATION_WINDOW_DAYS GRYPE_REMEDIATION_WINDOW_START \
+            GRYPE_BYPASS_REPOSITORY; do
             if ! grep -q "${var}" "${validate}"; then
               echo "Could not extract the Grype policy validation ❌"
+              echo "Update the extraction in this job to match"
+              exit 1
+            fi
+          done
+          for var in GRYPE_FAIL_ON GRYPE_DEPENDENCY_POLICY \
+            GRYPE_TRANSITIVE_FAIL_ON GRYPE_ONLY_FIXED \
+            GRYPE_BYPASS_REPOSITORY; do
+            if ! grep -q "${var}" "${merge}"; then
+              echo "Could not extract merge.yaml's Grype validation ❌"
               echo "Update the extraction in this job to match"
               exit 1
             fi
@@ -3449,7 +3709,10 @@ jobs:
           errors=0
           # $1 case, $2 accept|reject, $3 dependency policy, $4
           # transitive fail-on, $5 only-fixed, $6 remediation window
-          # days and $7 its start, both empty when omitted
+          # days and $7 its start, both empty when omitted. FAIL_ON
+          # (default medium) and BYPASS (default empty), set before the
+          # call, override the other two inputs; SCRIPT picks the step
+          # under test, build-test's by default
           check() {
             local out rc
             set +e
@@ -3457,7 +3720,9 @@ jobs:
               GRYPE_TRANSITIVE_FAIL_ON="$4" GRYPE_ONLY_FIXED="$5" \
               GRYPE_REMEDIATION_WINDOW_DAYS="${6-}" \
               GRYPE_REMEDIATION_WINDOW_START="${7-}" \
-              bash -eo pipefail "${validate}" 2>&1)"
+              GRYPE_FAIL_ON="${FAIL_ON-medium}" \
+              GRYPE_BYPASS_REPOSITORY="${BYPASS-}" \
+              bash -eo pipefail "${SCRIPT:-${validate}}" 2>&1)"
             rc=$?
             set -e
             if [ "$2" = 'accept' ] && [ "${rc}" != '0' ]; then
@@ -3523,6 +3788,38 @@ jobs:
             "$(printf '7\n::warning::forged')"
           check grype_remediation_window_start reject declared critical true \
             30 "$(printf '2026-01-01\n::warning::forged')"
+
+          # fail-on and the bypass repository, against both steps
+          for SCRIPT in "${validate}" "${merge}"; do
+            for severity in none negligible low medium high critical; do
+              FAIL_ON="${severity}" check "fail-on ${severity}" accept \
+                all none false
+            done
+            for repo in lfreleng-actions/bypasses org.name/repo_1-x; do
+              BYPASS="${repo}" check "bypass ${repo}" accept all none false
+            done
+            for bad in Medium '' 'low high' "$(printf 'x\n::warning::forged')"
+            do
+              FAIL_ON="${bad}" check grype_fail_on reject all none false
+            done
+            for bad in lfreleng-actions 'a/b/c' '/repo' 'owner/' \
+              'owner/repo name' 'https://github.com/o/r' \
+              "$(printf 'o/r\n::warning::forged')"; do
+              BYPASS="${bad}" check grype_bypass_repository reject \
+                all none false
+            done
+          done
+
+          # merge.yaml's defaults and the policy values it shares
+          SCRIPT="${merge}"
+          check 'merge defaults' accept all none false
+          check 'merge declared' accept declared critical true
+          check grype_dependency_policy reject declare none false
+          check grype_transitive_fail_on reject all Critical false
+          check grype_only_fixed reject all none yes
+          check grype_dependency_policy reject \
+            "$(printf 'x\n::warning::forged')" none false
+          unset SCRIPT
 
           if [ "${errors}" != '0' ]; then
             echo "Grype policy inputs incorrect ❌" >> "$GITHUB_STEP_SUMMARY"

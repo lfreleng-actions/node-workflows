@@ -38,6 +38,7 @@ GitHub-native and a Gerrit-wrapped variant per workflow.
 gerrit-validate -> { repository-metadata | node-metadata }
 node-metadata -> { build | lint }
 build -> { tests | audit | sbom -> grype }
+repository-metadata -> grype
 ```
 
 `build-test-release.yaml` (gating inversion: the audits gate the
@@ -194,10 +195,15 @@ attests this SBOM against the release tarball; see
 [Verifying Release Artefacts](#verifying-release-artefacts-model-a).
 
 A `grype` job then scans the release SBOM, informationally, as in
-`java-workflows`' merge lane: findings at `medium` or above appear in
-the job summary, but the job never fails the run and the publish does
-not wait for it. The verify lane's Grype scan is the gate. Set
-`grype_enabled: false` to skip it.
+`java-workflows`' merge lane: findings at `grype_fail_on` (`medium`)
+or above appear in the job summary, but the job never fails the run
+and the publish does not wait for it. The verify lane's Grype scan is
+the gate. `grype_only_fixed`, `grype_dependency_policy`,
+`grype_transitive_fail_on` and `grype_bypass_repository` shape the
+report as they do the verify lane's gate, and default to
+`grype-scan-action`'s own values; `gerrit-validate` rejects a value
+outside each list before the build runs. Set `grype_enabled: false`
+to skip the scan.
 
 The calling job must grant `id-token: write` and `attestations: write`.
 A caller's `permissions` block caps what the reusable workflow's jobs
@@ -367,9 +373,12 @@ it with `dry_run: true` to rehearse first.
 | `audit_permit_fail`                    | boolean | `false`      | Permit dependency audit failures (the NO_BLOCK pattern)                                    |
 | `sbom_enabled`                         | boolean | `true`       | Generate an SBOM (set false to skip; Grype then has nothing to scan)                       |
 | `grype_enabled`                        | boolean | `true`       | Run the Grype scan (set false to keep the SBOM but skip the scan)                          |
-| `grype_fail_on`                        | string  | `'medium'`   | Severity threshold that fails the Grype scan                                               |
+| `grype_fail_on`                        | string  | `'medium'`   | Severity threshold that fails the Grype scan, or `none`                                    |
 | `grype_permit_fail`                    | boolean | `false`      | Permit Grype findings without failing the job                                              |
+| `grype_bypass_repository`              | string  | `''`         | `owner/name` holding approved bypass issues; empty uses the calling repository             |
 | `grype_gate_when`                      | string  | `'always'`   | `always`, or `dependencies-changed`; see [Grype gating](#grype-gating)                     |
+| `grype_dependency_ecosystems`          | string  | `''`         | Comma-separated presets `dependencies-changed` watches; empty watches them all             |
+| `grype_dependency_patterns`            | string  | `''`         | Extra dependency file patterns, one per line, added to the presets                         |
 | `grype_dependency_policy`              | string  | `'declared'` | `all`, or `declared` to gate on declared packages alone; see [Grype gating](#grype-gating) |
 | `grype_transitive_fail_on`             | string  | `'critical'` | Severity at which an inherited package still gates under `declared`                        |
 | `grype_only_fixed`                     | boolean | `true`       | Gate on findings with a published fix alone; others become warnings                        |
@@ -448,22 +457,31 @@ lint: they build commits that already passed this one.
 With `grype_gate_when: dependencies-changed`, Grype still scans and
 reports every finding. Findings at or above `grype_fail_on` block the
 job when the change touched the dependency chain, and otherwise appear
-as warnings. The `sbom` job calls
-[`dependency-change-action`](https://github.com/lfreleng-actions/dependency-change-action)
-with its `node` preset to decide this, and uploads the
-`dependency-change.json` sidecar the action writes beside the SBOM, in
-the `sbom-files` artefact, for the `grype` job to read. The action's
-README lists the files the preset matches, how it chooses the base
-commit for each event, and why a symbolic link or submodule it cannot
-vouch for leaves the answer unresolved.
+as warnings. The `repository-metadata` job decides this through
+`repository-metadata-action`'s
+[dependency change detection](https://github.com/lfreleng-actions/repository-metadata-action#dependency-change-detection),
+over the checkout that job already holds: full history, or a Gerrit
+change with its parent. It hands the `grype` job a
+`dependencies_changed` job output of `true`, `false` or empty. The
+action's README lists the files each preset matches, how it chooses
+the base commit for each event, and why a symbolic link or submodule
+it cannot vouch for leaves the answer unresolved.
 
-The action fails closed: whenever it cannot prove what the change
-touched, it writes no sidecar, and the `grype` job then finds no
-manifest and keeps the gate on. That covers scheduled and manual runs,
-a `repository` or `ref` naming something other than the triggering
-commit, and a push of commits the shallow checkout did not fetch. Both
-`sbom` checkouts fetch two commits so the parent the comparison needs
-is present; `testing.yaml` asserts that depth.
+Detection watches every preset the action knows (`node`, `python`,
+`go`, `maven`, `gradle`, `rust` and `docker`), so a change to a
+Dockerfile or a Python helper's requirements arms the gate too.
+`grype_dependency_ecosystems` narrows that to a comma-separated list,
+which `gerrit-validate` checks against those names, and
+`grype_dependency_patterns` adds file patterns of the repository's
+own, one per line. Both look under `path_prefix`.
+
+Detection fails closed: whenever it cannot prove what the change
+touched, the verdict is empty and the gate stays on. That covers
+scheduled and manual runs, and a `repository` or `ref` naming
+something other than the triggering commit. The `grype` job waits for
+`repository-metadata` but runs whatever its result. It drops the
+verdict unless that job succeeded, so a failed or skipped metadata job
+keeps the gate on rather than skipping the scan.
 
 Three inputs shape what an armed gate blocks on, in both
 `build-test.yaml` and `build-test-release.yaml`. Each reaches
@@ -506,13 +524,20 @@ of the gate: either passes the job even when the gate blocks. A
 repository that sets `grype_permit_fail: true` to tolerate inherited
 advisories can instead set `grype_gate_when: dependencies-changed`, and
 still block a change that adds a vulnerable dependency.
+`grype_bypass_repository` names the `owner/name` repository whose
+approved `BYPASS:` issues the scan honours, so repositories can
+share one list; empty keeps the calling repository.
+`gerrit-validate` rejects a value of any other form, and a
+`grype_fail_on` outside `none`, `negligible`, `low`, `medium`, `high`
+and `critical`.
 `build-test-release.yaml` does not take `grype_gate_when`: a release
 always gates. It takes the remediation window inputs for parity, but
 they have no effect on a gate that is always armed.
 
 ### build-test-release.yaml
 
-All `build-test.yaml` inputs above except `grype_gate_when` (with
+All `build-test.yaml` inputs above except `grype_gate_when`,
+`grype_dependency_ecosystems` and `grype_dependency_patterns` (with
 `build_timeout_minutes` and `test_timeout_minutes` both defaulting to
 `12`, and `lockfile_required` defaulting to `true`), plus:
 
@@ -566,6 +591,11 @@ All `build-test.yaml` inputs above except `grype_gate_when` (with
 | `sigstore_sign`                        | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
 | `sbom_enabled`                         | boolean | `true`       | Generate the release SBOM (`sbom-files-node-merge` artefact); a failure blocks the release publish                               |
 | `grype_enabled`                        | boolean | `true`       | Run the informational Grype scan over the release SBOM; never fails the run                                                      |
+| `grype_fail_on`                        | string  | `'medium'`   | Severity at which findings count as failures in the report: `none`, `negligible`, `low`, `medium`, `high` or `critical`          |
+| `grype_only_fixed`                     | boolean | `false`      | Count findings with a published fix alone as failures                                                                            |
+| `grype_dependency_policy`              | string  | `'all'`      | `all`, or `declared` to count the packages the project declares                                                                  |
+| `grype_transitive_fail_on`             | string  | `'none'`     | Severity at which an inherited package counts anyway under `declared`                                                            |
+| `grype_bypass_repository`              | string  | `''`         | `owner/name` holding approved bypass issues; empty uses the calling repository                                                   |
 | `snapshot_targets`                     | string  | `''`         | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
 | `release_targets`                      | string  | `''`         | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
 | `snapshot_registry_url`                | string  | `''`         | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
@@ -1333,11 +1363,10 @@ their passing verdicts. Each leg passes its name as
 - each leg's Grype job downloaded, by the artefact ID its download
   step names, the SBOM its own leg uploaded, so legs that cross over
   fail the check;
-- no leg's SBOM artefact carries a `dependency-change.json` sidecar:
-  the `test-node-project` leg runs the `dependencies-changed` gate
-  against a fixture at a pinned commit, which the detection cannot
-  resolve, so the upload has to succeed without the sidecar and the
-  Grype job keeps its gate on.
+- the `test-node-project` leg's Grype job kept its gate on, with the
+  reason `the dependency-change signal was unavailable`: the leg runs
+  the `dependencies-changed` gate against a fixture at a pinned
+  commit, which detection cannot resolve.
 
 Every leg also passes the [Egress allow-list](#egress-allow-list)
 inputs in `block` mode: `lfreleng-actions//` as an unpinned
@@ -1353,6 +1382,13 @@ covers the failing case: it runs the linting action at the commit
 npm fixture, and requires the copy with a seeded unused variable to
 fail and the unmodified copy to pass. It also asserts the lint job's
 wiring, inputs and configuration guard from the workflow file. The
+`dependency-change-resolved` jobs cover the resolved side of the
+`dependencies-changed` gate, which no fixture leg can reach: they run
+detection and Grype at `build-test.yaml`'s pins over the pull
+request's own merge commit, and require a `true` or `false` verdict to
+reach Grype as the matching gate reason. The
+`dependency-change-wiring` job holds `build-test.yaml` to the same
+expressions and drives its ecosystems validation. The
 release and merge workflows
 need tag-push and merged-commit contexts (plus publish credentials),
 so instantiating repositories exercise those through their own
