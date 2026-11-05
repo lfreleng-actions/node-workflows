@@ -201,9 +201,9 @@ and the publish does not wait for it. The verify lane's Grype scan is
 the gate. `grype_only_fixed`, `grype_dependency_policy`,
 `grype_transitive_fail_on` and `grype_bypass_repository` shape the
 report as they do the verify lane's gate, and default to
-`grype-scan-action`'s own values; `gerrit-validate` rejects a value
-outside each list before the build runs. Set `grype_enabled: false`
-to skip the scan.
+`grype-scan-action`'s own values; `gerrit-validate` runs the action's
+own validation over the same inputs, so a bad value fails before the
+build runs. Set `grype_enabled: false` to skip the scan.
 
 The calling job must grant `id-token: write` and `attestations: write`.
 A caller's `permissions` block caps what the reusable workflow's jobs
@@ -486,8 +486,7 @@ keeps the gate on rather than skipping the scan.
 Three inputs shape what an armed gate blocks on, in both
 `build-test.yaml` and `build-test-release.yaml`. Each reaches
 `grype-scan-action` under its own name less the `grype_` prefix, with
-hyphens for underscores, and `gerrit-validate` rejects a value outside
-each list before the build runs:
+hyphens for underscores:
 
 - `grype_only_fixed` (`true`): the gate blocks on a finding with a
   known, published fix version, and nothing else. A finding nobody
@@ -515,9 +514,7 @@ never gates through it. `grype_remediation_window_start`, a
 `YYYY-MM-DD` date, floors the clock: no finding's window opens before
 that date, so an existing backlog gets the full window when a
 repository adopts the setting. Both default to empty, which leaves the
-window off, as in the action. `gerrit-validate` rejects a days value
-other than a whole number and a start outside that date form, and
-leaves a start in the future to the action.
+window off, as in the action.
 
 `grype_permit_fail` and the `NO_BLOCK_AUDIT_FAIL` variable apply on top
 of the gate: either passes the job even when the gate blocks. A
@@ -527,12 +524,23 @@ still block a change that adds a vulnerable dependency.
 `grype_bypass_repository` names the `owner/name` repository whose
 approved `BYPASS:` issues the scan honours, so repositories can
 share one list; empty keeps the calling repository.
-`gerrit-validate` rejects a value of any other form, and a
-`grype_fail_on` outside `none`, `negligible`, `low`, `medium`, `high`
-and `critical`.
 `build-test-release.yaml` does not take `grype_gate_when`: a release
 always gates. It takes the remediation window inputs for parity, but
 they have no effect on a gate that is always armed.
+
+`grype-scan-action` checks every one of these inputs, but in the
+`grype` job, after the build and SBOM jobs have run. So each
+workflow's `gerrit-validate` job runs the action first in its
+validation mode, at the same pin and with every input its scan step
+passes, as the identical value, except the SBOM, the artefact name,
+the token and the dependency-change signal a later job computes: the
+action checks its inputs and stops, installing no Grype, fetching no
+database, scanning nothing, reading no bypass issue and making no
+network request. A typo in a `grype_*` input fails in seconds, by the
+action's own rules, which cannot drift from what the scan accepts.
+`grype_dependency_ecosystems` is an input of
+`repository-metadata-action`, so `gerrit-validate` still checks it in
+shell.
 
 ### build-test-release.yaml
 
@@ -1389,6 +1397,27 @@ request's own merge commit, and require a `true` or `false` verdict to
 reach Grype as the matching gate reason. The
 `dependency-change-wiring` job holds `build-test.yaml` to the same
 expressions and drives its ecosystems validation. The
+`grype-input-contract` job runs `tests/test-grype-validation.sh`,
+which holds every lane's `gerrit-validate` to validating its Grype
+inputs through `grype-scan-action`'s validation mode: one pin for
+validator and scan, every key of the scan step's `with:` block
+mirrored as the identical string, whatever the shape of its value,
+except a fixed, named set (the SBOM, the artefact name, the token and
+the dependency-change signal), nothing else, no shell check of an
+input the action owns, and the lanes' declared defaults. It compares
+values as the strings the YAML holds and evaluates no expression:
+which values the action rejects is the action's own suite's concern.
+A called workflow that fails marks the run red, so `testing.yaml`
+calls no lane with a bad input; the script instead holds each lane to
+the shape that fails fast at the first hop: `gerrit-validate` has no
+`needs`, `if` or `continue-on-error`, the validator step has no
+`continue-on-error`, every job that lists `gerrit-validate` in its
+`needs` has an `if:` naming none of `always()`, `cancelled()` or
+`failure()` (a substring test, so a validation failure skips it), and
+every other job transitively needs one of those first-hop jobs. How a
+downstream job guards on its own upstream is the workflows' existing
+design, outside the check. It
+then mutates a copy of a lane in each way the check must catch. The
 release and merge workflows
 need tag-push and merged-commit contexts (plus publish credentials),
 so instantiating repositories exercise those through their own

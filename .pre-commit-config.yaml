@@ -179,3 +179,19 @@ repos:
         pass_filenames: false
         # yamllint disable-line rule:line-length
         files: '^(\.github/workflows/[^/]+\.yaml|tests/test-harden-runner-inputs\.sh)$'
+
+  # Contract check for the Grype input validation: each lane's
+  # gerrit-validate runs grype-scan-action in validate-only mode at the
+  # scan's pin, mirroring every input the scan step passes but a
+  # fixed, named set, as the identical string, and every other job
+  # of the lane fails fast behind it, so a rejected input stops it.
+  - repo: local
+    hooks:
+      - id: grype-validation
+        name: Grype input validation contract check
+        entry: bash tests/test-grype-validation.sh
+        language: python
+        additional_dependencies: ['pyyaml==6.0.2']
+        pass_filenames: false
+        # yamllint disable-line rule:line-length
+        files: '^(\.github/workflows/[^/]+\.yaml|tests/test-grype-validation\.sh)$'
