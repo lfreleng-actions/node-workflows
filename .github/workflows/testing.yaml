@@ -3539,12 +3539,13 @@ jobs:
           echo "Resolved verdict ${VERDICT} reached Grype ✅" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # The Grype policy and remediation window inputs reach
+  # The Grype policy, bypass and remediation window inputs reach
   # grype-scan-action only after the build and SBOM jobs have run, so
-  # gerrit-validate rejects a bad value first. Both workflows must
-  # declare the inputs alike, pass each through, and share one
-  # validation step; that step is then extracted and driven against
-  # every value it must reject.
+  # gerrit-validate rejects a bad value first. The verify workflows
+  # must declare the inputs alike, pass each through, and share one
+  # validation step; merge.yaml declares its own defaults and its own
+  # step. Each step is then extracted and driven against every value
+  # it must accept or reject.
   grype-policy-inputs:
     name: 'Test: Grype policy inputs'
     runs-on: ubuntu-latest
@@ -3574,17 +3575,20 @@ jobs:
         run: |
           # Exercise the Grype policy inputs
           validate="${RUNNER_TEMP}/validate-grype-policy.sh"
-          python3 - "${validate}" <<'PY'
+          merge="${RUNNER_TEMP}/validate-grype-policy-merge.sh"
+          python3 - "${validate}" "${merge}" <<'PY'
           import sys
 
           import yaml
 
-          out = sys.argv[1]
+          out, merge_out = sys.argv[1], sys.argv[2]
           # Split so Actions leaves the expressions in this script
           # unexpanded
           OPEN = '$' + '{{ '
           CLOSE = ' }' + '}'
-          INPUTS = {
+          # Name: (type, default, grype-audit input it feeds)
+          VERIFY = {
+              'grype_fail_on': ('string', 'medium', 'fail-on'),
               'grype_dependency_policy': ('string', 'declared',
                                           'dependency-policy'),
               'grype_transitive_fail_on': ('string', 'critical',
@@ -3594,11 +3598,30 @@ jobs:
                                                 'remediation-window-days'),
               'grype_remediation_window_start': ('string', '',
                                                  'remediation-window-start'),
+              'grype_bypass_repository': ('string', '',
+                                          'bypass-repository'),
+          }
+          # The merge lane reports and never gates, so its policy
+          # defaults are grype-scan-action's own
+          MERGE = {
+              'grype_fail_on': ('string', 'medium', 'fail-on'),
+              'grype_dependency_policy': ('string', 'all',
+                                          'dependency-policy'),
+              'grype_transitive_fail_on': ('string', 'none',
+                                           'transitive-fail-on'),
+              'grype_only_fixed': ('boolean', False, 'only-fixed'),
+              'grype_bypass_repository': ('string', '',
+                                          'bypass-repository'),
           }
           PATHS = (
               '.github/workflows/build-test.yaml',
               '.github/workflows/build-test-release.yaml',
           )
+          MERGE_PATH = '.github/workflows/merge.yaml'
+          # Detection inputs, which feed the repository-metadata job;
+          # dependency-change-wiring asserts where they go
+          DETECTION = ('grype_dependency_ecosystems',
+                       'grype_dependency_patterns')
 
           def step(doc, job, step_id):
               steps = doc['jobs'][job]['steps']
@@ -3607,15 +3630,16 @@ jobs:
 
           errors = []
           docs = {}
-          for path in PATHS:
+          for path in PATHS + (MERGE_PATH,):
               with open(path) as handle:
                   docs[path] = yaml.safe_load(handle)
           for path, doc in docs.items():
+              table = MERGE if path == MERGE_PATH else VERIFY
               # PyYAML reads the bare 'on' key as True
               inputs = doc[True]['workflow_call']['inputs']
               scan = step(doc, 'grype', 'grype-audit')
               with_ = (scan or {}).get('with') or {}
-              for name, (kind, default, passed) in INPUTS.items():
+              for name, (kind, default, passed) in table.items():
                   spec = inputs.get(name)
                   if spec is None:
                       errors.append(f'{path} lacks the {name} input')
@@ -3635,9 +3659,17 @@ jobs:
                   errors.append(f'{path} gerrit-validate has no '
                                 'validate-grype-policy step')
 
+          inputs = docs[PATHS[0]][True]['workflow_call']['inputs']
+          for name in DETECTION:
+              spec = inputs.get(name) or {}
+              if spec.get('type') != 'string' or spec.get('default') != '':
+                  errors.append(f'{PATHS[0]} {name} is not a string '
+                                "input defaulting to ''")
+
           ref = docs[PATHS[0]]
           check = step(ref, 'gerrit-validate', 'validate-grype-policy')
-          for path, doc in docs.items():
+          for path in PATHS:
+              doc = docs[path]
               other = step(doc, 'gerrit-validate', 'validate-grype-policy')
               if check is not None and other != check:
                   errors.append(f'validate-grype-policy step in {path} '
@@ -3648,14 +3680,27 @@ jobs:
               sys.exit('Grype policy inputs incorrect \u274c')
           with open(out, 'w') as handle:
               handle.write(check['run'])
+          with open(merge_out, 'w') as handle:
+              handle.write(step(docs[MERGE_PATH], 'gerrit-validate',
+                                'validate-grype-policy')['run'])
           PY
-          # Fail loudly rather than silently testing nothing if the
-          # step loses an input
-          for var in GRYPE_DEPENDENCY_POLICY GRYPE_TRANSITIVE_FAIL_ON \
-            GRYPE_ONLY_FIXED GRYPE_REMEDIATION_WINDOW_DAYS \
-            GRYPE_REMEDIATION_WINDOW_START; do
+          # Fail loudly rather than silently testing nothing if a step
+          # loses an input
+          for var in GRYPE_FAIL_ON GRYPE_DEPENDENCY_POLICY \
+            GRYPE_TRANSITIVE_FAIL_ON GRYPE_ONLY_FIXED \
+            GRYPE_REMEDIATION_WINDOW_DAYS GRYPE_REMEDIATION_WINDOW_START \
+            GRYPE_BYPASS_REPOSITORY; do
             if ! grep -q "${var}" "${validate}"; then
               echo "Could not extract the Grype policy validation ❌"
+              echo "Update the extraction in this job to match"
+              exit 1
+            fi
+          done
+          for var in GRYPE_FAIL_ON GRYPE_DEPENDENCY_POLICY \
+            GRYPE_TRANSITIVE_FAIL_ON GRYPE_ONLY_FIXED \
+            GRYPE_BYPASS_REPOSITORY; do
+            if ! grep -q "${var}" "${merge}"; then
+              echo "Could not extract merge.yaml's Grype validation ❌"
               echo "Update the extraction in this job to match"
               exit 1
             fi
@@ -3664,7 +3709,10 @@ jobs:
           errors=0
           # $1 case, $2 accept|reject, $3 dependency policy, $4
           # transitive fail-on, $5 only-fixed, $6 remediation window
-          # days and $7 its start, both empty when omitted
+          # days and $7 its start, both empty when omitted. FAIL_ON
+          # (default medium) and BYPASS (default empty), set before the
+          # call, override the other two inputs; SCRIPT picks the step
+          # under test, build-test's by default
           check() {
             local out rc
             set +e
@@ -3672,7 +3720,9 @@ jobs:
               GRYPE_TRANSITIVE_FAIL_ON="$4" GRYPE_ONLY_FIXED="$5" \
               GRYPE_REMEDIATION_WINDOW_DAYS="${6-}" \
               GRYPE_REMEDIATION_WINDOW_START="${7-}" \
-              bash -eo pipefail "${validate}" 2>&1)"
+              GRYPE_FAIL_ON="${FAIL_ON-medium}" \
+              GRYPE_BYPASS_REPOSITORY="${BYPASS-}" \
+              bash -eo pipefail "${SCRIPT:-${validate}}" 2>&1)"
             rc=$?
             set -e
             if [ "$2" = 'accept' ] && [ "${rc}" != '0' ]; then
@@ -3738,6 +3788,38 @@ jobs:
             "$(printf '7\n::warning::forged')"
           check grype_remediation_window_start reject declared critical true \
             30 "$(printf '2026-01-01\n::warning::forged')"
+
+          # fail-on and the bypass repository, against both steps
+          for SCRIPT in "${validate}" "${merge}"; do
+            for severity in none negligible low medium high critical; do
+              FAIL_ON="${severity}" check "fail-on ${severity}" accept \
+                all none false
+            done
+            for repo in lfreleng-actions/bypasses org.name/repo_1-x; do
+              BYPASS="${repo}" check "bypass ${repo}" accept all none false
+            done
+            for bad in Medium '' 'low high' "$(printf 'x\n::warning::forged')"
+            do
+              FAIL_ON="${bad}" check grype_fail_on reject all none false
+            done
+            for bad in lfreleng-actions 'a/b/c' '/repo' 'owner/' \
+              'owner/repo name' 'https://github.com/o/r' \
+              "$(printf 'o/r\n::warning::forged')"; do
+              BYPASS="${bad}" check grype_bypass_repository reject \
+                all none false
+            done
+          done
+
+          # merge.yaml's defaults and the policy values it shares
+          SCRIPT="${merge}"
+          check 'merge defaults' accept all none false
+          check 'merge declared' accept declared critical true
+          check grype_dependency_policy reject declare none false
+          check grype_transitive_fail_on reject all Critical false
+          check grype_only_fixed reject all none yes
+          check grype_dependency_policy reject \
+            "$(printf 'x\n::warning::forged')" none false
+          unset SCRIPT
 
           if [ "${errors}" != '0' ]; then
             echo "Grype policy inputs incorrect ❌" >> "$GITHUB_STEP_SUMMARY"

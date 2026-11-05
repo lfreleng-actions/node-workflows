@@ -195,10 +195,15 @@ attests this SBOM against the release tarball; see
 [Verifying Release Artefacts](#verifying-release-artefacts-model-a).
 
 A `grype` job then scans the release SBOM, informationally, as in
-`java-workflows`' merge lane: findings at `medium` or above appear in
-the job summary, but the job never fails the run and the publish does
-not wait for it. The verify lane's Grype scan is the gate. Set
-`grype_enabled: false` to skip it.
+`java-workflows`' merge lane: findings at `grype_fail_on` (`medium`)
+or above appear in the job summary, but the job never fails the run
+and the publish does not wait for it. The verify lane's Grype scan is
+the gate. `grype_only_fixed`, `grype_dependency_policy`,
+`grype_transitive_fail_on` and `grype_bypass_repository` shape the
+report as they do the verify lane's gate, and default to
+`grype-scan-action`'s own values; `gerrit-validate` rejects a value
+outside each list before the build runs. Set `grype_enabled: false`
+to skip the scan.
 
 The calling job must grant `id-token: write` and `attestations: write`.
 A caller's `permissions` block caps what the reusable workflow's jobs
@@ -368,8 +373,9 @@ it with `dry_run: true` to rehearse first.
 | `audit_permit_fail`                    | boolean | `false`      | Permit dependency audit failures (the NO_BLOCK pattern)                                    |
 | `sbom_enabled`                         | boolean | `true`       | Generate an SBOM (set false to skip; Grype then has nothing to scan)                       |
 | `grype_enabled`                        | boolean | `true`       | Run the Grype scan (set false to keep the SBOM but skip the scan)                          |
-| `grype_fail_on`                        | string  | `'medium'`   | Severity threshold that fails the Grype scan                                               |
+| `grype_fail_on`                        | string  | `'medium'`   | Severity threshold that fails the Grype scan, or `none`                                    |
 | `grype_permit_fail`                    | boolean | `false`      | Permit Grype findings without failing the job                                              |
+| `grype_bypass_repository`              | string  | `''`         | `owner/name` holding approved bypass issues; empty uses the calling repository             |
 | `grype_gate_when`                      | string  | `'always'`   | `always`, or `dependencies-changed`; see [Grype gating](#grype-gating)                     |
 | `grype_dependency_ecosystems`          | string  | `''`         | Comma-separated presets `dependencies-changed` watches; empty watches them all             |
 | `grype_dependency_patterns`            | string  | `''`         | Extra dependency file patterns, one per line, added to the presets                         |
@@ -518,6 +524,12 @@ of the gate: either passes the job even when the gate blocks. A
 repository that sets `grype_permit_fail: true` to tolerate inherited
 advisories can instead set `grype_gate_when: dependencies-changed`, and
 still block a change that adds a vulnerable dependency.
+`grype_bypass_repository` names the `owner/name` repository whose
+approved `BYPASS:` issues the scan honours, so repositories can
+share one list; empty keeps the calling repository.
+`gerrit-validate` rejects a value of any other form, and a
+`grype_fail_on` outside `none`, `negligible`, `low`, `medium`, `high`
+and `critical`.
 `build-test-release.yaml` does not take `grype_gate_when`: a release
 always gates. It takes the remediation window inputs for parity, but
 they have no effect on a gate that is always armed.
@@ -579,6 +591,11 @@ All `build-test.yaml` inputs above except `grype_gate_when`,
 | `sigstore_sign`                        | boolean | `true`       | Sign the packed release tarball with Sigstore (release publishes)                                                                |
 | `sbom_enabled`                         | boolean | `true`       | Generate the release SBOM (`sbom-files-node-merge` artefact); a failure blocks the release publish                               |
 | `grype_enabled`                        | boolean | `true`       | Run the informational Grype scan over the release SBOM; never fails the run                                                      |
+| `grype_fail_on`                        | string  | `'medium'`   | Severity at which findings count as failures in the report: `none`, `negligible`, `low`, `medium`, `high` or `critical`          |
+| `grype_only_fixed`                     | boolean | `false`      | Count findings with a published fix alone as failures                                                                            |
+| `grype_dependency_policy`              | string  | `'all'`      | `all`, or `declared` to count the packages the project declares                                                                  |
+| `grype_transitive_fail_on`             | string  | `'none'`     | Severity at which an inherited package counts anyway under `declared`                                                            |
+| `grype_bypass_repository`              | string  | `''`         | `owner/name` holding approved bypass issues; empty uses the calling repository                                                   |
 | `snapshot_targets`                     | string  | `''`         | REQUIRED unless you set `snapshot_registry_url`: JSON array of snapshot publish targets; see [Publish Targets](#publish-targets) |
 | `release_targets`                      | string  | `''`         | REQUIRED unless you set `release_registry_url`: JSON array of release publish targets; see [Publish Targets](#publish-targets)   |
 | `snapshot_registry_url`                | string  | `''`         | REQUIRED unless you set `snapshot_targets`: single snapshot registry URL; deprecated, prefer `snapshot_targets`                  |
