@@ -309,7 +309,7 @@ on:
         required: false
         type: string
         # yamllint disable-line rule:line-length
-        default: 'lfreleng-actions//.github/harden-runner/lfreleng-actions/allow_list.txt@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
+        default: 'lfreleng-actions//.github/harden-runner/lfreleng-actions/allow_list.txt@6e6cab073a93c0d58e4e8846d44e1cbddbac975b'  # v0.21.0
       harden_runner_supplemental_allowlist:
         description: >-
           Extra harden-runner allow-list merged with
@@ -598,7 +598,7 @@ jobs:
       - name: 'Load egress allow-list'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -720,7 +720,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -744,7 +744,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f0dd3d4dd4fceff1f56348152ecf0e040594f16a  # v1.2.1
+        uses: lfreleng-actions/checkout-gerrit-change-action@8721c15dacdd703064df5ade1416f7e5590b65f3  # v1.4.1
         with:
           gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -766,7 +766,7 @@ jobs:
       - name: 'Gather repository metadata'
         id: repo-metadata
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/repository-metadata-action@18e5b7c5b16423b0e734891d103513826b324858  # v0.4.0
+        uses: lfreleng-actions/repository-metadata-action@f0e5d2d8dc1154a5d702b75acc551eff6ba072dc  # v0.5.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           github_summary: 'true'
@@ -792,7 +792,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -817,7 +817,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f0dd3d4dd4fceff1f56348152ecf0e040594f16a  # v1.2.1
+        uses: lfreleng-actions/checkout-gerrit-change-action@8721c15dacdd703064df5ade1416f7e5590b65f3  # v1.4.1
         with:
           gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -838,7 +838,7 @@ jobs:
       - name: 'Gather Node.js build metadata'
         id: build-metadata
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/build-metadata-action@f5788fd76522ba71a079caaa77b7e50d7a7c5d0f  # v0.11.1
+        uses: lfreleng-actions/build-metadata-action@a52e7ccbf5e1b71075112e7b6c0ec3937fc39f0d  # v0.12.0
         with:
           path_prefix: ${{ inputs.path_prefix }}
           artifact_upload: 'false'
@@ -995,7 +995,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -1020,7 +1020,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f0dd3d4dd4fceff1f56348152ecf0e040594f16a  # v1.2.1
+        uses: lfreleng-actions/checkout-gerrit-change-action@8721c15dacdd703064df5ade1416f7e5590b65f3  # v1.4.1
         with:
           gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -1047,7 +1047,7 @@ jobs:
       - name: 'Gather version metadata'
         id: build-metadata
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/build-metadata-action@f5788fd76522ba71a079caaa77b7e50d7a7c5d0f  # v0.11.1
+        uses: lfreleng-actions/build-metadata-action@a52e7ccbf5e1b71075112e7b6c0ec3937fc39f0d  # v0.12.0
         with:
           path_prefix: ${{ inputs.path_prefix }}
           artifact_upload: 'false'
@@ -1160,7 +1160,7 @@ jobs:
       # would win, and audit mode would be unreachable.
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -1185,7 +1185,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f0dd3d4dd4fceff1f56348152ecf0e040594f16a  # v1.2.1
+        uses: lfreleng-actions/checkout-gerrit-change-action@8721c15dacdd703064df5ade1416f7e5590b65f3  # v1.4.1
         with:
           gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -1212,7 +1212,7 @@ jobs:
 
       - name: 'Build project'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-build-action@fad23d431fa5f26395b577c120a7ffff62d3e8a2  # v0.4.0
+        uses: lfreleng-actions/node-build-action@5dfea1475bbdab0d10a64359ef4dc7a6b5cae873  # v0.4.1
         with:
           node_version: ${{ needs.node-metadata.outputs.build_node_version }}
           build_tool: ${{ needs.node-metadata.outputs.build_tool }}
@@ -1318,7 +1318,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -1465,7 +1465,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -1634,7 +1634,7 @@ jobs:
         id: load-credential
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/credential-load-action@2748d6e79cd70f8d3b7befee38468bd851eab51d  # v2.1.0
+        uses: lfreleng-actions/credential-load-action@c4bf64f187865afb318669d8c9a95147c9e9d832  # v2.1.1
         with:
           # yamllint disable-line rule:line-length
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -1654,7 +1654,7 @@ jobs:
         # yamllint disable-line rule:line-length
         if: steps.creds.outputs.available == 'true' || inputs.dry_run
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@1aba0ee5d24837780fccd3f830b12d41e183e8fb  # v0.4.0
+        uses: lfreleng-actions/node-publish-action@8c14768c7d211c5433924e5cfd27bc978c651c44  # v0.4.1
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ needs.resolve-version.outputs.snapshot_version }}
@@ -1702,7 +1702,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -1734,7 +1734,7 @@ jobs:
       - name: 'Checkout Gerrit change'
         if: inputs.gerrit_refspec != ''
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/checkout-gerrit-change-action@f0dd3d4dd4fceff1f56348152ecf0e040594f16a  # v1.2.1
+        uses: lfreleng-actions/checkout-gerrit-change-action@8721c15dacdd703064df5ade1416f7e5590b65f3  # v1.4.1
         with:
           gerrit-refspec: ${{ needs.resolve-commit.outputs.commit }}
           gerrit-project: ${{ inputs.gerrit_project }}
@@ -1826,7 +1826,7 @@ jobs:
         id: release-schema
         if: steps.detect.outputs.has_release == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
         with:
           distribution-type: 'npm'
           release-file: ${{ steps.detect.outputs.release_file }}
@@ -1986,7 +1986,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -2125,7 +2125,7 @@ jobs:
         id: load-credential
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/credential-load-action@2748d6e79cd70f8d3b7befee38468bd851eab51d  # v2.1.0
+        uses: lfreleng-actions/credential-load-action@c4bf64f187865afb318669d8c9a95147c9e9d832  # v2.1.1
         with:
           # yamllint disable-line rule:line-length
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
@@ -2146,7 +2146,7 @@ jobs:
         id: read-npmrc
         if: steps.creds.outputs.available == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-create-npmrc-action@19f8a252515c4fd850fd0edbdd7ff9ccf7f9f03c  # v0.2.1
+        uses: lfreleng-actions/node-create-npmrc-action@d5f24db0e560147bdfea48d2d497052371c15825  # v0.2.2
         with:
           registry_url: ${{ matrix.target.registry_url }}
           nexus_user: ${{ steps.publish-params.outputs.nexus_user }}
@@ -2439,7 +2439,7 @@ jobs:
         # yamllint disable-line rule:line-length
         if: (steps.creds.outputs.available == 'true' || inputs.dry_run) && steps.registry-check.outputs.publish == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@1aba0ee5d24837780fccd3f830b12d41e183e8fb  # v0.4.0
+        uses: lfreleng-actions/node-publish-action@8c14768c7d211c5433924e5cfd27bc978c651c44  # v0.4.1
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
           registry_url: ${{ matrix.target.registry_url }}
@@ -2517,7 +2517,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -2601,7 +2601,7 @@ jobs:
       # node-publish-action refuses the provenance input with oidc.
       - name: 'Publish release'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@1aba0ee5d24837780fccd3f830b12d41e183e8fb  # v0.4.0
+        uses: lfreleng-actions/node-publish-action@8c14768c7d211c5433924e5cfd27bc978c651c44  # v0.4.1
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
           registry_url: ${{ matrix.target.registry_url }}
@@ -2664,7 +2664,7 @@ jobs:
       # so build_permit_egress_traffic covers it too.
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -2984,7 +2984,7 @@ jobs:
         id: sbom
         if: inputs.sbom_enabled
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/sbom-action@73cdda97132f74a64733b238747d34151444da15  # v0.7.0
+        uses: lfreleng-actions/sbom-action@6a9b119a4ddeb29a02f24fbbc0446da5eaa25fdd  # v0.7.2
         with:
           path_prefix: ${{ inputs.path_prefix }}
           filename_prefix: 'sbom-cyclonedx'
@@ -3048,7 +3048,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -3143,7 +3143,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
@@ -3174,7 +3174,7 @@ jobs:
 
       - name: 'Install cosign'
         # yamllint disable-line rule:line-length
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532  # v4.1.3
 
       # Keyless signing against the public Sigstore infrastructure.
       # The certificate names this reusable workflow (merge.yaml), so
@@ -3222,7 +3222,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
         with:
           config: ${{ inputs.harden_runner_allowlist }}
           # yamllint disable-line rule:line-length
