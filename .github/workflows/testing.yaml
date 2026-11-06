@@ -55,7 +55,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -66,7 +66,7 @@ jobs:
       - name: 'Report fixture commit'
         id: fixture
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/test-node-project@434c050d7aa60131d5cf42b26f81a58398837ac3  # v0.2.2
+        uses: lfreleng-actions/test-node-project@459eeb16595d2cc4acebb6dbfd14822cbbd273cb  # v0.2.3
       # The pin must name a release of the canonical repository. GitHub
       # resolves a commit pushed to any fork through the parent too, so
       # the reported repository alone cannot prove that; requiring a
@@ -286,7 +286,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -734,7 +734,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -759,8 +759,8 @@ jobs:
           import yaml
 
           ACTION = 'lfreleng-actions/standalone-linting-action@'
-          # The v0.10.1 commit; ebbfcadb... is its annotated tag object
-          PIN = ACTION + 'a00b2febdcb6da5332f77e829dfdc131a91b8fce'
+          # The v0.10.2 commit; cd2add12... is its annotated tag object
+          PIN = ACTION + '0a60cf5241a83be396fdd56bb63e9be11dd90b06'
 
 
           def expr(body):
@@ -1007,7 +1007,7 @@ jobs:
       - name: 'Lint the clean fixture'
         id: lint-clean
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/standalone-linting-action@a00b2febdcb6da5332f77e829dfdc131a91b8fce  # v0.10.1
+        uses: lfreleng-actions/standalone-linting-action@0a60cf5241a83be396fdd56bb63e9be11dd90b06  # v0.10.2
         with:
           path_prefix: 'lint-fixture/clean'
           no_checkout: 'true'
@@ -1018,7 +1018,7 @@ jobs:
       - name: 'Lint the seeded fixture'
         id: lint-seeded
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/standalone-linting-action@a00b2febdcb6da5332f77e829dfdc131a91b8fce  # v0.10.1
+        uses: lfreleng-actions/standalone-linting-action@0a60cf5241a83be396fdd56bb63e9be11dd90b06  # v0.10.2
         continue-on-error: true
         with:
           path_prefix: 'lint-fixture/seeded'
@@ -1115,7 +1115,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -2315,7 +2315,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -2392,7 +2392,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -2656,7 +2656,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -2927,7 +2927,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -3069,7 +3069,7 @@ jobs:
         id: onap
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/onap.yaml
@@ -3078,7 +3078,7 @@ jobs:
         id: full
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/full.yaml
@@ -3087,7 +3087,7 @@ jobs:
         id: short-version
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/short-version.yaml
@@ -3096,7 +3096,7 @@ jobs:
         id: no-version
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/no-version.yaml
@@ -3105,7 +3105,7 @@ jobs:
         id: maven
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@6defa50d0fd0f4c011b5ea0f625f0ba2b256dfb5  # v1.1.2
+        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/maven.yaml
@@ -3169,7 +3169,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -3194,7 +3194,7 @@ jobs:
           import yaml
 
           ACTION = 'lfreleng-actions/repository-metadata-action'
-          PIN = '18e5b7c5b16423b0e734891d103513826b324858'
+          PIN = 'f0e5d2d8dc1154a5d702b75acc551eff6ba072dc'
           # The sbom job's former route: a detection step, the sidecar
           # it wrote and the scan input that read it
           RETIRED = 'lfreleng-actions/dependency-change-action'
@@ -3423,7 +3423,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -3444,7 +3444,7 @@ jobs:
       - name: 'Gather repository metadata'
         id: repo-metadata
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/repository-metadata-action@18e5b7c5b16423b0e734891d103513826b324858  # v0.4.0
+        uses: lfreleng-actions/repository-metadata-action@f0e5d2d8dc1154a5d702b75acc551eff6ba072dc  # v0.5.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           github_summary: 'false'
@@ -3465,7 +3465,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -3570,7 +3570,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -3605,7 +3605,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -3737,7 +3737,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -3949,7 +3949,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -4049,7 +4049,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -4371,7 +4371,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -4482,7 +4482,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -4536,7 +4536,7 @@ jobs:
       - name: 'Render JUnit samples'
         id: junit-samples
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/junit-test-report-action@85e6bbd4dfcc434acf458fa1b49d55f367f802cc  # v0.0.3
+        uses: lfreleng-actions/junit-test-report-action@ee5eebd63818eace7a28e1bd3f42c552da7d1a1b  # v0.0.4
         with:
           report-paths: './samples/junit/**/*.xml'
           fail-on-failure: 'false'
@@ -4544,7 +4544,7 @@ jobs:
       - name: 'Render absent JUnit reports'
         id: junit-absent
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/junit-test-report-action@85e6bbd4dfcc434acf458fa1b49d55f367f802cc  # v0.0.3
+        uses: lfreleng-actions/junit-test-report-action@ee5eebd63818eace7a28e1bd3f42c552da7d1a1b  # v0.0.4
         with:
           report-paths: './samples/absent/*.xml'
           fail-on-failure: 'false'
@@ -4825,7 +4825,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -5564,7 +5564,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
@@ -5837,7 +5837,7 @@ jobs:
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        uses: lfreleng-actions/harden-runner-block-action@f5a475661142cd2f1611ae6fbf8af2be0f36a9a7  # v0.16.3
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
