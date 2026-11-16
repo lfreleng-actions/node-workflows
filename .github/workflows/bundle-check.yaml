@@ -1,0 +1,918 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Check that a JavaScript action's committed bundle matches its
+# sources, and rebuild it on a Dependabot pull request.
+#
+# Dependabot updates package-lock.json but never runs the build, so a
+# bump to a bundled dependency leaves the committed bundle (dist/)
+# stale. The check job rebuilds the bundle and fails when the result
+# differs from what the commit holds. On a Dependabot pull request
+# from the same repository it also uploads the rebuilt bundle, and
+# the repair job commits it to the pull request branch.
+#
+# The two jobs split for one reason: the build runs code from the
+# updated dependencies, so the job that builds holds no write
+# credential, and the job that writes runs nothing from the pull
+# request. It downloads the rebuilt files, validates them as data and
+# commits them through the GraphQL createCommitOnBranch mutation with
+# a GitHub App token. GitHub signs a commit made through the API, and
+# a push made with the App's token starts the workflows a push with
+# GITHUB_TOKEN would not, so the required checks report on it.
+#
+# The rebuild commit triggers this workflow again. The bundle then
+# matches, nothing is uploaded and the repair job skips. A bundle
+# still stale with a rebuild of its own directory in the run of
+# rebuild commits at the head means the build is not deterministic:
+# the check fails and says so, and never rebuilds again.
+name: '[R] Node.js Bundle Check'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: 'Node.js version passed to actions/setup-node'
+        required: false
+        type: string
+        default: '22'
+      build_script:
+        description: 'package.json script that writes the bundle'
+        required: false
+        type: string
+        default: 'build'
+      bundle_path:
+        description: >-
+          Directory holding the committed bundle, relative to
+          path_prefix
+        required: false
+        type: string
+        default: 'dist'
+      path_prefix:
+        description: 'Path to the project root directory'
+        required: false
+        type: string
+        default: '.'
+      app_client_id:
+        description: >-
+          Client ID of the GitHub App that commits the rebuilt bundle.
+          Required when the APP_PRIVATE_KEY secret is set
+        required: false
+        type: string
+        default: ''
+      repair_enabled:
+        description: >-
+          Commit the rebuilt bundle to a stale Dependabot pull request.
+          False checks only
+        required: false
+        type: boolean
+        default: true
+      dry_run:
+        description: >-
+          Do everything except mint the App token and create the
+          commit; the repair job reports the commit it would make
+        required: false
+        type: boolean
+        default: false
+      artifact_suffix:
+        description: >-
+          Appended to the rebuilt bundle's artefact name; give each
+          call in one run its own
+        required: false
+        type: string
+        default: ''
+      timeout_minutes:
+        description: 'Timeout (minutes) for the check job'
+        required: false
+        type: number
+        default: 15
+
+      # --- Runner hardening ---
+      harden_runner_egress:
+        description: "Harden-runner egress policy: 'block' or 'audit'"
+        required: false
+        type: string
+        default: 'block'
+      harden_runner_allowlist:
+        description: 'Out-of-band harden-runner allow-list configuration'
+        required: false
+        type: string
+        # yamllint disable-line rule:line-length
+        default: 'lfreleng-actions//.github/harden-runner/lfreleng-actions/allow_list.txt@6e6cab073a93c0d58e4e8846d44e1cbddbac975b'  # v0.21.0
+      harden_runner_supplemental_allowlist:
+        description: >-
+          Extra harden-runner allow-list merged with
+          harden_runner_allowlist, in the same coordinate grammar.
+          Empty adds nothing
+        required: false
+        type: string
+        default: ''
+      harden_runner_supplemental_unpinned:
+        description: >-
+          Let harden_runner_supplemental_allowlist omit '@ref' and
+          follow its default branch; only a list in the caller's own
+          organisation qualifies
+        required: false
+        type: boolean
+        default: false
+      harden_runner_extra_endpoints:
+        description: >-
+          Extra egress endpoints written inline, host[:port] tokens
+          separated by spaces or newlines, merged into the allow-list
+          for short-lived fixes. Empty adds nothing
+        required: false
+        type: string
+        default: ''
+    secrets:
+      APP_PRIVATE_KEY:
+        description: >-
+          Private key of the GitHub App named by app_client_id. Without
+          it the workflow checks only. A run Dependabot triggers reads
+          Dependabot secrets, and the run the App's rebuild commit
+          triggers reads Actions secrets, so the caller stores the key
+          under one name as both and maps it here.
+        required: false
+
+permissions: {}
+
+jobs:
+  check:
+    name: 'Committed bundle matches sources 📦'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    outputs:
+      head_sha: ${{ steps.compare.outputs.head_sha }}
+      repair: ${{ steps.repair.outputs.repair }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+          # yamllint disable-line rule:line-length
+          supplemental_config: ${{ inputs.harden_runner_supplemental_allowlist }}
+          # yamllint disable-line rule:line-length
+          supplemental_required: ${{ inputs.harden_runner_supplemental_allowlist != '' && 'true' || 'false' }}
+          # yamllint disable-line rule:line-length
+          supplemental_unpinned: ${{ inputs.harden_runner_supplemental_unpinned && 'true' || 'false' }}
+          extra_endpoints: ${{ inputs.harden_runner_extra_endpoints }}
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        with:
+          # yamllint disable-line rule:line-length
+          egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Validate inputs'
+        id: inputs
+        shell: bash
+        env:
+          NODE_VERSION: ${{ inputs.node_version }}
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+          BUNDLE_PATH: ${{ inputs.bundle_path }}
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          APP_CLIENT_ID: ${{ inputs.app_client_id }}
+          ARTIFACT_SUFFIX: ${{ inputs.artifact_suffix }}
+        run: |
+          # Validate inputs
+          python3 - <<'PY'
+          import os
+          import posixpath
+          import re
+          import sys
+
+          errors = []
+
+
+          def check(name, value, pattern, hint):
+              if not re.fullmatch(pattern, value):
+                  errors.append(f'{name} {value!r} is not valid: {hint}')
+
+
+          check('node_version', os.environ['NODE_VERSION'],
+                r'[A-Za-z0-9./*_-]{1,32}',
+                'use a version such as 22, 22.x or lts/*')
+          check('build_script', os.environ['BUILD_SCRIPT'],
+                r'[A-Za-z0-9][A-Za-z0-9:._-]{0,99}',
+                'name one package.json script')
+          check('app_client_id', os.environ['APP_CLIENT_ID'],
+                r'[A-Za-z0-9._-]{0,64}', 'use the App client ID')
+          check('artifact_suffix', os.environ['ARTIFACT_SUFFIX'],
+                r'[A-Za-z0-9._-]{0,64}', 'use letters, digits, . _ -')
+
+
+          def relative(name, value):
+              if not re.fullmatch(r'[A-Za-z0-9._/-]{1,200}', value):
+                  errors.append(f'{name} {value!r} is not valid: use '
+                                'letters, digits, . _ - and /')
+                  return False
+              if value.startswith('/') or '..' in value.split('/'):
+                  errors.append(f'{name} {value!r} must stay inside '
+                                'the repository')
+                  return False
+              return True
+
+
+          prefix = os.environ['PATH_PREFIX']
+          bundle = os.environ['BUNDLE_PATH']
+          if relative('path_prefix', prefix) and relative('bundle_path',
+                                                          bundle):
+              bundle_dir = posixpath.normpath(posixpath.join(prefix, bundle))
+              if posixpath.normpath(bundle) == '.' or bundle_dir == '.':
+                  errors.append('bundle_path must name a directory below '
+                                'the project root, not the root itself')
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit(1)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'bundle_dir={bundle_dir}\n')
+          print(f'Bundle directory: {bundle_dir}')
+          PY
+
+      # The pull request's head commit, not the merge commit: the
+      # repair job commits onto the head, so the check builds it. The
+      # loop guard reads the rebuild commits below the head, so the
+      # checkout takes some history
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 50
+          persist-credentials: false
+
+      - name: 'Set up Node.js'
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      # The build starts from an empty bundle directory, so a file it
+      # no longer writes shows as deleted even when the build itself
+      # never removes old output
+      - name: 'Build bundle'
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+          BUNDLE_DIR: ${{ steps.inputs.outputs.bundle_dir }}
+        run: |
+          # Build bundle
+          rm -rf -- "${BUNDLE_DIR}"
+          cd -- "${PATH_PREFIX}"
+          npm ci --no-audit --no-fund
+          npm run -- "${BUILD_SCRIPT}"
+
+      # git status counts additions, changes and deletions alike, so a
+      # file the build no longer writes makes the bundle stale too.
+      # --ignored=traditional lists new files a .gitignore covers, as
+      # in a repository that ignores dist/ and force-adds its bundle
+      - name: 'Compare bundle'
+        id: compare
+        shell: bash
+        env:
+          BUNDLE_DIR: ${{ steps.inputs.outputs.bundle_dir }}
+        run: |
+          # Compare bundle
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          bundle_dir = os.environ['BUNDLE_DIR']
+          head = subprocess.run(
+              ['git', 'rev-parse', 'HEAD'],
+              check=True, capture_output=True, text=True,
+          ).stdout.strip()
+          status = subprocess.run(
+              ['git', 'status', '--porcelain=v1', '-z', '--no-renames',
+               '--untracked-files=all', '--ignored=traditional', '--',
+               bundle_dir],
+              check=True, capture_output=True, text=True,
+          ).stdout
+          additions = []
+          deletions = []
+          for entry in status.split('\0'):
+              if not entry:
+                  continue
+              code, path = entry[:2], entry[3:]
+              if 'D' in code:
+                  deletions.append(path)
+              else:
+                  additions.append(path)
+          stale = bool(additions or deletions)
+          changes = {
+              'head_sha': head,
+              'additions': sorted(additions),
+              'deletions': sorted(deletions),
+          }
+          path = os.path.join(os.environ['RUNNER_TEMP'],
+                              'bundle-changes.json')
+          with open(path, 'w') as handle:
+              json.dump(changes, handle, indent=2)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'stale={"true" if stale else "false"}\n')
+              out.write(f'head_sha={head}\n')
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if not stale:
+              print(f'{bundle_dir}/ matches its sources at {head} ✅')
+              if summary:
+                  with open(summary, 'a') as out:
+                      out.write(f'Committed bundle `{bundle_dir}/` '
+                                'matches sources ✅\n')
+              sys.exit(0)
+          print(f'::error::{bundle_dir}/ is stale at {head}: rebuild it '
+                'and commit the result')
+          for label, paths in (('changed', additions),
+                               ('deleted', deletions)):
+              for item in sorted(paths):
+                  print(f'  {label}: {item!r}')
+          if summary:
+              with open(summary, 'a') as out:
+                  out.write(f'Committed bundle `{bundle_dir}/` is stale '
+                            f'❌ ({len(additions)} to add or change, '
+                            f'{len(deletions)} to delete)\n')
+          PY
+
+      # Repair keys on the pull request's author, not github.actor: a
+      # maintainer re-running the check on a Dependabot pull request
+      # still wants the rebuild, and nobody else's pull request gets
+      # one. A fork's branch is out of reach of the App's token.
+      - name: 'Decide repair'
+        id: repair
+        if: steps.compare.outputs.stale == 'true'
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+          REPAIR_ENABLED: ${{ inputs.repair_enabled }}
+          BUNDLE_DIR: ${{ steps.inputs.outputs.bundle_dir }}
+        run: |
+          # Decide repair
+          reasons=()
+          add_reason() { reasons+=("$*"); }
+          if [ "${REPAIR_ENABLED}" != 'true' ]; then
+            add_reason "repair_enabled is false"
+          fi
+          if [ "${EVENT_NAME}" != 'pull_request' ]; then
+            add_reason "the event is ${EVENT_NAME}, not pull_request"
+          elif [ "${PR_AUTHOR}" != 'dependabot[bot]' ]; then
+            add_reason "the pull request author is ${PR_AUTHOR}, not" \
+              "dependabot[bot]"
+          elif [ "${HEAD_REPO}" != "${BASE_REPO}" ]; then
+            add_reason "the head repository ${HEAD_REPO:-(deleted)} is a" \
+              "fork of ${BASE_REPO}"
+          fi
+          # The repair job writes a Bundle-Rebuilt-Path trailer naming
+          # the bundle directory into every rebuild commit. Walk the run
+          # of rebuild commits at the head: one for this directory means
+          # its rebuild did not hold. Checking the head alone would let
+          # two non-deterministic bundles repair each other in turn.
+          rebuilt=false
+          chain_ends=false
+          for sha in $(git rev-list --first-parent HEAD); do
+            body="$(git log -1 --format=%B "${sha}")"
+            if ! grep -q '^Bundle-Rebuilt-Path: ' <<< "${body}"; then
+              chain_ends=true
+              break
+            fi
+            if grep -Fxq "Bundle-Rebuilt-Path: ${BUNDLE_DIR}" \
+              <<< "${body}"; then
+              rebuilt=true
+              break
+            fi
+          done
+          if [ "${rebuilt}" = 'true' ]; then
+            echo "::error::A rebuild this workflow made for" \
+              "${BUNDLE_DIR}/ sits in the run of rebuild commits at the" \
+              "head, and the bundle is still stale: the build is not" \
+              "deterministic. Fix the build; this workflow does not" \
+              "rebuild again"
+            echo "repair=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${chain_ends}" != 'true' ]; then
+            echo "::error::Every fetched commit is a rebuild this" \
+              "workflow made, so the loop guard cannot see where the" \
+              "run of rebuilds began; this workflow does not rebuild" \
+              "again"
+            echo "repair=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${#reasons[@]}" -gt 0 ]; then
+            for reason in "${reasons[@]}"; do
+              echo "::notice::No automatic rebuild: ${reason}"
+            done
+            echo "repair=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Repair applies: the repair job commits the rebuilt bundle"
+          echo "repair=true" >> "$GITHUB_OUTPUT"
+
+      # The artefact holds the files to add or change under files/,
+      # and a manifest naming them, the files to delete and the
+      # commit they were built from. The repair job trusts none of it
+      # until it has validated it.
+      - name: 'Stage rebuilt bundle'
+        if: steps.repair.outputs.repair == 'true'
+        shell: bash
+        env:
+          BUNDLE_DIR: ${{ steps.inputs.outputs.bundle_dir }}
+        run: |
+          # Stage rebuilt bundle
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          import stat
+          import subprocess
+          import sys
+
+          temp = os.environ['RUNNER_TEMP']
+          with open(os.path.join(temp, 'bundle-changes.json')) as handle:
+              changes = json.load(handle)
+          # createCommitOnBranch takes a path and contents, no file
+          # mode, so it cannot keep an executable bit. A rebuild that
+          # needs one would leave the bundle stale, and the next check
+          # would wrongly call the build non-deterministic.
+          tree = subprocess.run(
+              ['git', 'ls-tree', '-r', '-z', 'HEAD', '--',
+               os.environ['BUNDLE_DIR']],
+              check=True, capture_output=True, text=True,
+          ).stdout
+          committed = {}
+          for entry in tree.split('\0'):
+              if entry:
+                  info, _, name = entry.partition('\t')
+                  committed[name] = info.split()[0]
+          stage = os.path.join(temp, 'bundle-repair')
+          shutil.rmtree(stage, ignore_errors=True)
+          os.makedirs(os.path.join(stage, 'files'))
+          for path in changes['additions']:
+              mode = os.lstat(path).st_mode
+              if not stat.S_ISREG(mode):
+                  print(f'::error::The build wrote {path!r}, which is not '
+                        'a regular file; commit the bundle by hand')
+                  sys.exit(1)
+              if mode & 0o111 or committed.get(path) == '100755':
+                  print(f'::error::{path!r} is or was executable, and a '
+                        'commit made through the API cannot set a file '
+                        'mode; rebuild and commit the bundle by hand')
+                  sys.exit(1)
+              target = os.path.join(stage, 'files', path)
+              os.makedirs(os.path.dirname(target), exist_ok=True)
+              shutil.copyfile(path, target)
+          manifest = {
+              'schema': 1,
+              'head_sha': changes['head_sha'],
+              'bundle_dir': os.environ['BUNDLE_DIR'],
+              'additions': changes['additions'],
+              'deletions': changes['deletions'],
+          }
+          with open(os.path.join(stage, 'manifest.json'), 'w') as handle:
+              json.dump(manifest, handle, indent=2)
+          print(f"Staged {len(changes['additions'])} file(s) to add or "
+                f"change and {len(changes['deletions'])} to delete")
+          PY
+
+      - name: 'Upload rebuilt bundle'
+        id: upload
+        if: steps.repair.outputs.repair == 'true'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: bundle-repair${{ inputs.artifact_suffix }}
+          path: ${{ runner.temp }}/bundle-repair
+          retention-days: 1
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: true
+
+      # That commit really is stale, so the check fails even when a
+      # rebuild follows; the rebuild commit gets a check of its own
+      - name: 'Fail on a stale bundle'
+        if: steps.compare.outputs.stale == 'true'
+        shell: bash
+        env:
+          REPAIR: ${{ steps.repair.outputs.repair }}
+        run: |
+          # Fail on a stale bundle
+          if [ "${REPAIR}" = 'true' ]; then
+            echo "::error::The bundle is stale; the repair job commits" \
+              "the rebuilt bundle to this pull request when the" \
+              "App's key is set"
+          else
+            echo "::error::The bundle is stale; rebuild it and commit" \
+              "the result"
+          fi
+          exit 1
+
+  repair:
+    name: 'Rebuild committed bundle'
+    needs: check
+    # The check job fails on a stale bundle, so this runs after a
+    # failure. The build in that job runs dependency code, which can
+    # forge its outputs, so this repeats every condition it can read
+    # from the event and the inputs rather than trusting the output
+    if: >-
+      !cancelled()
+      && needs.check.outputs.repair == 'true'
+      && inputs.repair_enabled
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # Nothing from the pull request runs here: no checkout, no npm.
+    # The App token is the only write credential, and it is minted
+    # after the artefact has been validated.
+    permissions: {}
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+          # yamllint disable-line rule:line-length
+          supplemental_config: ${{ inputs.harden_runner_supplemental_allowlist }}
+          # yamllint disable-line rule:line-length
+          supplemental_required: ${{ inputs.harden_runner_supplemental_allowlist != '' && 'true' || 'false' }}
+          # yamllint disable-line rule:line-length
+          supplemental_unpinned: ${{ inputs.harden_runner_supplemental_unpinned && 'true' || 'false' }}
+          extra_endpoints: ${{ inputs.harden_runner_extra_endpoints }}
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        with:
+          # yamllint disable-line rule:line-length
+          egress-policy: ${{ inputs.harden_runner_egress == 'audit' && 'audit' || 'block' }}
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # The key is read here and nowhere in the check job: GitHub sends
+      # a runner each secret its job references, and the check job runs
+      # dependency code that could read it off that runner. Without a
+      # key, and outside a dry run, the job stops here without failing.
+      - name: 'Check App key'
+        id: key
+        shell: bash
+        env:
+          HAS_KEY: ${{ secrets.APP_PRIVATE_KEY != '' }}
+          APP_CLIENT_ID: ${{ inputs.app_client_id }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          # Check App key
+          if [ "${HAS_KEY}" = 'true' ] && [ -z "${APP_CLIENT_ID}" ]; then
+            echo "::error::APP_PRIVATE_KEY is set but app_client_id is" \
+              "empty"
+            exit 1
+          fi
+          if [ "${DRY_RUN}" = 'true' ]; then
+            echo "Dry run: the commit is reported, not made"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "commit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${HAS_KEY}" != 'true' ]; then
+            message="No automatic rebuild: no APP_PRIVATE_KEY secret is"
+            message+=" set, so this workflow checks only."
+            if [ "${ACTOR}" != 'dependabot[bot]' ]; then
+              # A run another actor triggers, such as the App's own
+              # rebuild push, reads Actions secrets, not Dependabot ones
+              message+=" ${ACTOR:-(unknown)} triggered this run, not"
+              message+=" dependabot[bot], so it reads Actions secrets:"
+              message+=" store the App's key as an Actions secret too,"
+              message+=" under the name the caller passes"
+            fi
+            echo "::notice::${message}"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "commit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          echo "commit=true" >> "$GITHUB_OUTPUT"
+
+      - name: 'Download rebuilt bundle'
+        if: steps.key.outputs.proceed == 'true'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          artifact-ids: ${{ needs.check.outputs.artifact_id }}
+          path: ${{ runner.temp }}/bundle-repair
+
+      - name: 'Validate rebuilt bundle'
+        id: validate
+        if: steps.key.outputs.proceed == 'true'
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/bundle-repair
+          # The write boundary comes from the caller's inputs, never
+          # from the check job's outputs, which the build can forge
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          BUNDLE_PATH: ${{ inputs.bundle_path }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Validate rebuilt bundle
+          python3 - <<'PY'
+          import json
+          import os
+          import posixpath
+          import re
+          import stat
+          import sys
+
+          MAX_FILES = 1000
+          MAX_FILE_BYTES = 10 * 1024 * 1024
+          MAX_TOTAL_BYTES = 20 * 1024 * 1024
+          PATH_CHARS = re.compile(r'[A-Za-z0-9._@+=,~ /-]{1,400}')
+
+
+          def fail(message):
+              print(f'::error::Refusing the rebuilt bundle: {message}')
+              sys.exit(1)
+
+
+          root = os.environ['ARTIFACT_DIR']
+          expected = os.environ['EXPECTED_HEAD_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', expected):
+              fail(f'the head SHA {expected!r} is not a commit SHA')
+          for name in ('PATH_PREFIX', 'BUNDLE_PATH'):
+              value = os.environ[name]
+              if (not re.fullmatch(r'[A-Za-z0-9._/-]{1,200}', value)
+                      or value.startswith('/')
+                      or '..' in value.split('/')):
+                  fail(f'{name.lower()} {value!r} is not valid')
+          bundle = os.environ['BUNDLE_PATH']
+          bundle_dir = posixpath.normpath(
+              posixpath.join(os.environ['PATH_PREFIX'], bundle))
+          if posixpath.normpath(bundle) == '.' or bundle_dir == '.':
+              fail('bundle_path must name a directory below the project '
+                   'root')
+
+          # A download by ID may land in a directory named after the
+          # artefact; accept that one level and nothing deeper
+          if not os.path.lexists(os.path.join(root, 'manifest.json')):
+              entries = os.listdir(root)
+              if len(entries) == 1:
+                  nested = os.path.join(root, entries[0])
+                  if not stat.S_ISDIR(os.lstat(nested).st_mode):
+                      fail(f'{entries[0]!r} is not a directory')
+                  root = nested
+
+          # Walk without following links, so a symlink anywhere is seen
+          # as itself and refused
+          files = {}
+          total = 0
+          for current, dirs, names in os.walk(root, followlinks=False):
+              for name in dirs + names:
+                  full = os.path.join(current, name)
+                  rel = os.path.relpath(full, root).replace(os.sep, '/')
+                  mode = os.lstat(full).st_mode
+                  if stat.S_ISDIR(mode):
+                      continue
+                  if not stat.S_ISREG(mode):
+                      fail(f'{rel!r} is not a regular file')
+                  size = os.lstat(full).st_size
+                  if size > MAX_FILE_BYTES:
+                      fail(f'{rel!r} is {size} bytes, over the '
+                           f'{MAX_FILE_BYTES}-byte limit for one file')
+                  total += size
+                  files[rel] = size
+          if total > MAX_TOTAL_BYTES:
+              fail(f'it holds {total} bytes, over the {MAX_TOTAL_BYTES}-'
+                   'byte limit')
+
+          if files.pop('manifest.json', None) is None:
+              fail('it carries no manifest.json')
+          with open(os.path.join(root, 'manifest.json')) as handle:
+              try:
+                  manifest = json.load(handle)
+              except json.JSONDecodeError as exc:
+                  fail(f'manifest.json is not JSON ({exc})')
+          if not isinstance(manifest, dict) or manifest.get('schema') != 1:
+              fail('manifest.json is not a schema 1 manifest')
+          if manifest.get('head_sha') != expected:
+              fail(f"it was built from {manifest.get('head_sha')!r}, not "
+                   f'the pull request head {expected}')
+          if manifest.get('bundle_dir') != bundle_dir:
+              fail(f"it names bundle directory "
+                   f"{manifest.get('bundle_dir')!r}, not {bundle_dir!r}")
+          additions = manifest.get('additions')
+          deletions = manifest.get('deletions')
+          for label, paths in (('additions', additions),
+                               ('deletions', deletions)):
+              if (not isinstance(paths, list)
+                      or not all(isinstance(p, str) for p in paths)):
+                  fail(f'{label} is not a list of paths')
+              if len(set(paths)) != len(paths):
+                  fail(f'{label} lists a path twice')
+          if not additions and not deletions:
+              fail('it lists no change')
+          if len(additions) + len(deletions) > MAX_FILES:
+              fail(f'it changes {len(additions) + len(deletions)} files, '
+                   f'over the limit of {MAX_FILES}')
+          if set(additions) & set(deletions):
+              fail('a path is both added and deleted')
+          for path in additions + deletions:
+              parts = path.split('/')
+              if (not PATH_CHARS.fullmatch(path)
+                      or posixpath.normpath(path) != path
+                      or path.startswith('/')
+                      or '..' in parts or '.' in parts
+                      or not path.startswith(bundle_dir + '/')):
+                  fail(f'{path!r} is not a path inside {bundle_dir}/')
+          payload = {rel[len('files/'):] for rel in files
+                     if rel.startswith('files/')}
+          if len(payload) != len(files):
+              extra = sorted(rel for rel in files
+                             if not rel.startswith('files/'))
+              fail(f'it holds unexpected entries {extra!r}')
+          if payload != set(additions):
+              fail('its files do not match the additions it lists: '
+                   f'unlisted {sorted(payload - set(additions))!r}, '
+                   f'missing {sorted(set(additions) - payload)!r}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'root={root}\n')
+          print(f'Rebuilt bundle valid: {len(additions)} to add or '
+                f'change, {len(deletions)} to delete ✅')
+          PY
+
+      # Scoped to the calling repository and to contents: write alone
+      - name: 'Mint App token'
+        id: app-token
+        if: steps.key.outputs.commit == 'true'
+        # yamllint disable-line rule:line-length
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
+        with:
+          client-id: ${{ inputs.app_client_id }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      # An API commit's author is the App's bot account; a DCO check
+      # wants a sign-off from that identity
+      - name: 'Resolve commit author'
+        id: author
+        if: steps.key.outputs.commit == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          # Resolve commit author
+          if [[ ! "${APP_SLUG}" =~ ^[a-z0-9-]+$ ]]; then
+            echo "::error::Unexpected App slug '${APP_SLUG}'"
+            exit 1
+          fi
+          login="${APP_SLUG}[bot]"
+          id="$(gh api "users/${login}" --jq '.id')"
+          if [[ ! "${id}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Cannot resolve the user ID of ${login}"
+            exit 1
+          fi
+          email="${id}+${login}@users.noreply.github.com"
+          echo "signoff=${login} <${email}>" >> "$GITHUB_OUTPUT"
+
+      - name: 'Build commit request'
+        id: request
+        if: steps.key.outputs.proceed == 'true'
+        shell: bash
+        env:
+          MANIFEST_ROOT: ${{ steps.validate.outputs.root }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+          SIGNOFF: ${{ steps.author.outputs.signoff }}
+        run: |
+          # Build commit request
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import textwrap
+
+          QUERY = (
+              'mutation($input: CreateCommitOnBranchInput!) {'
+              ' createCommitOnBranch(input: $input) {'
+              ' commit { oid url } } }'
+          )
+          root = os.environ['MANIFEST_ROOT']
+          branch = os.environ['BRANCH']
+          signoff = os.environ.get('SIGNOFF', '')
+          if not re.fullmatch(r'[A-Za-z0-9._/@+-]{1,255}', branch):
+              print(f'::error::Unexpected branch name {branch!r}')
+              sys.exit(1)
+          with open(os.path.join(root, 'manifest.json')) as handle:
+              manifest = json.load(handle)
+          head = manifest['head_sha']
+          bundle_dir = manifest['bundle_dir']
+
+          additions = []
+          for path in manifest['additions']:
+              with open(os.path.join(root, 'files', path), 'rb') as handle:
+                  contents = base64.b64encode(handle.read()).decode()
+              additions.append({'path': path, 'contents': contents})
+          deletions = [{'path': path} for path in manifest['deletions']]
+
+          body = textwrap.fill(
+              'Dependabot updated a bundled dependency without '
+              f'rebuilding {bundle_dir}/. This commit holds the output '
+              f"of 'npm run {os.environ['BUILD_SCRIPT']}' at {head}, "
+              'made by the node-workflows bundle check.',
+              width=72,
+          )
+          trailers = [f'Bundle-Rebuilt-From: {head}',
+                      f'Bundle-Rebuilt-Path: {bundle_dir}']
+          if signoff:
+              trailers.append(f'Signed-off-by: {signoff}')
+          body += '\n\n[dependabot skip]\n\n' + '\n'.join(trailers)
+
+          request = {
+              'query': QUERY,
+              'variables': {
+                  'input': {
+                      'branch': {
+                          'repositoryNameWithOwner': os.environ['REPOSITORY'],
+                          'branchName': branch,
+                      },
+                      'expectedHeadOid': head,
+                      'message': {
+                          'headline': 'Build: Rebuild committed bundle',
+                          'body': body,
+                      },
+                      'fileChanges': {
+                          'additions': additions,
+                          'deletions': deletions,
+                      },
+                  },
+              },
+          }
+          path = os.path.join(os.environ['RUNNER_TEMP'],
+                              'bundle-commit-request.json')
+          with open(path, 'w') as handle:
+              json.dump(request, handle)
+
+          lines = [
+              f"Commit on {os.environ['REPOSITORY']} {branch}, "
+              f'expected head {head}:',
+              '',
+              'Build: Rebuild committed bundle',
+              '',
+              body,
+              '',
+          ]
+          lines += [f"  add or change: {a['path']}" for a in additions]
+          lines += [f"  delete: {d['path']}" for d in deletions]
+          if not signoff:
+              lines.append('(dry run: the sign-off is resolved from the '
+                           'App when the commit is made)')
+          print('\n'.join(lines))
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a') as out:
+                  out.write('```text\n' + '\n'.join(lines) + '\n```\n')
+          PY
+
+      # expectedHeadOid makes GitHub refuse the commit when the branch
+      # has moved since the check built from it
+      - name: 'Commit rebuilt bundle'
+        if: steps.key.outputs.commit == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Commit rebuilt bundle
+          request="${RUNNER_TEMP}/bundle-commit-request.json"
+          response="${RUNNER_TEMP}/bundle-commit-response.json"
+          # gh exits non-zero on a GraphQL error and prints it
+          gh api graphql --input "${request}" > "${response}"
+          python3 - "${response}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as handle:
+              response = json.load(handle)
+          commit = ((response.get('data') or {})
+                    .get('createCommitOnBranch') or {}).get('commit')
+          if response.get('errors') or not commit:
+              print(f"::error::createCommitOnBranch failed: "
+                    f"{response.get('errors')!r}")
+              sys.exit(1)
+          print(f"Committed the rebuilt bundle: {commit['url']}")
+          PY
