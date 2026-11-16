@@ -1,0 +1,71 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# =============================================================================
+# EXAMPLE: GitHub-native caller for the reusable bundle-check workflow
+# =============================================================================
+# Copy this file into the .github/workflows/ directory of a JavaScript
+# action that commits a built bundle (dist/), and adjust the `uses:` ref
+# and the optional `with:` overrides to suit the project.
+#
+# On every pull request and push it rebuilds the bundle and fails when
+# the committed one differs. On a Dependabot pull request from this
+# repository it also commits the rebuilt bundle to the pull request
+# branch, through the organisation's GitHub App.
+#
+# Dependabot runs read Dependabot secrets, and the run the App's
+# rebuild commit triggers reads Actions secrets. Store the App's
+# private key under the name used below as both a Dependabot secret
+# and an Actions secret, and install the App on this repository. A
+# caller checking one bundle needs only the Dependabot secret; one
+# checking several needs both, or the bundles after the first stay
+# stale. Without the key the workflow checks only.
+#
+# The check reports as '<job name> / Committed bundle matches sources
+# 📦', here 'Bundle / Committed bundle matches sources 📦'. Point any
+# ruleset that requires the check at that name.
+# =============================================================================
+name: 'Bundle Check'
+
+# yamllint disable-line rule:truthy
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  bundle:
+    name: 'Bundle'
+    permissions:
+      contents: read
+    # REPLACE the pinned SHA below with a node-workflows release SHA.
+    # The all-zero SHA is a non-functional placeholder, NOT a real commit.
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/node-workflows/.github/workflows/bundle-check.yaml@0000000000000000000000000000000000000000  # REPLACE: vX.Y.Z
+    with:
+      # The App's client ID is not a secret; a repository or
+      # organisation variable keeps it in one place
+      app_client_id: ${{ vars.LF_RELENG_BOT_CLIENT_ID }}
+      # All other inputs are optional:
+      # node_version: '22'        # actions/setup-node version
+      # build_script: 'build'     # package.json script writing the bundle
+      # bundle_path: 'dist'       # bundle directory, under path_prefix
+      # path_prefix: '.'          # project root (monorepo subdir, etc.)
+      # repair_enabled: true      # false checks only
+      # dry_run: false            # true reports the commit, makes none
+    secrets:
+      # Both a Dependabot secret and an Actions secret of this name:
+      # runs Dependabot triggers read the first, the run the App's
+      # rebuild commit triggers reads the second
+      APP_PRIVATE_KEY: ${{ secrets.LF_RELENG_BOT_PRIVATE_KEY }}

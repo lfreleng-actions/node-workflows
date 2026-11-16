@@ -24,11 +24,13 @@ of truth (dispatched through gerrit_to_platform).
 | `.github/workflows/build-test.yaml`         | Pull request / verify     | Build, test, dependency audit, SBOM generation and Grype scan                                     |
 | `.github/workflows/build-test-release.yaml` | Tag push (Model A)        | Everything above, plus GitHub release with signed/attested npm tarball and optional Nexus publish |
 | `.github/workflows/merge.yaml`              | Merge to branch (Model B) | Snapshot publish on every merge; release publish when a release file merges                       |
+| `.github/workflows/bundle-check.yaml`       | Pull request / push       | Check a committed bundle matches its sources; rebuild it on Dependabot pull requests              |
 
 <!-- markdownlint-enable MD013 -->
 
 Thin caller examples for each workflow live under `examples/`, with a
-GitHub-native and a Gerrit-wrapped variant per workflow.
+GitHub-native and a Gerrit-wrapped variant per workflow;
+`bundle-check.yaml` has a GitHub-native caller alone.
 
 ## Job Graphs
 
@@ -69,6 +71,12 @@ node-metadata -> build
 pack-release -> { attest | sign-artefacts | grype }
 { pack-release | attest | sign-artefacts } -> release-publish
 { pack-release | attest | sign-artefacts } -> release-publish-oidc
+```
+
+`bundle-check.yaml`:
+
+```text
+check -> repair (Dependabot pull requests with a stale bundle alone)
 ```
 
 ## Release Models
@@ -675,13 +683,45 @@ targets.
 
 <!-- markdownlint-enable MD013 -->
 
+### bundle-check.yaml
+
+<!-- markdownlint-disable MD013 -->
+
+| Input                                  | Type    | Default   | Description                                                                      |
+| -------------------------------------- | ------- | --------- | -------------------------------------------------------------------------------- |
+| `node_version`                         | string  | `'22'`    | Node.js version passed to `actions/setup-node`                                   |
+| `build_script`                         | string  | `'build'` | package.json script that writes the bundle                                       |
+| `bundle_path`                          | string  | `'dist'`  | Directory holding the committed bundle, relative to `path_prefix`                |
+| `path_prefix`                          | string  | `'.'`     | Path to the project root directory                                               |
+| `app_client_id`                        | string  | `''`      | Client ID of the GitHub App that commits the rebuild; required with the key      |
+| `repair_enabled`                       | boolean | `true`    | Commit the rebuilt bundle to a stale Dependabot pull request; false skips it     |
+| `dry_run`                              | boolean | `false`   | Report the rebuild commit without minting a token or making it                   |
+| `artifact_suffix`                      | string  | `''`      | Appended to the `bundle-repair` artefact name; give each call in one run its own |
+| `timeout_minutes`                      | number  | `15`      | Timeout (minutes) for the check job                                              |
+| `harden_runner_egress`                 | string  | `'block'` | Harden-runner egress policy: `block` or `audit`                                  |
+| `harden_runner_allowlist`              | string  | (pinned)  | Out-of-band harden-runner allow-list configuration                               |
+| `harden_runner_supplemental_allowlist` | string  | `''`      | Extra allow-list merged with the baseline                                        |
+| `harden_runner_supplemental_unpinned`  | boolean | `false`   | Let a supplemental list in the caller's organisation follow its default branch   |
+| `harden_runner_extra_endpoints`        | string  | `''`      | Inline `host[:port]` endpoints for a short-term fix                              |
+
+| Secret            | Required | Description                                                                         |
+| ----------------- | -------- | ----------------------------------------------------------------------------------- |
+| `APP_PRIVATE_KEY` | No       | Private key of the App `app_client_id` names; without it no repair runs             |
+
+<!-- markdownlint-enable MD013 -->
+
+The workflow exposes no outputs. See
+[Rebuilding Committed Bundles](#rebuilding-committed-bundles) for
+how the repair works and what a caller needs to set up.
+
 ### Egress allow-list
 
 Every job runs `step-security/harden-runner`, which in `block` mode
 lets a job reach the endpoints on its allow-list and nothing else.
 `lfreleng-actions/harden-runner-block-action` builds that list.
-`build-test.yaml`, `build-test-release.yaml` and `merge.yaml` take
-the same five inputs to shape it, and pass each one to every job:
+`build-test.yaml`, `build-test-release.yaml`, `merge.yaml` and
+`bundle-check.yaml` take the same five inputs to shape it, and pass
+each one to every job:
 
 <!-- markdownlint-disable MD013 -->
 
@@ -1106,6 +1146,157 @@ takes precedence over a secret of the same name that the caller
 passes. GitHub creates a missing environment, unprotected, the first
 time a job names it, so configure the environment before naming it.
 
+## Rebuilding Committed Bundles
+
+A JavaScript action that commits its built bundle goes stale whenever
+Dependabot updates a bundled dependency: Dependabot changes
+`package-lock.json` and never runs the build. `bundle-check.yaml`
+catches that, and on a Dependabot pull request repairs it.
+
+The `check` job, named `Committed bundle matches sources 📦`, checks
+out the commit under test (a pull request's head commit, not its
+merge commit), deletes the bundle directory, runs `npm ci` and the
+`build_script`, then compares the bundle with `git status --porcelain`,
+passing `--untracked-files=all` and `--ignored=traditional`.
+A file the build adds, changes or no longer writes makes the bundle
+stale, even when the build leaves old output in place or a
+`.gitignore` covers the bundle directory, and the job fails, since
+that commit's bundle is stale. So every file in the bundle directory
+must come from the build. The job holds
+`contents: read` and nothing else.
+
+When the bundle is stale and these all hold, the job also uploads
+the rebuilt files, with a manifest of the files to add or change, the
+files to delete and the commit the build used:
+
+- the event is `pull_request`;
+- the pull request's author (`github.event.pull_request.user.login`,
+  not `github.actor`) is `dependabot[bot]`;
+- the head repository is the base repository, not a fork;
+- `repair_enabled` is `true`;
+- the run of rebuild commits this workflow made at the head of the
+  branch (commits carrying a `Bundle-Rebuilt-Path` trailer, followed
+  down the first parent) holds none for the same bundle directory. A
+  bundle still stale after its own rebuild means the build is not
+  deterministic: the job says so and the workflow does not rebuild
+  again. A rebuild of another bundle the caller checks does not count,
+  but neither does it hide an earlier rebuild of this one, so two
+  non-deterministic bundles cannot repair each other in turn. The
+  check fetches the last 50 commits; a run of rebuilds that fills
+  them stops the repair too.
+
+`createCommitOnBranch` takes no file mode, so the job uploads
+nothing and fails asking for a rebuild by hand when a file to add or
+change is executable, or was executable in the head commit: a commit
+made through the API would leave that bundle stale.
+
+The check job references no secret, `APP_PRIVATE_KEY` included.
+GitHub sends a runner each secret its job references, and the build
+runs dependency code that could read a secret off that runner, so
+the check decides without knowing whether the caller passed a key.
+
+The `repair` job then runs with `permissions: {}`, and alone reads
+`APP_PRIVATE_KEY`. Its first step after hardening the runner checks
+for the key: with none, and `dry_run` false, it prints a notice that
+no rebuild follows, naming the Actions secret when Dependabot did not
+trigger the run, and the job stops there without failing; the
+uploaded artefact expires after a day. A key without an
+`app_client_id` fails the job. The build ran
+dependency code that could forge the check job's outputs, so the job
+repeats each condition it can read itself: `repair_enabled`, the
+event, the author and the head repository, and it derives the bundle
+directory from `path_prefix` and `bundle_path` rather than from the
+check's outputs. It checks nothing
+out and runs nothing from the pull request: it downloads the
+artefact and refuses it unless it names that bundle directory and
+holds regular files alone, every
+path inside the bundle directory, no symlinks and no `..`, at most
+1000 changed paths, 10 MiB per file and 20 MiB in all, built from the
+pull request's head commit. It then mints a token for the
+`app_client_id` App with `actions/create-github-app-token`, scoped to
+the calling repository with `contents: write` alone, and makes one
+commit on the pull request branch through the GraphQL
+`createCommitOnBranch` mutation. `expectedHeadOid` names the commit
+the check built from, so GitHub refuses the commit if the branch has
+moved. The commit reads:
+
+```text
+Build: Rebuild committed bundle
+
+Dependabot updated a bundled dependency without rebuilding dist/.
+This commit holds the output of 'npm run build' at <SHA>, made by
+the node-workflows bundle check.
+
+[dependabot skip]
+
+Bundle-Rebuilt-From: <SHA>
+Bundle-Rebuilt-Path: dist
+Signed-off-by: <app-slug>[bot] <<id>+<app-slug>[bot]@users.noreply.github.com>
+```
+
+Why it works this way:
+
+- **An App token, not `GITHUB_TOKEN`.** A push made with
+  `GITHUB_TOKEN` starts no workflow runs, so the required checks would
+  never report on the rebuild commit and the pull request would stay
+  blocked.
+- **An API commit.** GitHub signs commits made through the API, which
+  a branch requiring signed commits needs; a `git push` from the
+  runner would carry no signature.
+- **`[dependabot skip]`.** Without it, Dependabot stops rebasing a
+  pull request someone else has pushed to. With it, Dependabot may
+  overwrite the commit when it rebases, and the workflow rebuilds
+  again.
+- **Two jobs.** The build runs code from the updated dependencies, so
+  the job that builds never holds a write credential.
+- **The loop ends by itself.** The rebuild commit triggers a new run;
+  the bundle now matches, the check uploads nothing and `repair`
+  skips.
+
+`dry_run: true` runs everything but the token, the sign-off lookup
+and the commit, and reports the commit it would make in the repair
+job's log and summary. It needs no private key.
+
+### Setting up a caller
+
+`examples/bundle-check/github.yaml` is a complete caller. Before
+relying on it:
+
+- **Store the App's private key as both a Dependabot secret and an
+  Actions secret, under the same name.** A run that Dependabot
+  triggers reads Dependabot secrets, not Actions secrets, and no
+  environment secrets. The run the App's rebuild commit triggers has
+  the App as its actor, so it reads Actions secrets instead. The
+  caller passes the secret (`LF_RELENG_BOT_PRIVATE_KEY` in the
+  example) as `APP_PRIVATE_KEY`, and the same expression resolves in
+  either run. A caller that checks one bundle can do without the
+  Actions secret, since its follow-up run finds the bundle fresh.
+  A caller that checks more than one needs both: the first rebuild
+  commit moves the head, so the other bundle's repair fails on
+  `expectedHeadOid` and falls to the follow-up run, which without an
+  Actions secret does not repair and says why. Whichever run holds
+  the key, repair applies to a same-repository Dependabot pull
+  request alone.
+  The App's client ID is not secret; the example reads it from the
+  `LF_RELENG_BOT_CLIENT_ID` variable.
+- **Install the App on the calling repository.** The workflow scopes
+  the token to that repository, and minting it fails where the App
+  has no installation.
+- **Update the required check's name.** Called through a reusable
+  workflow, the check reports as
+  `<caller job name> / Committed bundle matches sources 📦`, such as
+  `Bundle / Committed bundle matches sources 📦` in the example. A
+  ruleset that requires the name of an older, inline check needs
+  updating to match.
+- **Approve after the rebuild lands.** Where the ruleset dismisses
+  stale reviews, the rebuild commit dismisses an approval given
+  before it.
+- **Let the rebuild commit pass the DCO check and the organisation's
+  required workflows.** The App's token starts them on the new
+  commit. The commit carries a `Signed-off-by` trailer for the App's
+  bot account, which is the commit's author, for a DCO check that
+  needs one.
+
 ## Verifying Release Artefacts (Model A)
 
 The attestation and the signature both come from jobs inside this
@@ -1237,8 +1428,9 @@ jobs:
 Pin the `uses:` reference to the commit SHA of a node-workflows
 release. Never use a mutable ref such as `@main`, which follows
 whatever lands upstream without review. See `examples/build-test/`,
-`examples/build-test-release/` and `examples/merge/` for complete
-callers, including tag-push release and push-to-main merge triggers.
+`examples/build-test-release/`, `examples/merge/` and
+`examples/bundle-check/` for complete callers, including tag-push
+release and push-to-main merge triggers.
 
 ### Gerrit-wrapped caller
 
@@ -1427,3 +1619,26 @@ asserts the `node-build-action` and `node-audit-action` wiring and
 drives the snapshot specifier guard, and the `release-pack` job runs
 the shared pack steps against the fixture's pnpm workspace member and
 Yarn Berry variant.
+
+The `bundle-check` job runs `tests/test-bundle-check.sh`, which needs
+no live Dependabot pull request. It lifts each step out of
+`bundle-check.yaml` and drives it against a local npm project whose
+build writes `dist/` and leaves old output in place: a fresh bundle
+passes and a stale one names each file to add, change or delete, also
+under a `.gitignore` that covers the bundle; each repair condition
+(event, author, fork, the repair switch, and a run of rebuild commits
+at the head that already rebuilt the bundle, as in an A/B/A loop)
+gives the expected verdict; the repair job's key check stops without a
+key, names the Actions secret in the run the App's rebuild push
+triggers, and lets a dry run through; staging refuses a new executable
+file and a change to a committed executable one; artefact validation
+refuses a symlink, a path outside the bundle directory, an oversized
+artefact, a build from another commit, and a bundle directory other
+than the inputs name even when a forged check output agrees with it;
+and the commit request the dry run reports carries the additions,
+deletions, `expectedHeadOid` and message, and once applied leaves a
+bundle the check passes. It also holds the workflow's permissions,
+pins and dry-run steps to their design, checks that a forged repair
+output cannot run the repair job with `repair_enabled` false, and
+fails if any part of the check job references the `secrets` context.
+Run it locally with `bash tests/test-bundle-check.sh`.
