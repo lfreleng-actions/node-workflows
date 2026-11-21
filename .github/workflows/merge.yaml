@@ -1654,7 +1654,7 @@ jobs:
         # yamllint disable-line rule:line-length
         if: steps.creds.outputs.available == 'true' || inputs.dry_run
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@8c14768c7d211c5433924e5cfd27bc978c651c44  # v0.4.1
+        uses: lfreleng-actions/node-publish-action@f1b8ef9da0e5ab4c9e386b15a3bd8895a5462648  # v0.4.2
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ needs.resolve-version.outputs.snapshot_version }}
@@ -2439,7 +2439,7 @@ jobs:
         # yamllint disable-line rule:line-length
         if: (steps.creds.outputs.available == 'true' || inputs.dry_run) && steps.registry-check.outputs.publish == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@8c14768c7d211c5433924e5cfd27bc978c651c44  # v0.4.1
+        uses: lfreleng-actions/node-publish-action@f1b8ef9da0e5ab4c9e386b15a3bd8895a5462648  # v0.4.2
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
           registry_url: ${{ matrix.target.registry_url }}
@@ -2601,7 +2601,7 @@ jobs:
       # node-publish-action refuses the provenance input with oidc.
       - name: 'Publish release'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@8c14768c7d211c5433924e5cfd27bc978c651c44  # v0.4.1
+        uses: lfreleng-actions/node-publish-action@f1b8ef9da0e5ab4c9e386b15a3bd8895a5462648  # v0.4.2
         with:
           publish_version: ${{ needs.resolve-version.outputs.version }}
           registry_url: ${{ matrix.target.registry_url }}

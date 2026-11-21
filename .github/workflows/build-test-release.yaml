@@ -1075,7 +1075,7 @@ jobs:
       - name: 'Verify pushed tag'
         id: 'tag-validate'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/tag-validate-action@e2a80f310fd8f4f43e86e2abc5ffb032e8217a41  # v1.1.11
+        uses: lfreleng-actions/tag-validate-action@0c2ccc8074af58bc62d5eb30d07655e6e6069dd4  # v1.1.12
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           require_type: 'semver'
@@ -2783,7 +2783,7 @@ jobs:
         # A target already holding this release is skipped
         if: steps.registry-check.outputs.publish == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/node-publish-action@8c14768c7d211c5433924e5cfd27bc978c651c44  # v0.4.1
+        uses: lfreleng-actions/node-publish-action@f1b8ef9da0e5ab4c9e386b15a3bd8895a5462648  # v0.4.2
         with:
           # yamllint disable-line rule:line-length
           publish_version: ${{ steps.publish-params.outputs.publish_version }}
