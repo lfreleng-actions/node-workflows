@@ -42,9 +42,8 @@
 # input; this check holds the lanes to the shape that fails fast
 # instead.
 #
-# It first checks the real workflows, then mutates a copy of one of
-# them in each way the check must catch and expects each mutant to
-# fail, so a check that silently passes everything fails here too.
+# It checks the real workflows, then verifies that mutants fail and
+# a coordinated pin bump passes.
 #
 # Usage: bash tests/test-grype-validation.sh [<workflows-dir>]
 #
@@ -67,7 +66,7 @@ if ! python3 -c 'import yaml' 2>/dev/null; then
 fi
 
 # '-I' keeps the working directory off sys.path.
-python3 -I - "${workflows}" <<'PYEOF'
+python3 -IB - "${workflows}" "${script_dir}" <<'PYEOF'
 import copy
 import pathlib
 import re
@@ -75,12 +74,12 @@ import sys
 
 import yaml
 
+sys.path.insert(0, sys.argv[2])
+from action_pins import action_calls, pin_cases, pin_errors
+
 ACTION = "lfreleng-actions/grype-scan-action"
-# v0.6.2: validate-only (v0.6.0), with rejected values escaped in the
-# log (v0.6.1) and a retried Grype install (v0.6.2).
-PIN = "f65dca2762823cfc8f376e32fee9baa6f3292696"
-USES = f"{ACTION}@{PIN}"
-PIN_LINE = f"uses: {USES}  # v0.6.2"
+# Require validate-only with escaped rejected values and a retried Grype install.
+MIN_VERSION = (0, 6, 2)
 
 VALIDATE_JOB = "gerrit-validate"
 VALIDATOR = "Validate Grype inputs"
@@ -222,10 +221,9 @@ def check_lane(name, doc):
                 f"{SCAN_ID} passes {passed} as"
                 f" {(scan.get('with') or {}).get(passed)!r}, expected {want!r}"
             )
-    if scan.get("uses") != USES:
-        problems.append(f"{SCAN_ID} uses {scan.get('uses')!r}, not {USES}")
-    if validator.get("uses") != scan.get("uses"):
-        problems.append(f"'{VALIDATOR}' and {SCAN_ID} do not share one pin")
+    for label, step in ((SCAN_ID, scan), (VALIDATOR, validator)):
+        if str(step.get("uses", "")).partition("@")[0].lower() != ACTION:
+            problems.append(f"{label} uses {step.get('uses')!r}, not {ACTION}")
     if "if" in validator:
         problems.append(f"'{VALIDATOR}' is conditional; it must always run")
     passed = validator.get("with") or {}
@@ -331,35 +329,32 @@ def check_fail_fast(doc):
     return problems
 
 
-def check_lane_text(text):
-    """Return the problems in the pin lines of one lane's source."""
-    problems = []
-    lines = [line.strip().lstrip("- ") for line in text.splitlines()
-             if ACTION in line]
-    uses = [line for line in lines if line.startswith("uses:")]
-    if len(uses) != 2:
-        problems.append(f"{ACTION} is used {len(uses)} times, expected 2")
-    for line in uses:
-        if line != PIN_LINE:
-            problems.append(f"{line!r} is not {PIN_LINE!r}")
-    return problems
-
-
 def load(path):
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-def check_dir(root):
+def grype_pin_errors(sources):
+    calls = list(action_calls(sources, ACTION, yaml.compose))
+    problems = pin_errors(calls, ACTION, MIN_VERSION)
+    for name in sources:
+        count = sum(call.file == name for call in calls)
+        if count != 2:
+            problems.append(f"{name}: {ACTION} is used {count} times, expected 2")
+    return problems
+
+
+def check_dir(root, sources):
     failures = 0
+    for problem in grype_pin_errors(sources):
+        print(f"::error::{problem}")
+        failures += 1
     for name in LANES:
         path = root / name
-        if not path.is_file():
+        if name not in sources:
             print(f"::error::{path} is missing")
             failures += 1
             continue
-        text = path.read_text(encoding="utf-8")
-        doc = yaml.safe_load(text)
-        for problem in check_lane(name, doc) + check_lane_text(text):
+        for problem in check_lane(name, yaml.safe_load(sources[name])):
             print(f"::error file={path}::{problem}")
             failures += 1
     return failures
@@ -384,11 +379,11 @@ def lane_mutants(doc):
     validator(d)["with"]["validate-only"] = True
     yield "validate-only as a bare boolean", d
     d = copy.deepcopy(doc)
-    validator(d)["uses"] = f"{ACTION}@{'0' * 40}"
-    yield "validator pinned elsewhere", d
+    validator(d)["uses"] = scan(d)["uses"].replace(ACTION, "example/other-action")
+    yield "validator calls another action", d
     d = copy.deepcopy(doc)
-    scan(d)["uses"] = f"{ACTION}@{'0' * 40}"
-    yield "scan pinned elsewhere", d
+    scan(d)["uses"] = validator(d)["uses"].replace(ACTION, "example/other-action")
+    yield "scan calls another action", d
     d = copy.deepcopy(doc)
     validator(d)["with"]["permit-fail"] = "${{ inputs.grype_permit_fail }}"
     yield "validator shortens a compound expression", d
@@ -544,22 +539,11 @@ def merge_mutants(doc):
     yield "validator passes an output-only input", d
 
 
-def lane_text_mutants(text):
-    """Yield (label, mutated source) for each pin drift to catch."""
-    yield "pin comment names another release", text.replace(
-        "# v0.6.2", "# v0.6.1", 1
-    )
-    yield "a third use of the action", text + (
-        f"\n      - uses: {USES}  # v0.6.2\n"
-    )
-
-
-def self_test(root):
+def self_test(root, sources):
     """Expect every mutant to fail; return the number that escaped."""
     escaped = total = 0
     name = "build-test.yaml"
-    text = (root / name).read_text(encoding="utf-8")
-    doc = yaml.safe_load(text)
+    doc = yaml.safe_load(sources[name])
     for label, mutant in lane_mutants(doc):
         total += 1
         # Through a dump and a load, as a file would be read
@@ -580,21 +564,40 @@ def self_test(root):
         ):
             escaped += 1
             print(f"::error::mutant not caught: {label}")
-    for label, mutant in lane_text_mutants(text):
+    calls = list(action_calls(sources, ACTION, yaml.compose))
+    for label, rewritten, should_pass in pin_cases(sources, calls, ACTION):
         total += 1
-        if not check_lane_text(mutant):
+        problems = grype_pin_errors(rewritten)
+        if should_pass:
+            problems += [
+                problem for name, text in rewritten.items()
+                for problem in check_lane(name, yaml.safe_load(text))
+            ]
+        if bool(problems) == should_pass:
             escaped += 1
-            print(f"::error::mutant not caught: {label}")
-    print(f"Mutants caught: {total - escaped}/{total}")
+            print(f"::error::unexpected pin check result for {label}: {problems}")
+    extra = (
+        "\n  extra-grype:\n    steps:\n"
+        f"      - uses: {ACTION}@{calls[0].ref}{calls[0].comment}\n"
+    )
+    total += 1
+    if not grype_pin_errors({**sources, name: sources[name] + extra}):
+        escaped += 1
+        print("::error::mutant not caught: a third use of the action")
+    print(f"Self-tests passed: {total - escaped}/{total}")
     return escaped
 
 
 root = pathlib.Path(sys.argv[1])
-failures = check_dir(root)
+sources = {
+    name: (root / name).read_text(encoding="utf-8")
+    for name in LANES if (root / name).is_file()
+}
+failures = check_dir(root, sources)
 if failures:
     print(f"{failures} problem(s) in the Grype input validation ❌")
     sys.exit(1)
 print("Every lane validates its Grype inputs through the action ✅")
-if self_test(root):
+if self_test(root, sources):
     sys.exit(1)
 PYEOF

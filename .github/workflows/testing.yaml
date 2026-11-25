@@ -753,14 +753,23 @@ jobs:
         shell: bash
         run: |
           # Assert lint job wiring
-          if ! python3 - <<'PY'
+          if ! python3 -IB - <<'PY'
+          from pathlib import Path
           import sys
 
           import yaml
 
-          ACTION = 'lfreleng-actions/standalone-linting-action@'
-          # The v0.10.2 commit; cd2add12... is its annotated tag object
-          PIN = ACTION + '0a60cf5241a83be396fdd56bb63e9be11dd90b06'
+          sys.path.insert(0, str(Path('tests').resolve()))
+          from action_pins import action_calls, pin_cases, pin_errors
+
+          ACTION = 'lfreleng-actions/standalone-linting-action'
+          # Require the baseline release exercised by the lint fixtures.
+          MIN_VERSION = (0, 10, 2)
+          NO_LINT = ('build-test-release.yaml', 'merge.yaml')
+          sources = {
+              name: Path('.github/workflows', name).read_text(encoding='utf-8')
+              for name in ('build-test.yaml', 'testing.yaml', *NO_LINT)
+          }
 
 
           def expr(body):
@@ -769,11 +778,18 @@ jobs:
 
 
           def load(name):
-              with open(f'.github/workflows/{name}') as handle:
-                  return yaml.safe_load(handle)
+              return yaml.safe_load(sources[name])
 
 
-          errors = []
+          def lint_calls(steps):
+              return [
+                  s for s in steps
+                  if str(s.get('uses', '')).partition('@')[0].lower() == ACTION
+              ]
+
+
+          pins = list(action_calls(sources, ACTION, yaml.compose))
+          errors = pin_errors(pins, ACTION, MIN_VERSION)
           doc = load('build-test.yaml')
           jobs = doc['jobs']
 
@@ -841,8 +857,7 @@ jobs:
                   'persist-credentials') is not False:
               errors.append('lint checkout persists credentials')
 
-          calls = [s for s in steps
-                   if str(s.get('uses', '')).startswith(ACTION)]
+          calls = lint_calls(steps)
           guard = [s for s in steps if s.get('id') == 'lint-config']
           if len(calls) != 1:
               errors.append(f'lint calls standalone-linting-action '
@@ -851,9 +866,6 @@ jobs:
               errors.append('lint has no lint-config guard step')
           if len(calls) == 1 and len(guard) == 1:
               call, guard = calls[0], guard[0]
-              if call['uses'] != PIN:
-                  errors.append(f'lint pins {call["uses"]}, expected '
-                                f'{PIN}')
               if (names.index(guard['name']) > names.index(call['name'])
                       or names.index('Checkout repository')
                       > names.index(guard['name'])):
@@ -900,17 +912,24 @@ jobs:
 
           # Release and merge lanes build commits that already passed
           # verify, so neither lints
-          for name in ('build-test-release.yaml', 'merge.yaml'):
-              if ACTION in str(load(name)):
+          for name in NO_LINT:
+              if any(pin.file == name for pin in pins):
                   errors.append(f'{name} calls standalone-linting-action')
 
           # This job's own calls must test the pin build-test.yaml uses
           own = load('testing.yaml')['jobs']['lint']['steps']
-          pins = {s['uses'] for s in own
-                  if str(s.get('uses', '')).startswith(ACTION)}
-          if pins != {PIN}:
-              errors.append(f'testing.yaml lint job pins {pins!r}, '
-                            f'expected {PIN}')
+          if not lint_calls(own):
+              errors.append(f'testing.yaml lint job lacks a call to {ACTION}')
+
+          if not errors:
+              for label, rewritten, should_pass in pin_cases(
+                      sources, pins, ACTION):
+                  calls = list(action_calls(rewritten, ACTION, yaml.compose))
+                  problems = pin_errors(
+                      calls, ACTION, MIN_VERSION)
+                  if bool(problems) == should_pass:
+                      errors.append(f'unexpected pin check result for '
+                                    f'{label}: {problems}')
 
           if errors:
               for message in errors:
