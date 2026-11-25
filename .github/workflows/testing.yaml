@@ -3208,12 +3208,22 @@ jobs:
         run: |
           # Assert dependency change wiring
           python3 - <<'PY'
+          import re
           import sys
 
           import yaml
 
           ACTION = 'lfreleng-actions/repository-metadata-action'
-          PIN = 'ff822d06a64404a54feb79f8e27b687cc76d1c83'
+          # The oldest release these lanes accept. The dependency
+          # change inputs the repo-metadata step passes arrived in
+          # v0.4.0; v0.5.4 is the release this check last pinned by
+          # commit, so a downgrade past what it proved fails here
+          FLOOR = (0, 5, 4)
+          CALL = re.compile(r'^\s*(?:-\s+)?uses:\s*[\'"]?'
+                            + re.escape(ACTION)
+                            + r'@([^\s\'"#]*)[\'"]?(.*)$')
+          SHA = re.compile(r'[0-9a-f]{40}')
+          VERSION = re.compile(r'#\s*v(\d+)\.(\d+)\.(\d+)\s*$')
           # The sbom job's former route: a detection step, the sidecar
           # it wrote and the scan input that read it
           RETIRED = 'lfreleng-actions/dependency-change-action'
@@ -3234,31 +3244,129 @@ jobs:
                   for s in job.get('steps') or []:
                       yield name, s
 
+          def pin_errors(texts):
+              # Every call pins one full commit SHA, the same in every
+              # file, with a version comment no older than FLOOR, so a
+              # Dependabot bump that moves every call together passes
+              found = []
+              for path, text in texts.items():
+                  calls = 0
+                  for number, line in enumerate(text.splitlines(), 1):
+                      match = CALL.match(line)
+                      if match:
+                          calls += 1
+                          found.append((f'{path}:{number}',
+                                        match.group(1), match.group(2)))
+                  if calls == 0:
+                      yield f'{path} never calls {ACTION}'
+                  # The line checks read text, since YAML drops
+                  # comments; the parsed refs are what Actions
+                  # resolves, so each must be the bare SHA and none
+                  # may escape the line checks
+                  refs = [str(s.get('uses', '')).split('@', 1)[1]
+                          for _, s in steps(yaml.safe_load(text))
+                          if str(s.get('uses', '')).startswith(
+                              f'{ACTION}@')]
+                  if len(refs) != calls:
+                      yield (f'{path} calls {ACTION} {len(refs)} '
+                             f'times, but {calls} uses: lines match')
+                  for ref in refs:
+                      if not SHA.fullmatch(ref):
+                          yield (f'{path} resolves {ACTION}@{ref!r}, '
+                                 'not a full commit SHA')
+              for where, ref, rest in found:
+                  if not SHA.fullmatch(ref):
+                      yield (f'{where} pins {ACTION}@{ref!r}, not a '
+                             'full commit SHA')
+                  version = VERSION.search(rest)
+                  if version is None:
+                      yield (f'{where} pins {ACTION} without a '
+                             '# vX.Y.Z comment')
+                  elif tuple(map(int, version.groups())) < FLOOR:
+                      floor = '.'.join(map(str, FLOOR))
+                      yield (f'{where} pins {ACTION} at '
+                             f'v{".".join(version.groups())}, older '
+                             f'than v{floor}')
+              # Compare the ref and the version it names, not the raw
+              # comment, so spacing alone never splits one pin in two
+              pins = set()
+              for _, ref, rest in found:
+                  version = VERSION.search(rest)
+                  pins.add((ref, 'v' + '.'.join(version.groups())
+                            if version else ''))
+              if len(pins) > 1:
+                  yield (f'{ACTION} calls disagree on their pin: '
+                         + ', '.join(f'{ref} {tag}'.strip()
+                                     for ref, tag in sorted(pins)))
+
           def step(job, key, value):
               found = [s for s in job.get('steps') or []
                        if s.get(key) == value]
               return found[0] if found else None
 
           docs = {}
+          texts = {}
           for path in PATHS:
               with open(path) as handle:
                   text = handle.read()
+              texts[path] = text
               docs[path] = yaml.safe_load(text)
               for gone in GONE:
                   if gone in text:
                       errors.append(f'{path} still mentions {gone}')
-              calls = 0
               for job, s in steps(docs[path]):
                   uses = str(s.get('uses', ''))
                   if uses.startswith(f'{RETIRED}@'):
                       errors.append(f'{path}/{job} still calls {RETIRED}')
-                  if uses.startswith(f'{ACTION}@'):
-                      calls += 1
-                      if uses != f'{ACTION}@{PIN}':
-                          errors.append(f'{path}/{job} uses {uses!r}, '
-                                        f'expected {ACTION}@{PIN}')
-              if calls == 0:
-                  errors.append(f'{path} never calls {ACTION}')
+          errors.extend(pin_errors(texts))
+
+          # Drive pin_errors over the real files with their pins
+          # rewritten, so the rule itself is tested: a bump of every
+          # call passes, and each kind of bad pin fails for its own
+          # reason, with the uses: value bare, single- and double-quoted
+          def repin(text, pin, quote=''):
+              # The ref, trailing text included, sits inside the
+              # quotes; the version comment stays outside them
+              ref, mark, comment = pin.partition('#')
+              tail = ref[len(ref.rstrip()):] + mark + comment
+              value = f'{quote}{ACTION}@{ref.rstrip()}{quote}{tail}'
+              return re.sub(r'[\'"]?' + re.escape(ACTION) + r'@.*$',
+                            lambda _: value, text, flags=re.M)
+
+          NEWER = 'a' * 40 + '  # v0.6.0'
+          OLD = '2206d754f65f1a90f57b49be546712c5f594def2  # v0.3.3'
+          first = PATHS[0]
+          cases = (
+              ('every call bumped together', None, NEWER, None),
+              ('one file at a different pin', first,
+               'b' * 40 + '  # v0.6.1', 'disagree on their pin'),
+              ('one file spacing its comment differently', first,
+               'a' * 40 + ' #  v0.6.0', None),
+              ('one file naming another version', first,
+               'a' * 40 + '  # v0.6.1', 'disagree on their pin'),
+              ('a pin older than the floor', None, OLD, 'older than'),
+              ('a pin without its version comment', None, 'a' * 40,
+               'without a # vX.Y.Z comment'),
+              ('a tag', None, 'v0.5.5  # v0.5.5', 'not a full commit'),
+              ('a short SHA', None, 'f4417bd  # v0.5.5',
+               'not a full commit'),
+              ('text after the SHA', None,
+               'a' * 40 + ' unexpected  # v0.6.0', 'not a full commit'),
+          )
+          for label, only, pin, want in cases:
+              for quote in ('', "'", '"'):
+                  name = f'{label} (quoted {quote})' if quote else label
+                  trial = {p: repin(t, NEWER if only else pin, quote)
+                           for p, t in texts.items()}
+                  if only:
+                      trial[only] = repin(texts[only], pin, quote)
+                  got = list(pin_errors(trial))
+                  if want is None and got:
+                      errors.append(f'pin check rejects {name}: '
+                                    f'{got[0]}')
+                  if want is not None and not any(want in g
+                                                  for g in got):
+                      errors.append(f'pin check accepts {name}')
 
           jobs = docs[PATHS[0]]['jobs']
           meta = jobs['repository-metadata']
