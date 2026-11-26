@@ -53,6 +53,17 @@ on:
         required: false
         type: string
         default: ''
+      node_eol_behaviour:
+        description: >-
+          What to do when node_version or a test_node_versions entry
+          names an end-of-life Node.js line: 'warn' (the default)
+          annotates the run and carries on; 'fail' fails the
+          node-metadata job before anything builds. Aliases such as
+          lts/* are not checked, and unavailable release facts never
+          fail the job.
+        required: false
+        type: string
+        default: 'warn'
       build_node_version:
         description: >-
           Node.js version for jobs that run the project's own
@@ -714,7 +725,7 @@ jobs:
       install_mode: ${{ steps.resolve.outputs.install_mode }}
     permissions:
       contents: read
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: 'Load egress allow-list'
         # yamllint disable-line rule:line-length
@@ -1009,6 +1020,174 @@ jobs:
             echo "test_node_version=${test_node_version}"
             echo "test_matrix=${test_matrix}"
           } >> "$GITHUB_OUTPUT"
+
+      # End-of-life check of the versions resolved above: node_version
+      # and each test_node_versions entry. The facts come from
+      # supported-versions-action, which falls back to its cache or
+      # embedded snapshot when the network fails; if even that fails
+      # the check is skipped with a warning, never a failed job.
+      - name: 'Plan Node.js end-of-life check'
+        id: eol-plan
+        shell: bash
+        env:
+          NODE_EOL_BEHAVIOUR: ${{ inputs.node_eol_behaviour }}
+          NODE_VERSION: ${{ steps.resolve.outputs.node_version }}
+          TEST_MATRIX: ${{ steps.resolve.outputs.test_matrix }}
+        run: |
+          # Plan Node.js end-of-life check
+          case "${NODE_EOL_BEHAVIOUR}" in
+            warn|fail) ;;
+            *)
+              echo "::error::Invalid node_eol_behaviour input:" \
+                "'$(printf '%s' "${NODE_EOL_BEHAVIOUR}" | tr -d '\r\n')'" \
+                "(must be warn or fail)"
+              exit 1
+              ;;
+          esac
+          # The single default test leg carries no suffix; only the
+          # legs test_node_versions fans out are checked
+          candidates=("${NODE_VERSION}")
+          if [ -n "${TEST_MATRIX}" ]; then
+            mapfile -t legs < <(jq -r \
+              '.[] | select(.suffix != "") | .node_version' \
+              <<< "${TEST_MATRIX}")
+            candidates+=("${legs[@]}")
+          fi
+          # Every value passed the resolver's character allowlist, so
+          # it is safe to print. An alias such as lts/* or a codename
+          # names no fixed line, so it is reported rather than guessed
+          declare -A seen=()
+          versions=()
+          for version in "${candidates[@]}"; do
+            if [ -n "${seen[${version}]:-}" ]; then
+              continue
+            fi
+            seen[${version}]=1
+            if [[ "${version}" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+              versions+=("${version}")
+            else
+              echo "::notice::Node.js version '${version}' is not a" \
+                "plain version; not checked for end-of-life"
+            fi
+          done
+          echo "versions=${versions[*]}" >> "$GITHUB_OUTPUT"
+      - name: 'Gather Node.js release facts'
+        id: eol-facts
+        if: steps.eol-plan.outputs.versions != ''
+        # Unavailable facts must not fail the job in either mode
+        continue-on-error: true
+        timeout-minutes: 4
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/supported-versions-action@dbe30689f59131d86b5ac0c757f26e759172ebc1  # v0.2.0
+        with:
+          tool: 'nodejs'
+          mode: 'list'
+          summary: 'false'
+      - name: 'Check Node.js end-of-life'
+        id: eol-check
+        if: steps.eol-plan.outputs.versions != ''
+        shell: bash
+        env:
+          NODE_EOL_BEHAVIOUR: ${{ inputs.node_eol_behaviour }}
+          VERSIONS: ${{ steps.eol-plan.outputs.versions }}
+          FACTS_OUTCOME: ${{ steps.eol-facts.outcome }}
+          REPORT_PATH: ${{ steps.eol-facts.outputs.report_path }}
+          # yamllint disable-line rule:line-length
+          VERSIONS_SOURCE: ${{ steps.eol-facts.outputs.versions_source }}
+        run: |
+          # Check Node.js end-of-life
+          heading='### Node.js end-of-life check'
+          if [ "${FACTS_OUTCOME}" != 'success' ] ||
+            [ ! -r "${REPORT_PATH}" ] ||
+            ! jq -e '.lines | type == "array"' "${REPORT_PATH}" \
+              > /dev/null 2>&1; then
+            echo "::warning::Node.js release facts are unavailable;" \
+              "end-of-life check skipped for ${VERSIONS// /, }"
+            {
+              echo "${heading}"
+              echo
+              echo "Release facts unavailable; not checked: ${VERSIONS}"
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          source_text="\`${VERSIONS_SOURCE:-unknown}\`"
+          case "${VERSIONS_SOURCE}" in
+            live|cache) ;;
+            *) source_text+=' (not live; may be out of date)' ;;
+          esac
+          if [ "${NODE_EOL_BEHAVIOUR}" = 'fail' ]; then
+            level='error'
+            mark='❌'
+          else
+            level='warning'
+            mark='⚠️'
+          fi
+          eol_count=0
+          rows=()
+          row() { rows+=("$*"); }
+          for version in ${VERSIONS}; do
+            # Node.js lines are majors; drop leading zeros to match
+            line="${version%%.*}"
+            line="${line#"${line%%[!0]*}"}"
+            line="${line:-0}"
+            # The report's fields are enums, dates and booleans, none
+            # holding a '|' or a newline; '|' keeps empty fields apart
+            IFS='|' read -r status eol in_matrix reason < <(jq -r \
+              --arg line "${line}" \
+              'first(.lines[] | select(.line == $line)) // {}
+              | [.status // "unknown", .eol // "", .in_matrix // false,
+                .reason // ""] | map(tostring) | join("|")' \
+              "${REPORT_PATH}")
+            # endoflife.date marks a line whose upstream support ended
+            # but which a vendor still supports commercially as
+            # extended: end-of-life for these workflows too
+            case "${status}" in
+              eol|extended)
+                eol_count=$((eol_count + 1))
+                when="${eol:+ on ${eol}}"
+                echo "::${level}::Node.js ${version} reached" \
+                  "end-of-life${when:- (date unknown)}" \
+                  "(status ${status}); move to a supported line"
+                row "- ${mark} \`${version}\`: end-of-life${when}" \
+                  "(status \`${status}\`)"
+                ;;
+              active|security)
+                if [ "${in_matrix}" = 'true' ]; then
+                  row "- ✅ \`${version}\`: supported${eol:+ until ${eol}}" \
+                    "(status \`${status}\`)"
+                else
+                  # Upstream supports the line, but the catalog policy
+                  # (LTS lines only, say) leaves it out of its matrix
+                  echo "::notice::Node.js ${version} is supported" \
+                    "upstream (status ${status}), but the" \
+                    "organisation's version policy excludes line" \
+                    "${line} (${reason:-policy})"
+                  row "- ℹ️ \`${version}\`: supported upstream," \
+                    "excluded by policy (\`${reason:-policy}\`)"
+                fi
+                ;;
+              *)
+                echo "::notice::Node.js ${version}: no release facts for" \
+                  "line ${line} (status ${status}); not checked"
+                row "- ℹ️ \`${version}\`: not checked" \
+                  "(status \`${status}\`)"
+                ;;
+            esac
+          done
+          {
+            echo "${heading}"
+            echo
+            printf '%s\n' "${rows[@]}"
+            echo
+            echo "Release facts: ${source_text}"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${level}" = 'error' ] && [ "${eol_count}" -gt 0 ]; then
+            echo "::error::node_eol_behaviour is fail and" \
+              "${eol_count} checked Node.js version(s) are end-of-life"
+            exit 1
+          fi
 
   build:
     name: 'Node.js Build'

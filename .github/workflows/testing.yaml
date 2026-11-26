@@ -5716,6 +5716,285 @@ jobs:
           echo "Node.js version wiring correct ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
+  # The node-metadata end-of-life check runs in three steps that every
+  # lane carries verbatim. A fixture leg cannot choose its fact source
+  # or reach the fail mode without failing, so, as with the resolver,
+  # the steps are extracted and driven directly: against the action's
+  # embedded snapshot (what a lane falls back to offline) and against
+  # a hand-written report for the cases the snapshot cannot pin down.
+  node-eol-check:
+    name: 'Test: Node.js end-of-life check'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Extract the end-of-life check'
+        shell: bash
+        run: |
+          # Extract the end-of-life check
+          python3 - <<'EXTRACT'
+          import os
+          import sys
+          import yaml
+
+          paths = [
+              '.github/workflows/build-test.yaml',
+              '.github/workflows/build-test-release.yaml',
+              '.github/workflows/merge.yaml',
+          ]
+          ids = ['eol-plan', 'eol-facts', 'eol-check']
+          found = {}
+          for path in paths:
+              with open(path) as handle:
+                  doc = yaml.safe_load(handle)
+              steps = doc['jobs']['node-metadata']['steps']
+              by_id = {s.get('id'): s for s in steps}
+              missing = [i for i in ids if i not in by_id]
+              if missing:
+                  sys.exit(f'{path}: node-metadata lacks {missing}')
+              # The check must follow the resolver, which it reads
+              order = [s.get('id') for s in steps]
+              if not order.index('resolve') < order.index('eol-plan'):
+                  sys.exit(f'{path}: eol-plan runs before resolve')
+              if 'node_eol_behaviour' not in doc[True]['workflow_call'][
+                      'inputs']:
+                  sys.exit(f'{path}: no node_eol_behaviour input')
+              found[path] = [by_id[i] for i in ids]
+
+          # Identical logic in every lane: the steps entire, not just
+          # their scripts, so the facts step's inputs agree too
+          reference = found[paths[0]]
+          for path in paths[1:]:
+              if found[path] != reference:
+                  sys.exit(f'end-of-life check in {path} diverged')
+
+          # A network failure must never fail the job
+          if reference[1].get('continue-on-error') is not True:
+              sys.exit('eol-facts must set continue-on-error')
+
+          tmp = os.environ['RUNNER_TEMP']
+          for name, step in (('plan', reference[0]),
+                             ('check', reference[2])):
+              with open(f'{tmp}/eol-{name}.sh', 'w') as handle:
+                  handle.write(step['run'])
+          EXTRACT
+
+      # Offline, the action answers from its embedded snapshot: the
+      # facts a lane falls back to when the network fails
+      - name: 'Gather Node.js release facts offline'
+        id: facts
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/supported-versions-action@dbe30689f59131d86b5ac0c757f26e759172ebc1  # v0.2.0
+        with:
+          tool: 'nodejs'
+          mode: 'list'
+          summary: 'false'
+          offline_mode: 'true'
+
+      - name: 'Exercise the end-of-life check'
+        shell: bash
+        env:
+          REPORT: ${{ steps.facts.outputs.report_path }}
+          SOURCE: ${{ steps.facts.outputs.versions_source }}
+          # The newest stable line: supported on any snapshot
+          LATEST: ${{ steps.facts.outputs.latest }}
+        run: |
+          # Exercise the end-of-life check
+          plan="${RUNNER_TEMP}/eol-plan.sh"
+          check="${RUNNER_TEMP}/eol-check.sh"
+          out_file="${RUNNER_TEMP}/eol-out.txt"
+          summary_file="${RUNNER_TEMP}/eol-summary.md"
+          if [ ! -r "${REPORT}" ] || [[ "${SOURCE}" != snapshot:* ]] ||
+            [ -z "${LATEST}" ]; then
+            echo "Offline facts missing: '${SOURCE}' '${LATEST}' ❌"
+            exit 1
+          fi
+          errors=0
+          fail() {
+            echo "$1 ❌"
+            errors=1
+          }
+          # Run as Actions runs a bash step, with -e and pipefail
+          run_step() {
+            local script="$1"
+            shift
+            : > "${out_file}"
+            : > "${summary_file}"
+            set +e
+            out="$(env "$@" GITHUB_OUTPUT="${out_file}" \
+              GITHUB_STEP_SUMMARY="${summary_file}" \
+              bash --noprofile --norc -eo pipefail "${script}" 2>&1)"
+            rc=$?
+            set -e
+          }
+
+          single='[{"node_version":"10","name":"Tests",'
+          single+='"artifact":"node-test-results","suffix":""}]'
+          fanned='[{"node_version":"18","name":"Tests (Node 18)",'
+          fanned+='"artifact":"x","suffix":"-node-18"},'
+          fanned+='{"node_version":"lts/*","name":"Tests (Node lts/*)",'
+          fanned+='"artifact":"x","suffix":"-node-lts__"},'
+          fanned+='{"node_version":"22","name":"Tests (Node 22)",'
+          fanned+='"artifact":"x","suffix":"-node-22"}]'
+
+          # $1 case, $2 the versions to check or 'reject', $3 whether
+          # an alias notice is expected; then the inputs
+          check_plan() {
+            local name="$1" want="$2" notice="$3"
+            shift 3
+            run_step "${plan}" NODE_EOL_BEHAVIOUR='warn' NODE_VERSION='' \
+              TEST_MATRIX='' "$@"
+            if [ "${want}" = 'reject' ]; then
+              if [ "${rc}" = 0 ] || ! grep -q '^::error::' <<< "${out}"
+              then
+                fail "${name}: expected a labelled rejection"
+              fi
+              return
+            fi
+            if [ "${rc}" != 0 ]; then
+              fail "${name}: plan failed: ${out}"
+              return
+            fi
+            got="$(grep '^versions=' "${out_file}" | cut -d= -f2-)"
+            if [ "${got}" != "${want}" ]; then
+              fail "${name}: got '${got}', expected '${want}'"
+            fi
+            if grep -q '^::notice::' <<< "${out}"; then
+              has_notice=true
+            else
+              has_notice=false
+            fi
+            if [ "${has_notice}" != "${notice}" ]; then
+              fail "${name}: alias notice ${has_notice}, want ${notice}"
+            fi
+          }
+          check_plan 'plain version' '18' false NODE_VERSION='18'
+          check_plan 'patch version' '18.20.4' false \
+            NODE_VERSION='18.20.4'
+          # merge.yaml has no tests job and so no test_matrix
+          check_plan 'no test matrix' '22' false NODE_VERSION='22'
+          # The default single leg runs test_node_version, unchecked
+          check_plan 'single test leg' '22' false NODE_VERSION='22' \
+            TEST_MATRIX="${single}"
+          check_plan 'fanned-out legs' '22 18' true NODE_VERSION='22' \
+            TEST_MATRIX="${fanned}"
+          check_plan 'lts alias' '' true NODE_VERSION='lts/*'
+          check_plan 'codename alias' '' true NODE_VERSION='lts/hydrogen'
+          check_plan 'latest alias' '' true NODE_VERSION='latest'
+          check_plan 'fail accepted' '18' false NODE_EOL_BEHAVIOUR='fail' \
+            NODE_VERSION='18'
+          check_plan 'unknown behaviour' reject false \
+            NODE_EOL_BEHAVIOUR='error' NODE_VERSION='18'
+          check_plan 'behaviour is case-sensitive' reject false \
+            NODE_EOL_BEHAVIOUR='WARN' NODE_VERSION='18'
+
+          # $1 case, $2 expected exit code, $3 a line the output must
+          # match or '' for no ::warning:: or ::error:: at all, $4 a
+          # fixed string the summary must hold; then the inputs
+          check_eol() {
+            local name="$1" want_rc="$2" want_line="$3" want_summary="$4"
+            shift 4
+            run_step "${check}" NODE_EOL_BEHAVIOUR='warn' VERSIONS='' \
+              FACTS_OUTCOME='success' REPORT_PATH="${REPORT}" \
+              VERSIONS_SOURCE="${SOURCE}" "$@"
+            if [ "${rc}" != "${want_rc}" ]; then
+              fail "${name}: exit ${rc}, expected ${want_rc}: ${out}"
+              return
+            fi
+            if [ -z "${want_line}" ]; then
+              if grep -Eq '^::(warning|error)::' <<< "${out}"; then
+                fail "${name}: unexpected annotation: ${out}"
+              fi
+            elif ! grep -Eq "${want_line}" <<< "${out}"; then
+              fail "${name}: no line matching '${want_line}': ${out}"
+            fi
+            if ! grep -qF -- "${want_summary}" "${summary_file}"; then
+              fail "${name}: summary lacks '${want_summary}'"
+            fi
+          }
+          # Node.js 18 reached end-of-life on 2025-04-30; endoflife.date
+          # reports it as extended, for vendors' paid support
+          check_eol 'warn by default' 0 \
+            '^::warning::Node.js 18 reached end-of-life on 2025-04-30' \
+            "\`18\`: end-of-life on 2025-04-30" VERSIONS='18'
+          check_eol 'fail names the version' 1 \
+            '^::error::Node.js 18 reached end-of-life' \
+            "\`18\`: end-of-life" NODE_EOL_BEHAVIOUR='fail' VERSIONS='18'
+          check_eol 'patch version' 0 \
+            '^::warning::Node.js 18.20.4 reached end-of-life' \
+            "\`18.20.4\`" VERSIONS='18.20.4'
+          check_eol 'supported version' 0 '' "\`${LATEST}\`: supported" \
+            VERSIONS="${LATEST}"
+          check_eol 'supported version under fail' 0 '' \
+            "\`${LATEST}\`: supported" NODE_EOL_BEHAVIOUR='fail' \
+            VERSIONS="${LATEST}"
+          check_eol 'fail with one end-of-life entry' 1 \
+            '^::error::Node.js 16 reached end-of-life' "\`16\`" \
+            NODE_EOL_BEHAVIOUR='fail' VERSIONS="${LATEST} 16"
+          # A stale answer must be visible
+          check_eol 'snapshot source reported' 0 '' \
+            "Release facts: \`${SOURCE}\` (not live" VERSIONS="${LATEST}"
+          # The facts step failed outright, as with no network and no
+          # snapshot: a warning, never a failure, whatever the mode
+          check_eol 'facts unavailable' 0 \
+            '^::warning::Node.js release facts are unavailable' \
+            'not checked: 18' NODE_EOL_BEHAVIOUR='fail' VERSIONS='18' \
+            FACTS_OUTCOME='failure' REPORT_PATH='' VERSIONS_SOURCE=''
+          check_eol 'report unreadable' 0 \
+            '^::warning::Node.js release facts are unavailable' \
+            'not checked: 18' NODE_EOL_BEHAVIOUR='fail' VERSIONS='18' \
+            REPORT_PATH="${RUNNER_TEMP}/absent.json"
+
+          # Cases the snapshot cannot hold still: a line upstream
+          # supports but the policy leaves out, a line with no date,
+          # and one the facts do not list
+          fixture="${RUNNER_TEMP}/eol-fixture.json"
+          jq -n '{schema: 1, lines: [
+            {line: "25", status: "active", in_matrix: false,
+              reason: "not-lts", eol: "2099-06-01"},
+            {line: "5", status: "eol", in_matrix: false,
+              reason: "not-installable"}]}' > "${fixture}"
+          check_eol 'policy-excluded line' 0 '' 'excluded by policy' \
+            NODE_EOL_BEHAVIOUR='fail' VERSIONS='25' \
+            REPORT_PATH="${fixture}" VERSIONS_SOURCE='live'
+          check_eol 'policy-excluded notice' 0 \
+            '^::notice::Node.js 25 is supported upstream' 'not-lts' \
+            VERSIONS='25' REPORT_PATH="${fixture}" VERSIONS_SOURCE='live'
+          check_eol 'end-of-life without a date' 0 \
+            '^::warning::Node.js 5 reached end-of-life \(date unknown\)' \
+            "\`5\`: end-of-life (status" VERSIONS='5' \
+            REPORT_PATH="${fixture}" VERSIONS_SOURCE='live'
+          check_eol 'unlisted line' 0 '^::notice::Node.js 99: no release' \
+            "\`99\`: not checked" NODE_EOL_BEHAVIOUR='fail' VERSIONS='99' \
+            REPORT_PATH="${fixture}" VERSIONS_SOURCE='live'
+          check_eol 'leading zeros' 0 '^::warning::Node.js 05 reached' \
+            "\`05\`" VERSIONS='05' REPORT_PATH="${fixture}" \
+            VERSIONS_SOURCE='live'
+
+          if [ "${errors}" != '0' ]; then
+            echo "End-of-life check incorrect ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "End-of-life check correct ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
   # The workflows hand the resolved build tool to node-build-action,
   # node-audit-action and their own pack steps. None of those reach
   # the build-test self-test's job outputs, so the wiring is asserted
