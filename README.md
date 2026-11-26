@@ -359,6 +359,7 @@ it with `dry_run: true` to rehearse first.
 | `ref`                                  | string  | `''`         | Checkout ref (empty = event ref; other repos: default branch)                              |
 | `path_prefix`                          | string  | `'.'`        | Path to the project root directory                                                         |
 | `node_version`                         | string  | `''`         | Node.js version; empty auto-detects `engines.node`, then 22                                |
+| `node_eol_behaviour`                   | string  | `'warn'`     | `warn` or `fail` on an end-of-life Node.js version                                         |
 | `build_node_version`                   | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`             |
 | `test_node_version`                    | string  | `''`         | Node.js for the tests job; empty follows `node_version`                                    |
 | `test_node_versions`                   | string  | `''`         | Node.js versions to test on, one leg each; JSON array or list, at most 10                  |
@@ -599,6 +600,7 @@ All `build-test.yaml` inputs above except `grype_gate_when`,
 | `ref`                                  | string  | `''`         | Checkout ref (empty = event ref; other repos: default branch)                                                                    |
 | `path_prefix`                          | string  | `'.'`        | Path to the project root directory                                                                                               |
 | `node_version`                         | string  | `''`         | Node.js version; empty auto-detects `engines.node`, then 22                                                                      |
+| `node_eol_behaviour`                   | string  | `'warn'`     | `warn` or `fail` on an end-of-life Node.js version                                                                               |
 | `build_node_version`                   | string  | `''`         | Node.js for jobs running the project's toolchain; empty follows `node_version`                                                   |
 | `build_tool`                           | string  | `''`         | `npm`, `yarn`, `yarn-berry`, `pnpm` or `bun`; empty auto-detects                                                                 |
 | `build_scripts`                        | string  | `'build'`    | package.json script(s) the build job runs                                                                                        |
@@ -966,6 +968,46 @@ A library supporting more than one Node.js major can test on each.
 
 Left empty, the job runs once as before, keeping the `Tests` name and
 the unsuffixed artefact names.
+
+### End-of-life Node.js versions
+
+The `node-metadata` job checks the resolved `node_version` and each
+`test_node_versions` entry against the Node.js release schedule, and
+names any version on a line past its end-of-life date:
+
+```text
+Node.js 18 reached end-of-life on 2025-04-30 (status extended);
+move to a supported line
+```
+
+`node_eol_behaviour` sets what happens next:
+
+- `warn` (the default) emits a warning annotation and the run carries
+  on.
+- `fail` emits an error and fails `node-metadata`, so nothing builds,
+  tests or publishes.
+
+Details:
+
+- A line past its end-of-life date with commercial extended support,
+  such as Node.js 18 or 16, counts as end-of-life.
+- A supported line outside the default test matrix, such as an odd,
+  non-LTS current line, gets a notice and never fails the job.
+- The check covers plain versions (`22`, `22.11`, `22.11.0`). An alias
+  such as `lts/*` names no fixed line, so it gets a notice instead.
+  `build_node_version`, `test_node_version` and `oidc_node_version`
+  are outside the check.
+- The facts come from
+  [supported-versions-action](https://github.com/lfreleng-actions/supported-versions-action),
+  which reads `endoflife.date` and `actions/node-versions`, then falls
+  back to its cache or embedded snapshot. If no facts are available
+  at all, the job warns that it skipped the check and carries on, in
+  either mode.
+- The action builds its CLI with Go, so the job also reaches the Go
+  toolchain and module proxy hosts. The organisation
+  [egress allow-list](#egress-allow-list) already lists each host.
+- The job summary lists each version checked, its status and where
+  the facts came from, flagging a snapshot as possibly out of date.
 
 ## Publish Targets
 
@@ -1619,6 +1661,13 @@ asserts the `node-build-action` and `node-audit-action` wiring and
 drives the snapshot specifier guard, and the `release-pack` job runs
 the shared pack steps against the fixture's pnpm workspace member and
 Yarn Berry variant.
+
+The `node-eol-check` job holds the three lanes' end-of-life steps
+identical, then runs them against facts the pinned
+supported-versions-action reports in offline mode and a fixture
+report. It covers `warn` and `fail`, a rejected behaviour, aliases,
+duplicates, patch versions, a policy-excluded line, a line with no
+facts, and missing or unreadable facts.
 
 The `bundle-check` job runs `tests/test-bundle-check.sh`, which needs
 no live Dependabot pull request. It lifts each step out of
