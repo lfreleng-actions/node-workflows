@@ -1826,7 +1826,7 @@ jobs:
         id: release-schema
         if: steps.detect.outputs.has_release == 'true'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
+        uses: lfreleng-actions/verify-release-schema-action@04c660c2172f29ffbc1d99b498a499e3d6cffbe9  # v1.2.0
         with:
           distribution-type: 'npm'
           release-file: ${{ steps.detect.outputs.release_file }}
