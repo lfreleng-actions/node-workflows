@@ -3088,7 +3088,7 @@ jobs:
         id: onap
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
+        uses: lfreleng-actions/verify-release-schema-action@04c660c2172f29ffbc1d99b498a499e3d6cffbe9  # v1.2.0
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/onap.yaml
@@ -3097,7 +3097,7 @@ jobs:
         id: full
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
+        uses: lfreleng-actions/verify-release-schema-action@04c660c2172f29ffbc1d99b498a499e3d6cffbe9  # v1.2.0
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/full.yaml
@@ -3106,7 +3106,7 @@ jobs:
         id: short-version
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
+        uses: lfreleng-actions/verify-release-schema-action@04c660c2172f29ffbc1d99b498a499e3d6cffbe9  # v1.2.0
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/short-version.yaml
@@ -3115,7 +3115,7 @@ jobs:
         id: no-version
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
+        uses: lfreleng-actions/verify-release-schema-action@04c660c2172f29ffbc1d99b498a499e3d6cffbe9  # v1.2.0
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/no-version.yaml
@@ -3124,7 +3124,7 @@ jobs:
         id: maven
         continue-on-error: true
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/verify-release-schema-action@4402955a5beef8f98d755094a74f82c6755a3bf9  # v1.1.4
+        uses: lfreleng-actions/verify-release-schema-action@04c660c2172f29ffbc1d99b498a499e3d6cffbe9  # v1.2.0
         with:
           distribution-type: 'npm'
           release-file: ${{ runner.temp }}/release-fixtures/maven.yaml
